@@ -423,10 +423,9 @@ func (s *memStore) ReportCount() int {
 	}
 	// Add reports that are name-only (no entry in byVersion). These are
 	// the "any version of this package is bad" findings.
-	for k, reports := range s.byName {
+	for _, reports := range s.byName {
 		for _, r := range reports {
 			if r.Version == "" {
-				_ = k
 				total++
 			}
 		}
