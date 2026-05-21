@@ -57,8 +57,7 @@ func NewStore(logger zerolog.Logger, sources ...Source) Store {
 // the new data is rejected and the previous slice retained, so a single
 // MITM'd or wedged upstream can't silently shrink the index. Set
 // conservatively: malware feeds grow over time, so any meaningful drop
-// is suspicious. Override at construction via WithPartialDropThreshold
-// if a specific feed legitimately curates aggressively.
+// is suspicious.
 const partialDropThreshold = 0.5
 
 // versionKey targets exact (ecosystem, name, version) lookups.
