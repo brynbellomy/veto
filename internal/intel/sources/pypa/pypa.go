@@ -19,6 +19,7 @@ package pypa
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"io"
@@ -225,7 +226,7 @@ func (s *Source) fetchWithCacheBounded(ctx context.Context, payloadPath, etagPat
 //
 // Anything outside `vulns/.../*.yaml` is skipped.
 func parseTarball(payload []byte, logger zerolog.Logger) ([]intel.MalwareReport, error) {
-	gz, err := gzip.NewReader(strings.NewReader(string(payload)))
+	gz, err := gzip.NewReader(bytes.NewReader(payload))
 	if err != nil {
 		return nil, vetoerrors.With(err, "decompress tarball")
 	}
