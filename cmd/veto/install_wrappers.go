@@ -116,22 +116,32 @@ var wrappedManagers = pmlist.Wrapped
 //	--dir DIR        add an additional discovery dir. Can be repeated.
 //	--only PM        only wrap this PM. Can be repeated.
 func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
+	rc, _ := runInstallWrappersWithStats(logger, cfg, args)
+	return rc
+}
+
+// runInstallWrappersWithStats is the install-wrappers worker exposed so
+// install-all can route exit codes based on whether failures were genuine
+// vs. just unwritable-dir skips. The public runInstallWrappers wraps this
+// and discards the stats — preserves the existing standalone-command exit
+// contract (non-zero only on stats.failed > 0, per the original logic).
+func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []string) (int, wrapperStats) {
 	opts, err := parseWrapperFlags(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "veto install-wrappers: %v\n", err)
-		return exitUsage
+		return exitUsage, wrapperStats{}
 	}
 
 	vetoPath, err := resolveVetoBinary()
 	if err != nil {
 		logger.Error().Err(err).Msg("locate veto binary")
-		return exitInternal
+		return exitInternal, wrapperStats{}
 	}
 
 	candidates, err := discoverWrapCandidates(opts, vetoPath)
 	if err != nil {
 		logger.Error().Err(err).Msg("discover wrap candidates")
-		return exitInternal
+		return exitInternal, wrapperStats{}
 	}
 
 	// Phase 1.5: propagate load errors so a corrupt wrappers.json fails
@@ -143,7 +153,7 @@ func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
 		logger.Error().Err(err).
 			Str("path", filepath.Join(cfg.CacheDir, "wrappers.json")).
 			Msg("wrappers.json is malformed; refusing to overwrite a load-bearing registry. Inspect or move the file aside and re-run.")
-		return exitInternal
+		return exitInternal, wrapperStats{}
 	}
 
 	// Discovery includes already-ours paths, so empty candidates now
@@ -153,7 +163,7 @@ func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
 		fmt.Fprintln(os.Stderr, "Checked: /opt/homebrew/bin, /usr/local/bin, ~/.local/share/mise/installs/*/*/bin,")
 		fmt.Fprintln(os.Stderr, "         ~/.asdf/installs/*/*/bin, ~/.bun/bin.")
 		fmt.Fprintln(os.Stderr, "Pass --dir to add more discovery roots, or skip Layer 4 if no PMs are installed locally.")
-		return exitOK
+		return exitOK, wrapperStats{}
 	}
 
 	stats := wrapperStats{}
@@ -257,7 +267,7 @@ func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
 	if !opts.dryRun && (stats.reconciled > 0 || stats.failed > 0) {
 		if err := saveWrapperState(cfg, state); err != nil {
 			logger.Error().Err(err).Msg("save wrapper state (final reconcile)")
-			return exitInternal
+			return exitInternal, stats
 		}
 	}
 
@@ -265,9 +275,9 @@ func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
 		stats.wrapped, stats.reconciled, stats.alreadyOurs, stats.wouldWrap, stats.skippedUnwritable, stats.failed)
 	printUnwritableRemediation(skipped)
 	if stats.failed > 0 {
-		return exitInternal
+		return exitInternal, stats
 	}
-	return exitOK
+	return exitOK, stats
 }
 
 // printUnwritableRemediation prints one copy-pasteable command per

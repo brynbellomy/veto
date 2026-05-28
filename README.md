@@ -82,6 +82,19 @@ builds `libveto_interpose.dylib`/`.so` with `make interposer` when
 needed. Open a new terminal, or source your shell rc file, for the
 managed shell block and interposer env vars to take effect.
 
+`install-all` supports `--skip-wrappers` for integrators that install the
+user-scoped layers (shims, shell rc, Claude hook, preload, intel, doctor)
+as the regular user and run `veto install-wrappers` separately under
+elevation. It returns structured exit codes so wrapping scripts can route
+remediation without parsing human-readable output:
+
+| Exit | Meaning |
+|---|---|
+| `0` | every requested step succeeded |
+| `10` | a user-scoped layer failed (shims/shell/hook/preload/intel/doctor) |
+| `20` | the wrappers step skipped one or more candidate dirs because the current (non-root) user can't write to them — retry under sudo |
+| `30` | the wrappers step had write access (or we are already root) and still hit a real failure |
+
 If you want to install the layers one at a time, the equivalent commands are
 `veto install-shims`, `veto install-shell`,
 `veto install-claude-hook`, `make interposer`,
