@@ -1167,7 +1167,9 @@ Install everything:
                                install shims, shell integration, Claude hook,
                                preload interposer, wrappers, sync intel, then doctor.
                                If --lib is omitted, builds libveto_interpose
-                               with `+"`make interposer`"+` when run from the repo.
+                               from the C source embedded in the veto binary
+                               (requires `+"`cc`"+` on PATH; override via `+"`CC=...`"+`).
+                               Works from any CWD; no veto source tree needed.
 
 Supported package managers:
   npm, pnpm, yarn, bun, pip, pip3, uv, poetry, pdm, go, cargo,
