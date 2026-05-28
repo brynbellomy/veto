@@ -18,9 +18,38 @@ type installAllOpts struct {
 	autoRC       bool
 	force        bool
 	skipInterpos bool
+	skipWrappers bool
 }
 
+// installAllStep is one named subcommand executed by install-all. Each
+// step closes over its own arg-building logic; the slice it lives in is
+// composed by buildInstallAllSteps so callers (including tests) can
+// inspect the composition without running anything.
+type installAllStep struct {
+	name string
+	run  func() int
+	// kind classifies the step for exit-code routing.
+	// - "layer": failure surfaces as exitInstallAllLayerFail (10).
+	// - "wrappers": failure goes through classifyWrappersResult to
+	//   distinguish needs-root (20) from genuine failure (30).
+	kind string
+}
+
+const (
+	installAllStepKindLayer    = "layer"
+	installAllStepKindWrappers = "wrappers"
+)
+
 // runInstallAll installs every veto protection layer in one guided command.
+//
+// Exit-code contract (see main.go for the constants):
+//   - 0  every requested step succeeded.
+//   - 10 a user-scoped layer (shims/shell/hook/preload/intel/doctor) failed.
+//   - 20 the wrappers step couldn't touch one or more candidate dirs
+//        because the current user lacks write access (non-root); caller
+//        can retry under sudo without re-running layers 1–4.
+//   - 30 the wrappers step had write access (or we are root) and still
+//        failed — caller has a real bug, not a permissions one.
 func runInstallAll(logger zerolog.Logger, cfg config, args []string) int {
 	opts, err := parseInstallAllFlags(args)
 	if err != nil {
@@ -41,59 +70,121 @@ func runInstallAll(logger zerolog.Logger, cfg config, args []string) int {
 		}
 	}
 
-	steps := []struct {
-		name string
-		run  func() int
-	}{
-		{name: "install shims", run: func() int {
+	steps := buildInstallAllSteps(opts, cfg, libPath, logger)
+
+	for _, step := range steps {
+		fmt.Printf("\n==> veto: %s\n", step.name)
+		switch step.kind {
+		case installAllStepKindWrappers:
+			rc, stats := runInstallWrappersWithStats(logger, cfg, wrapperStepArgs(opts))
+			code := classifyWrappersResult(rc, stats, os.Geteuid())
+			if code != exitOK {
+				fmt.Fprintf(os.Stderr, "veto install-all: step failed: %s\n", step.name)
+				return code
+			}
+		default:
+			if rc := step.run(); rc != exitOK {
+				fmt.Fprintf(os.Stderr, "veto install-all: step failed: %s\n", step.name)
+				return exitInstallAllLayerFail
+			}
+		}
+	}
+	return exitOK
+}
+
+// buildInstallAllSteps composes the ordered list of steps install-all
+// will execute. Pulled out so unit tests can assert composition without
+// running anything. The wrappers step closure is still wired here for
+// shape consistency, but runInstallAll invokes the stats-bearing helper
+// directly so it can route the exit code.
+func buildInstallAllSteps(opts installAllOpts, cfg config, libPath string, logger zerolog.Logger) []installAllStep {
+	steps := []installAllStep{
+		{name: "install shims", kind: installAllStepKindLayer, run: func() int {
 			shimArgs := []string{}
 			if opts.force {
 				shimArgs = append(shimArgs, "--force")
 			}
 			return runInstallShims(logger, shimArgs)
 		}},
-		{name: "install shell integration", run: func() int {
+		{name: "install shell integration", kind: installAllStepKindLayer, run: func() int {
 			return runInstallShell(logger, shellRCArgs(opts))
 		}},
-		{name: "install Claude Code hook", run: func() int {
+		{name: "install Claude Code hook", kind: installAllStepKindLayer, run: func() int {
 			return runInstallClaudeHook(logger, nil)
 		}},
 	}
 	if !opts.skipInterpos {
-		steps = append(steps, struct {
-			name string
-			run  func() int
-		}{name: "install preload interposer", run: func() int {
-			preloadArgs := append([]string{"--lib", libPath}, shellRCArgs(opts)...)
-			return runInstallPreload(logger, preloadArgs)
-		}})
+		steps = append(steps, installAllStep{
+			name: "install preload interposer",
+			kind: installAllStepKindLayer,
+			run: func() int {
+				preloadArgs := append([]string{"--lib", libPath}, shellRCArgs(opts)...)
+				return runInstallPreload(logger, preloadArgs)
+			},
+		})
 	}
-	steps = append(steps, []struct {
-		name string
-		run  func() int
-	}{
-		{name: "install real-binary wrappers", run: func() int {
-			wrapperArgs := []string{}
-			if opts.force {
-				wrapperArgs = append(wrapperArgs, "--force")
-			}
-			return runInstallWrappers(logger, cfg, wrapperArgs)
-		}},
-		{name: "sync intel", run: func() int {
+	if !opts.skipWrappers {
+		steps = append(steps, installAllStep{
+			name: "install real-binary wrappers",
+			kind: installAllStepKindWrappers,
+			run: func() int {
+				return runInstallWrappers(logger, cfg, wrapperStepArgs(opts))
+			},
+		})
+	}
+	steps = append(steps,
+		installAllStep{name: "sync intel", kind: installAllStepKindLayer, run: func() int {
 			return runSync(logger, cfg)
 		}},
-		{name: "doctor", run: func() int {
+		installAllStep{name: "doctor", kind: installAllStepKindLayer, run: func() int {
 			prepareInstallAllDoctorEnv(logger, opts)
 			return runDoctor(logger, cfg, nil)
 		}},
-	}...)
+	)
+	return steps
+}
 
-	for _, step := range steps {
-		fmt.Printf("\n==> veto: %s\n", step.name)
-		if rc := step.run(); rc != exitOK {
-			fmt.Fprintf(os.Stderr, "veto install-all: step failed: %s\n", step.name)
-			return rc
+// wrapperStepArgs builds the argv install-all hands to the wrappers
+// step. Today only --force is forwarded; kept as a helper so both the
+// closure (for shape) and the direct call site stay in sync.
+func wrapperStepArgs(opts installAllOpts) []string {
+	args := []string{}
+	if opts.force {
+		args = append(args, "--force")
+	}
+	return args
+}
+
+// classifyWrappersResult maps the (rc, stats, euid) tuple returned by
+// runInstallWrappersWithStats onto the install-all exit-code contract.
+// Pure (no I/O, no globals) so it can be unit tested exhaustively.
+//
+//   - stats.failed > 0  → genuine wrappers failure (30), regardless of euid.
+//                         If we are root and still hit a hard failure, it's
+//                         not a permissions problem.
+//   - stats.failed == 0 && stats.skippedUnwritable > 0:
+//       - euid != 0 → needs-root (20). User can retry under sudo.
+//       - euid == 0 → wrappers fail (30). We ARE root and still can't
+//                     write; the dir is read-only at the OS level
+//                     (SIP-protected, immutable flag, etc.) so
+//                     elevation will not help.
+//   - rc != 0 (no skipped, no failed) → wrappers fail (30). Defensive:
+//     install-wrappers should only return non-zero when stats.failed > 0,
+//     but if a future change adds another non-zero path we surface it
+//     loudly rather than silently treating it as success.
+//   - otherwise → success (0).
+func classifyWrappersResult(rc int, stats wrapperStats, euid int) int {
+	if stats.failed > 0 {
+		return exitInstallAllWrappersFail
+	}
+	if stats.skippedUnwritable > 0 {
+		if euid != 0 {
+			return exitInstallAllNeedsRoot
 		}
+		return exitInstallAllWrappersFail
+	}
+	if rc != exitOK {
+		return exitInstallAllWrappersFail
 	}
 	return exitOK
 }
@@ -133,6 +224,8 @@ func parseInstallAllFlags(args []string) (installAllOpts, error) {
 			opts.force = true
 		case a == "--skip-interposer":
 			opts.skipInterpos = true
+		case a == "--skip-wrappers":
+			opts.skipWrappers = true
 		default:
 			return opts, errors.WithNew("unknown argument").Set("arg", a)
 		}
