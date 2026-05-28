@@ -230,6 +230,8 @@ func run(args []string) int {
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return exitOK
+	case "version", "--version", "-v":
+		return runVersion(os.Stdout)
 	case "sync":
 		return runSync(logger, cfg)
 	case "status":
@@ -1339,6 +1341,8 @@ Usage:
   veto audit-agent-surface [--json]
                             inspect Claude/Codex/Cursor/Sirene/MCP/launchd
                             persistence surfaces only
+  veto version | --version | -v
+                            print the version string (one line)
   veto help                 this message
 
 Layer 1 — Claude Code hook (Bash tool interception):
