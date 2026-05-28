@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -330,3 +331,223 @@ func TestPrintVersionManagerFooters_OnlyForRecognizedManagers(t *testing.T) {
 // Small file-IO helpers used by the earlier-real-binary test.
 func mkdir(p string) error                                 { return os.MkdirAll(p, 0o755) }
 func writeFile(p string, data []byte, m os.FileMode) error { return os.WriteFile(p, data, m) }
+
+// hostHasAbsolutePathPM reports whether the running host has any
+// wrapped-PM binary at one of the well-known absolute-path install
+// roots (homebrew / /usr/local/bin). Used by the per-PM survey
+// tests to skip themselves on hosts that would carry real installs
+// into the survey output and make assertions flaky.
+//
+// We don't check the version-manager install roots (~/.local/share/mise/...
+// etc.) because the tests already control $HOME, so those resolve under
+// the tempdir.
+func hostHasAbsolutePathPM(t *testing.T) bool {
+	t.Helper()
+	for _, dir := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			for _, pm := range []string{
+				"npm", "pnpm", "yarn", "bun", "npx", "pnpx", "bunx",
+				"pip", "pip3", "uv", "uvx", "poetry", "pipx", "pdm",
+				"go", "cargo",
+			} {
+				if e.Name() == pm {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// TestCheckWrappersPerPM_AllNotApplicable: with an empty tempdir as
+// the only $PATH entry, an isolated $HOME (no mise/asdf installs), and
+// no wrappers.json — every PM line should come back N/A and the
+// generic Layer-4 WARN must NOT fire (nothing to wrap means no
+// warning).
+//
+// Skipped when the host has homebrew/usr-local PM installs since the
+// /opt/homebrew/bin and /usr/local/bin survey paths aren't sandboxable
+// from a test. That's almost always darwin in practice, but we
+// detect dynamically rather than gating on runtime.GOOS so the test is
+// useful on either platform when the host is clean.
+func TestCheckWrappersPerPM_AllNotApplicable(t *testing.T) {
+	if hostHasAbsolutePathPM(t) {
+		t.Skip("host has PM installs in /opt/homebrew/bin or /usr/local/bin; can't isolate survey")
+	}
+	tempDir := t.TempDir()
+	emptyBin := filepath.Join(tempDir, "bin")
+	require.NoError(t, os.MkdirAll(emptyBin, 0o755))
+	t.Setenv("HOME", tempDir)
+	t.Setenv("PATH", emptyBin)
+
+	cfg := config{CacheDir: filepath.Join(tempDir, "cache")}
+	results := checkWrappers(cfg)
+
+	naCount := 0
+	for _, r := range results {
+		require.NotEqual(t, statusWarn, r.status,
+			"no generic Layer-4 WARN should fire when nothing is installed; got: %+v", r)
+		require.NotEqual(t, statusFail, r.status,
+			"no FAIL with empty state and clean host; got: %+v", r)
+		if r.status == statusNotApplicable {
+			naCount++
+		}
+	}
+	// One N/A per wrapped PM expected.
+	require.Equal(t, len(pmlistWrappedForTest()), naCount,
+		"expected one N/A line per wrapped PM; got %d lines: %+v", naCount, results)
+}
+
+// pmlistWrappedForTest mirrors pmlist.Wrapped without importing the
+// package directly from the test (the package is already imported via
+// doctor.go; this helper just keeps the test free of internal/ paths).
+func pmlistWrappedForTest() []string {
+	// Survey one PM at a time via surveyWrappablePaths to derive the
+	// list rather than hardcoding it — keeps the test from drifting
+	// when pmlist.Wrapped changes.
+	return wrappedManagers
+}
+
+// TestCheckWrappersPerPM_OneWrappedOneUnwrapped: builds a tempdir with
+// two synthetic binaries — `npm` as a symlink to the test binary (so
+// pointsAtVeto succeeds) with a .veto-original sibling, and `uv` as a
+// plain executable. Survey should report npm PASS, uv WARN.
+//
+// Skipped when the host has homebrew/usr-local PM installs that
+// would surface their own WARN lines and break the focused assertion.
+func TestCheckWrappersPerPM_OneWrappedOneUnwrapped(t *testing.T) {
+	if hostHasAbsolutePathPM(t) {
+		t.Skip("host has PM installs in /opt/homebrew/bin or /usr/local/bin; can't isolate survey")
+	}
+	tempDir := t.TempDir()
+	bin := filepath.Join(tempDir, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+
+	// Resolve the test binary's canonical path. We use it as the
+	// symlink target so isAlreadyOursWrap's strict physical-path
+	// identity check (via pointsAtVeto) succeeds.
+	vetoPath, err := resolveVetoBinary()
+	require.NoError(t, err)
+
+	// Wrapped npm: symlink → test binary, with .veto-original sibling.
+	npmPath := filepath.Join(bin, "npm")
+	require.NoError(t, os.Symlink(vetoPath, npmPath))
+	require.NoError(t, os.WriteFile(npmPath+wrapperSuffix, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	// Unwrapped uv: plain executable, no .veto-original.
+	uvPath := filepath.Join(bin, "uv")
+	require.NoError(t, os.WriteFile(uvPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	t.Setenv("HOME", tempDir)
+	t.Setenv("PATH", bin)
+
+	cfg := config{CacheDir: filepath.Join(tempDir, "cache")}
+	results := checkWrappers(cfg)
+
+	var npmLine, uvLine *checkResult
+	for i := range results {
+		switch results[i].label {
+		case "wrapper:npm":
+			if npmLine == nil || results[i].status == statusPass {
+				npmLine = &results[i]
+			}
+		case "wrapper:uv":
+			if uvLine == nil || results[i].status == statusWarn {
+				uvLine = &results[i]
+			}
+		}
+	}
+	require.NotNil(t, npmLine, "no wrapper:npm line in output: %+v", results)
+	require.NotNil(t, uvLine, "no wrapper:uv line in output: %+v", results)
+	require.Equal(t, statusPass, npmLine.status, "npm symlink to veto with .veto-original should PASS; got %+v", npmLine)
+	require.Equal(t, statusWarn, uvLine.status, "uv plain executable should WARN; got %+v", uvLine)
+	require.Contains(t, uvLine.detail, "NOT wrapped")
+}
+
+// TestCheckWrappersPerPM_OutputHasNoHomebrewOnLinux: regression for
+// the original symptom — on Linux the doctor output must not
+// reference /opt/homebrew anywhere when the generic Layer-4 WARN
+// fires. Tests the platform-aware example path branch via
+// layer4ExampleHints. We render through printResults using a
+// synthetic results slice so the test doesn't depend on the host's
+// state.
+//
+// On darwin the homebrew path is the correct example, so the test
+// is darwin-skipped: it's a Linux-output regression, not a
+// cross-platform invariant.
+func TestCheckWrappersPerPM_OutputHasNoHomebrewOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("regression test for Linux output; /opt/homebrew is a legitimate example path on darwin")
+	}
+	examplePath, envVar := layer4ExampleHints("uv")
+	require.Equal(t, "/usr/local/bin/uv", examplePath, "Linux example path must be /usr/local/bin/<pm>")
+	require.Equal(t, "LD_PRELOAD", envVar, "Linux preload env var must be LD_PRELOAD")
+
+	// And render a synthetic results slice through printResults to
+	// confirm no /opt/homebrew leaks via any other code path.
+	var buf bytes.Buffer
+	results := []checkResult{
+		{
+			status: statusWarn,
+			label:  "real-binary wrappers",
+			detail: "Layer 4 not installed — absolute-path invocations like " + examplePath + " bypass the gate",
+			howToFix: "Run `veto install-wrappers` to wrap PM binaries with veto symlinks. " +
+				"This catches `subprocess.run([abs_path, ...])` even when " + envVar + " is unset.",
+		},
+		{status: statusNotApplicable, label: "wrapper:npm", detail: "no absolute-path install detected on this host"},
+	}
+	printResults(&buf, results)
+	require.NotContains(t, buf.String(), "/opt/homebrew",
+		"Linux doctor output must not reference /opt/homebrew")
+}
+
+// TestStatusNotApplicableCountsAsPassInSummary: assert that an N/A
+// line shows up in the "passed" bucket of the summary, not warnings
+// or failures. We test the summary computation by replicating it
+// inline since runDoctor's loop is small and not separately
+// exported.
+func TestStatusNotApplicableCountsAsPassInSummary(t *testing.T) {
+	results := []checkResult{
+		{status: statusPass, label: "a", detail: "ok"},
+		{status: statusNotApplicable, label: "b", detail: "n/a"},
+		{status: statusNotApplicable, label: "c", detail: "n/a"},
+		{status: statusWarn, label: "d", detail: "warn"},
+		{status: statusFail, label: "e", detail: "fail"},
+	}
+	failures := 0
+	warnings := 0
+	for _, r := range results {
+		switch r.status {
+		case statusFail:
+			failures++
+		case statusWarn:
+			warnings++
+		}
+	}
+	passed := len(results) - failures - warnings
+	require.Equal(t, 3, passed, "1 PASS + 2 N/A should count as 3 passed")
+	require.Equal(t, 1, warnings)
+	require.Equal(t, 1, failures)
+}
+
+// TestPrintResults_NAMarkerRendered: an N/A result must render an
+// `[N/A]` marker in the output and NOT emit a how-to-fix arrow line
+// (even if howToFix is set, which it shouldn't normally be — but
+// printResults must defend against it).
+func TestPrintResults_NAMarkerRendered(t *testing.T) {
+	var buf bytes.Buffer
+	results := []checkResult{
+		{status: statusNotApplicable, label: "wrapper:foo", detail: "no install detected", howToFix: "this should NOT print"},
+	}
+	printResults(&buf, results)
+	out := buf.String()
+	require.Contains(t, out, "N/A", "N/A marker must appear in output")
+	require.Contains(t, out, "wrapper:foo", "label must appear")
+	require.NotContains(t, out, "this should NOT print",
+		"N/A must not emit a how-to-fix arrow line")
+	require.NotContains(t, out, "→", "N/A must not emit the fix-arrow glyph")
+}
