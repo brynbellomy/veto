@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -60,12 +59,20 @@ func runInstallAll(logger zerolog.Logger, cfg config, args []string) int {
 		opts.autoRC = true
 	}
 
-	var libPath string
+	var (
+		libPath        string
+		libPathCleanup = func() {}
+	)
+	// Cleanup runs after every step finishes. The interposer-build path
+	// returns a tempdir that lives only long enough for runInstallPreload
+	// to copy the .dylib/.so into ~/.local/lib; running cleanup any
+	// earlier would delete the artifact before the install step reads it.
+	defer func() { libPathCleanup() }()
 	if !opts.skipInterpos {
-		libPath, err = ensureInterposerArtifact(logger, opts.libPath)
+		libPath, libPathCleanup, err = ensureInterposerArtifact(logger, opts.libPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "veto install-all: %v\n", err)
-			fmt.Fprintln(os.Stderr, "Run from the veto repo so `make interposer` can build the library, pass `--lib /path/to/libveto_interpose.*`, or use `--skip-interposer`.")
+			fmt.Fprintln(os.Stderr, "Pass `--lib /path/to/libveto_interpose.*`, ensure a C compiler is on PATH (CC env var), or use `--skip-interposer`.")
 			return exitUsage
 		}
 	}
@@ -233,29 +240,34 @@ func parseInstallAllFlags(args []string) (installAllOpts, error) {
 	return opts, nil
 }
 
-func ensureInterposerArtifact(logger zerolog.Logger, explicit string) (string, error) {
+// ensureInterposerArtifact resolves a path to a usable interposer
+// library, building from the embedded C source if none exists on disk.
+//
+// Returns (path, cleanup, error). cleanup is always safe to call
+// exactly once; defer it at the call site. For the explicit-path and
+// found-on-disk branches cleanup is a no-op; for the build-from-embed
+// branch it removes the tempdir holding the freshly-compiled artifact,
+// so the caller MUST consume `path` before allowing cleanup to run.
+func ensureInterposerArtifact(logger zerolog.Logger, explicit string) (string, func(), error) {
+	noop := func() {}
+
 	path, err := findInterposerArtifact(explicit)
 	if err == nil || explicit != "" {
-		return path, err
+		return path, noop, err
 	}
 
-	if !repoMakefileExists() {
-		return "", err
+	// No prebuilt artifact on disk and no explicit path. Compile the
+	// embedded C source on the fly. This used to require the veto source
+	// tree on disk (we'd shell out to `make interposer`); now we ship the
+	// .c + .h inside the veto binary via go:embed, so any CWD works.
+	fmt.Println("veto: interposer artifact not found; compiling from embedded source...")
+	builtPath, cleanup, buildErr := buildInterposerFromEmbed(logger)
+	if buildErr != nil {
+		logger.Error().Err(buildErr).Msg("build interposer from embed")
+		return "", noop, errors.With(buildErr, "build interposer from embedded source")
 	}
-	fmt.Println("veto: interposer artifact not found; building it with `make interposer`...")
-	cmd := exec.Command("make", "interposer")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if runErr := cmd.Run(); runErr != nil {
-		logger.Error().Err(runErr).Msg("build interposer")
-		return "", errors.With(runErr, "make interposer")
-	}
-	return findInterposerArtifact("")
-}
-
-func repoMakefileExists() bool {
-	info, err := os.Stat("Makefile")
-	return err == nil && !info.IsDir()
+	fmt.Printf("veto: built interposer at %s\n", builtPath)
+	return builtPath, cleanup, nil
 }
 
 func shellRCArgs(opts installAllOpts) []string {
