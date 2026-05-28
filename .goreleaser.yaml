@@ -1,0 +1,66 @@
+version: 2
+
+project_name: veto
+
+before:
+  hooks:
+    - go mod download
+    # Regenerate internal/interposer/pm_names.h from the canonical Go PM
+    # list before building. Veto itself does not cgo-link the interposer
+    # (see internal/interposer/gen/gen.go), but Task 3's pending embed
+    # work will go:embed veto_interpose.c at install time. Keeping the
+    # header in sync at release time means the embedded source compiles
+    # cleanly on the user's host.
+    - go generate ./internal/interposer/gen/...
+
+builds:
+  - id: veto
+    main: ./cmd/veto
+    binary: veto
+    # CGO disabled: veto itself is pure Go. The C interposer is built
+    # standalone by the Makefile (and, post-Task 3, by `veto
+    # install-preload` against an embedded copy of veto_interpose.c).
+    # Disabling CGO lets a single linux runner cross-compile darwin
+    # binaries without a darwin runner or osxcross toolchain.
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # The -X targets are not yet defined in main.go on origin/main
+    # (Task 5 lands them). Go's linker silently ignores -X against
+    # undefined symbols, so these are no-ops until Task 5 merges and
+    # become meaningful automatically afterward.
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.buildDate={{ .Date }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    name_template: >-
+      veto_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    # No LICENSE file exists on origin/main HEAD; only ship README.md
+    # alongside the binary. If the maintainer later adds LICENSE, append
+    # it here.
+    files:
+      - README.md
+    formats:
+      - tar.gz
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+release:
+  prerelease: auto
+  draft: false
