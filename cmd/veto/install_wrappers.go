@@ -147,11 +147,16 @@ func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
 	}
 
 	stats := wrapperStats{}
+	var skipped []wrapCandidate // read-only-dir candidates, for the sudo hint
 	for _, c := range candidates {
 		switch action, err := applyWrapper(c, vetoPath, opts.dryRun, opts.force); {
 		case err != nil:
 			stats.failed++
 			fmt.Fprintf(os.Stderr, "  %-10s  FAIL  %s — %v\n", c.pm, c.path, err)
+		case action == wrapperActionSkipUnwritable:
+			stats.skippedUnwritable++
+			skipped = append(skipped, c)
+			fmt.Fprintf(os.Stderr, "  %-10s  SKIP  %s — read-only dir (needs sudo)\n", c.pm, c.path)
 		case action == wrapperActionSkipAlreadyOurs:
 			// The filesystem says this is wrapped. If state agrees,
 			// silent no-op. If state doesn't know about it, reconcile —
@@ -194,12 +199,67 @@ func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
 		}
 	}
 
-	fmt.Printf("\nSummary: %d wrapped, %d reconciled, %d already-ours, %d would-wrap, %d failed\n",
-		stats.wrapped, stats.reconciled, stats.alreadyOurs, stats.wouldWrap, stats.failed)
+	fmt.Printf("\nSummary: %d wrapped, %d reconciled, %d already-ours, %d would-wrap, %d skipped (needs sudo), %d failed\n",
+		stats.wrapped, stats.reconciled, stats.alreadyOurs, stats.wouldWrap, stats.skippedUnwritable, stats.failed)
+	printUnwritableRemediation(skipped)
 	if stats.failed > 0 {
 		return exitInternal
 	}
 	return exitOK
+}
+
+// printUnwritableRemediation prints one copy-pasteable command per
+// read-only dir that held skipped candidates, so the user can finish
+// wrapping those paths under sudo and keep full protection. We don't
+// fail the run for these — they're an environmental constraint, not a
+// bug — but we make the gap and its fix loud.
+func printUnwritableRemediation(skipped []wrapCandidate) {
+	cmds := unwritableRemediationCommands(skipped)
+	if len(cmds) == 0 {
+		return
+	}
+	subject := "path needs"
+	if len(skipped) > 1 {
+		subject = "paths need"
+	}
+	fmt.Fprintf(os.Stderr, "\n%d %s elevated permissions to wrap. To finish (keeps full protection):\n",
+		len(skipped), subject)
+	for _, cmd := range cmds {
+		fmt.Fprintf(os.Stderr, "  %s\n", cmd)
+	}
+}
+
+// unwritableRemediationCommands builds one self-contained `sudo veto
+// install-wrappers` command per read-only dir, grouping the skipped pms
+// under each. The explicit --dir makes the command work even for a dir
+// that isn't a default scan root; for a default dir it just re-wraps
+// (already-ours paths are harmless no-ops). Dir order is first-seen so
+// output is stable across runs.
+func unwritableRemediationCommands(skipped []wrapCandidate) []string {
+	if len(skipped) == 0 {
+		return nil
+	}
+	dirOrder := []string{}
+	pmsByDir := map[string][]string{}
+	for _, c := range skipped {
+		dir := filepath.Dir(c.path)
+		if _, seen := pmsByDir[dir]; !seen {
+			dirOrder = append(dirOrder, dir)
+		}
+		pmsByDir[dir] = append(pmsByDir[dir], c.pm)
+	}
+	cmds := make([]string, 0, len(dirOrder))
+	for _, dir := range dirOrder {
+		var b strings.Builder
+		b.WriteString("sudo veto install-wrappers --dir ")
+		b.WriteString(dir)
+		for _, pm := range pmsByDir[dir] {
+			b.WriteString(" --only ")
+			b.WriteString(pm)
+		}
+		cmds = append(cmds, b.String())
+	}
+	return cmds
 }
 
 // runUninstallWrappers reverses every wrapper recorded in state. Files
@@ -271,11 +331,12 @@ type wrapperFlags struct {
 }
 
 type wrapperStats struct {
-	wrapped     int
-	reconciled  int
-	alreadyOurs int
-	wouldWrap   int
-	failed      int
+	wrapped           int
+	reconciled        int
+	alreadyOurs       int
+	wouldWrap         int
+	skippedUnwritable int
+	failed            int
 }
 
 type wrapAction int
@@ -283,6 +344,12 @@ type wrapAction int
 const (
 	wrapperActionSkipAlreadyOurs wrapAction = iota
 	wrapperActionSkipDryRun
+	// wrapperActionSkipUnwritable: the candidate dir isn't writable by
+	// the current user (e.g. a stray pip3 in root-owned /usr/local/bin on
+	// Apple Silicon). This is an environmental constraint, not a failure —
+	// the user can finish under sudo. Reported as a skip with a
+	// copy-pasteable remediation command rather than aborting install-all.
+	wrapperActionSkipUnwritable
 	wrapperActionWrapped
 )
 
@@ -565,9 +632,15 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 					return wrapperActionSkipDryRun, nil
 				}
 				if err := os.Remove(c.path); err != nil {
+					if os.IsPermission(err) {
+						return wrapperActionSkipUnwritable, nil
+					}
 					return wrapperActionWrapped, errors.With(err, "remove existing veto symlink for --force relink").Set("path", c.path)
 				}
 				if err := os.Symlink(vetoPath, c.path); err != nil {
+					if os.IsPermission(err) {
+						return wrapperActionSkipUnwritable, nil
+					}
 					return wrapperActionWrapped, errors.With(err, "recreate veto symlink").Set("path", c.path)
 				}
 				return wrapperActionWrapped, nil
@@ -588,8 +661,15 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		return wrapperActionSkipDryRun, nil
 	}
 
-	// 1) Move the real binary aside.
+	// 1) Move the real binary aside. A permission error here means the
+	// candidate dir is read-only to this user — classify it as a skip
+	// (not a failure) so the caller can emit a sudo remediation and
+	// install-all keeps going. Check the raw os error: os.IsPermission
+	// does not see through the errors.With wrapper.
 	if err := os.Rename(c.path, original); err != nil {
+		if os.IsPermission(err) {
+			return wrapperActionSkipUnwritable, nil
+		}
 		return wrapperActionWrapped, errors.With(err, "rename real binary aside").Set("from", c.path, "to", original)
 	}
 	// 2) Install the symlink at the original path.
@@ -597,6 +677,9 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		// Best-effort rollback so we don't strand the user with a
 		// PM that's invisible.
 		_ = os.Rename(original, c.path)
+		if os.IsPermission(err) {
+			return wrapperActionSkipUnwritable, nil
+		}
 		return wrapperActionWrapped, errors.With(err, "create veto symlink").Set("path", c.path)
 	}
 	return wrapperActionWrapped, nil

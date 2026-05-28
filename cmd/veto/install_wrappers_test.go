@@ -651,3 +651,57 @@ func TestRunInstallWrappers_EndToEnd(t *testing.T) {
 		require.Zero(t, info.Mode()&os.ModeSymlink, "post-unwrap, path should be a regular file again")
 	}
 }
+
+// TestApplyWrapper_ReadOnlyDir_SkipsUnwritable models the reported bug:
+// a stray pip3 in a dir the current user can't write (root-owned
+// /usr/local/bin on Apple Silicon). The rename-aside fails with
+// permission denied, which must surface as a skip — not an error — so
+// install-all keeps going. The real binary is left untouched.
+func TestApplyWrapper_ReadOnlyDir_SkipsUnwritable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses the dir-write permission check")
+	}
+	// veto binary lives in a writable dir; the PM lives in a read-only one.
+	home := t.TempDir()
+	veto := filepath.Join(home, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte(""), 0o755))
+
+	roDir := t.TempDir()
+	pip3 := filepath.Join(roDir, "pip3")
+	require.NoError(t, os.WriteFile(pip3, []byte("#!/bin/sh\nexec real-pip3\n"), 0o755))
+
+	// Drop the dir's write bit. Restore on cleanup so t.TempDir can prune.
+	require.NoError(t, os.Chmod(roDir, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o755) })
+
+	c := wrapCandidate{path: pip3, pm: "pip3", source: "user"}
+	action, err := applyWrapper(c, veto, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionSkipUnwritable, action)
+
+	// The real binary is untouched: still a regular file, no symlink, no
+	// .veto-original sibling stranded.
+	info, err := os.Lstat(pip3)
+	require.NoError(t, err)
+	require.Zero(t, info.Mode()&os.ModeSymlink)
+	_, err = os.Lstat(pip3 + wrapperSuffix)
+	require.True(t, os.IsNotExist(err), "no .veto-original should be left behind")
+}
+
+// TestUnwritableRemediationCommands_GroupsByDir verifies the sudo hint:
+// one self-contained command per read-only dir, --only repeated per pm,
+// dirs in first-seen order.
+func TestUnwritableRemediationCommands_GroupsByDir(t *testing.T) {
+	require.Nil(t, unwritableRemediationCommands(nil))
+
+	skipped := []wrapCandidate{
+		{path: "/usr/local/bin/pip3", pm: "pip3", source: "homebrew"},
+		{path: "/usr/local/bin/pip", pm: "pip", source: "homebrew"},
+		{path: "/opt/locked/bin/npm", pm: "npm", source: "user"},
+	}
+	cmds := unwritableRemediationCommands(skipped)
+	require.Equal(t, []string{
+		"sudo veto install-wrappers --dir /usr/local/bin --only pip3 --only pip",
+		"sudo veto install-wrappers --dir /opt/locked/bin --only npm",
+	}, cmds)
+}
