@@ -12,6 +12,11 @@
 // registry), which defeats the purpose of a parse-only gate. The intel store's
 // name-keyed fallback catches every flagged version when the range is too
 // imprecise to pin a single version.
+//
+// When the root package.json declares "workspaces", each member package.json
+// (array form or the {"packages": [...]} object form) is walked too, because
+// `npm install` at the root installs every member's deps — a fresh-checkout
+// monorepo would otherwise miss them.
 package jsmanifest
 
 import (
@@ -19,6 +24,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	vetoerrors "github.com/brynbellomy/go-utils/errors"
@@ -48,6 +54,11 @@ type packageJSON struct {
 	PeerDependencies     map[string]string `json:"peerDependencies"`
 	OptionalDependencies map[string]string `json:"optionalDependencies"`
 	BundleDependencies   []string          `json:"bundleDependencies"`
+	// Workspaces is the npm/yarn/pnpm monorepo member list. It is either a
+	// JSON array of directory globs (npm, yarn classic) or an object with a
+	// "packages" array (yarn berry), so it is kept raw and parsed by
+	// workspacePatterns.
+	Workspaces json.RawMessage `json:"workspaces"`
 }
 
 // Expand reads ref.Path and returns the []Install its direct-dependency maps
@@ -62,23 +73,58 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 		return nil, nil
 	}
 
-	data, err := os.ReadFile(ref.Path)
+	pkg, ok, err := decodePackageJSON(ref.Path)
+	if err != nil || !ok {
+		return nil, err
+	}
+
+	installs := collectDeps(pkg)
+
+	// npm/yarn/pnpm workspaces: `npm install` at the root installs every
+	// member's deps, so a member-only malicious dep would otherwise be missed
+	// on a fresh checkout. Members are discovered from the root only (no
+	// recursion / cycle risk). A lockfile, when present, already covers member
+	// deps via the lockfile expander; this closes the fresh-checkout gap.
+	members, err := workspaceMemberManifests(filepath.Dir(ref.Path), workspacePatterns(pkg.Workspaces))
+	if err != nil {
+		return nil, err
+	}
+	for _, memberPath := range members {
+		mpkg, ok, err := decodePackageJSON(memberPath)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		installs = append(installs, collectDeps(mpkg)...)
+	}
+	return installs, nil
+}
+
+// decodePackageJSON reads and parses a package.json. The bool is false (with a
+// nil error) when the file does not exist — install verbs run from non-project
+// directories, and workspace globs can name dirs without a package.json.
+// Malformed JSON or any other read error returns a wrapped error.
+func decodePackageJSON(path string) (packageJSON, bool, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
+			return packageJSON{}, false, nil
 		}
-		return nil, vetoerrors.With(err, "reading package.json").Set("path", ref.Path)
+		return packageJSON{}, false, vetoerrors.With(err, "reading package.json").Set("path", path)
 	}
-
 	var pkg packageJSON
 	if err := json.Unmarshal(data, &pkg); err != nil {
-		return nil, vetoerrors.With(err, "parse package.json").Set("path", ref.Path)
+		return packageJSON{}, false, vetoerrors.With(err, "parse package.json").Set("path", path)
 	}
+	return pkg, true, nil
+}
 
-	// Pre-size for the realistic upper bound: one entry per name across all
-	// four maps. Order is insertion-stable per Go's map iteration only within
-	// a single map, so the resulting slice is grouped by section rather than
-	// by name. That's fine — the gate's lookup is order-independent.
+// collectDeps walks a package.json's four direct-dependency maps plus
+// bundleDependencies into Installs. Safe to call for the root and for each
+// workspace member; the gate's lookup is order- and duplicate-independent.
+func collectDeps(pkg packageJSON) []packagemanager.Install {
 	approx := len(pkg.Dependencies) + len(pkg.DevDependencies) + len(pkg.PeerDependencies) + len(pkg.OptionalDependencies)
 	installs := make([]packagemanager.Install, 0, approx+len(pkg.BundleDependencies))
 	installs = appendDeps(installs, pkg.Dependencies)
@@ -95,7 +141,60 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 			RawSpec: name,
 		})
 	}
-	return installs, nil
+	return installs
+}
+
+// workspacePatterns extracts the directory globs from a package.json
+// "workspaces" value, which is either a JSON array of globs (npm, yarn
+// classic) or an object with a "packages" array (yarn berry). Returns nil for
+// any other shape. Negation patterns (yarn's "!pkg") are not interpreted —
+// over-including a member is the safe posture for a gate.
+func workspacePatterns(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return arr
+	}
+	var obj struct {
+		Packages []string `json:"packages"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.Packages
+	}
+	return nil
+}
+
+// workspaceMemberManifests expands the workspace directory globs (relative to
+// rootDir) and returns the package.json path inside each member directory that
+// has one. Glob matches that are not directories, or directories without a
+// package.json, are skipped so a stray file or data dir does not abort
+// expansion.
+func workspaceMemberManifests(rootDir string, patterns []string) ([]string, error) {
+	if len(patterns) == 0 {
+		return nil, nil
+	}
+	var out []string
+	seen := make(map[string]struct{})
+	for _, pat := range patterns {
+		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		if err != nil {
+			return nil, vetoerrors.With(err, "expand workspace member glob").Set("pattern", pat)
+		}
+		for _, dir := range matches {
+			if _, dup := seen[dir]; dup {
+				continue
+			}
+			seen[dir] = struct{}{}
+			pj := filepath.Join(dir, "package.json")
+			if info, err := os.Stat(pj); err != nil || info.IsDir() {
+				continue
+			}
+			out = append(out, pj)
+		}
+	}
+	return out, nil
 }
 
 // appendDeps turns a {name: versionSpec} map into Installs via jsspec.Parse.

@@ -5,12 +5,17 @@
 // "1.0.0" are caret requirements in Cargo, so this expander leaves Version
 // empty unless the requirement is explicitly exact (`=1.0.0`). Cargo.lock is
 // the resolved transitive source for exact crate versions.
+//
+// For a workspace root ([workspace] members = [...]), each member crate's
+// Cargo.toml is walked too, since `cargo build` at the root compiles every
+// member and a fresh checkout has no Cargo.lock to fall back on.
 package cargomanifest
 
 import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	vetoerrors "github.com/brynbellomy/go-utils/errors"
@@ -28,24 +33,24 @@ func New() *Expander { return &Expander{} }
 
 // Expand reads Cargo.toml and returns direct dependency declarations. Missing
 // files and unknown kinds return nil, nil.
+//
+// When the root is a workspace ([workspace] members = [...]), each member
+// crate's Cargo.toml is walked too: `cargo build` at a workspace root compiles
+// every member, so a member-only dep would otherwise be missed on a fresh
+// checkout with no Cargo.lock. Members are discovered from the root only;
+// `exclude` is honored.
 func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Install, error) {
 	if ref.Kind != packagemanager.ManifestKindCargoToml {
 		return nil, nil
 	}
-	data, err := os.ReadFile(ref.Path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, vetoerrors.With(err, "read Cargo.toml").Set("path", ref.Path)
+	doc, ok, err := decodeCargoToml(ref.Path)
+	if err != nil || !ok {
+		return nil, err
 	}
-	var doc map[string]any
-	if err := toml.Unmarshal(data, &doc); err != nil {
-		return nil, vetoerrors.With(err, "parse Cargo.toml").Set("path", ref.Path)
-	}
+
 	seen := map[string]struct{}{}
 	var out []packagemanager.Install
-	collectDependencyTables(doc, func(deps map[string]any) {
+	visit := func(deps map[string]any) {
 		for name, raw := range deps {
 			ins, ok := installFromDependency(name, raw)
 			if !ok {
@@ -64,8 +69,111 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 			seen[key] = struct{}{}
 			out = append(out, ins)
 		}
-	})
+	}
+
+	collectDependencyTables(doc, visit)
+
+	members, err := cargoWorkspaceMembers(filepath.Dir(ref.Path), doc)
+	if err != nil {
+		return nil, err
+	}
+	for _, memberPath := range members {
+		mdoc, ok, err := decodeCargoToml(memberPath)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		collectDependencyTables(mdoc, visit)
+	}
 	return out, nil
+}
+
+// decodeCargoToml reads and parses a Cargo.toml. The bool is false (with a nil
+// error) when the file does not exist — workspace globs can name dirs without a
+// Cargo.toml, and scans run from non-project directories. Malformed TOML or any
+// other read error returns a wrapped error so the gate fails closed.
+func decodeCargoToml(path string) (map[string]any, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, vetoerrors.With(err, "read Cargo.toml").Set("path", path)
+	}
+	var doc map[string]any
+	if err := toml.Unmarshal(data, &doc); err != nil {
+		return nil, false, vetoerrors.With(err, "parse Cargo.toml").Set("path", path)
+	}
+	return doc, true, nil
+}
+
+// cargoWorkspaceMembers expands the [workspace] members/exclude directory globs
+// (relative to rootDir) and returns the Cargo.toml path inside each
+// non-excluded member directory that has one. Glob matches that are not
+// directories, or lack a Cargo.toml, are skipped. Only explicit members are
+// walked — Cargo's implicit path-dependency members are out of scope.
+func cargoWorkspaceMembers(rootDir string, doc map[string]any) ([]string, error) {
+	workspace, ok := tableValue(doc["workspace"])
+	if !ok {
+		return nil, nil
+	}
+	members := stringSlice(workspace["members"])
+	if len(members) == 0 {
+		return nil, nil
+	}
+
+	excluded := make(map[string]struct{})
+	for _, pat := range stringSlice(workspace["exclude"]) {
+		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		if err != nil {
+			return nil, vetoerrors.With(err, "expand workspace exclude glob").Set("pattern", pat)
+		}
+		for _, m := range matches {
+			excluded[m] = struct{}{}
+		}
+	}
+
+	var out []string
+	seenDir := make(map[string]struct{})
+	for _, pat := range members {
+		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		if err != nil {
+			return nil, vetoerrors.With(err, "expand workspace member glob").Set("pattern", pat)
+		}
+		for _, dir := range matches {
+			if _, ex := excluded[dir]; ex {
+				continue
+			}
+			if _, dup := seenDir[dir]; dup {
+				continue
+			}
+			seenDir[dir] = struct{}{}
+			ct := filepath.Join(dir, "Cargo.toml")
+			if info, err := os.Stat(ct); err != nil || info.IsDir() {
+				continue
+			}
+			out = append(out, ct)
+		}
+	}
+	return out, nil
+}
+
+// stringSlice extracts the string elements of a TOML array decoded as []any,
+// dropping any non-string entries.
+func stringSlice(raw any) []string {
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func collectDependencyTables(doc map[string]any, visit func(map[string]any)) {

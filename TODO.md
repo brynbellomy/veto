@@ -17,11 +17,11 @@ current user-facing behavior.
   `--package=<spec>` flag is honored and trailing positionals after
   the spec are not over-gated. Today these verbs go through
   `jsspec.ParseInstallArgs` which treats every positional as a spec.
-- Phase 1.6.5 partial: jsmanifest does NOT yet walk `workspaces`
-  glob patterns recursively. The lockfile expanders pick up
-  workspace-member deps in practice (the resolver writes them
-  through), but the manifest path on a fresh-checkout monorepo
-  misses them.
+- Phase 1.6.5 (done): jsmanifest now walks `package.json` `workspaces` (both
+  the array form and the `{ "packages": [...] }` object form), reading each
+  member's package.json so a fresh-checkout monorepo no longer misses member
+  deps. Members are discovered from the root only (no recursion); negation
+  patterns are not interpreted (over-including a member is the safe posture).
 - Phase 1.6 followup: gate `jsspec.tryParseAlias` on
   `isLegalNpmName(name)` so `user/repo@npm:evil@1` is treated as
   github-shorthand (OpaqueRemote) rather than alias-unwrapped to
@@ -59,12 +59,13 @@ current user-facing behavior.
   member's deps. `exclude` is honored; glob matches without a pyproject.toml
   are skipped. (Member-transitive coverage on a fresh checkout still depends on
   a future `uv sync` resolver prescan — see below.)
-- Phase 1.8.2 deferred: cargo coverage still needs `publish` in
+- Phase 1.8.2 partial: `[workspace]` members expansion for monorepo Cargo.toml
+  roots is now done — cargomanifest walks each member crate's Cargo.toml
+  (explicit members only; `exclude` honored). Still remaining: `publish` in
   ParseInstalls (it fetches + builds); `doc`, `package` added to
-  ProjectPreflight (they run build.rs / proc-macros);
+  ProjectPreflight (they run build.rs / proc-macros); and a
   `cargomanifest` registry classifier (non-crates-io `registry = ...`
-  should be OpaqueRemote, mirroring cargolock); and `[workspace]`
-  members expansion for monorepo Cargo.toml roots.
+  should be OpaqueRemote, mirroring cargolock).
 - SHIPPED: `cargo install --git` / `cargo add --git` clone-and-scan
   (`cmd/veto/opaquegit.go` + `cargo.OpaqueRemoteResolver`). Clones to a temp
   dir, regenerates the lockfile (mirrors cargo's resolution; honors
