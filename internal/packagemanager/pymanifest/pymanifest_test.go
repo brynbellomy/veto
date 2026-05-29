@@ -91,6 +91,66 @@ ruff = "0.4.4"
 	require.Equal(t, "0.4.4", byName["ruff"].Ref.Version)
 }
 
+// TestExpandPyProjectUvPdmAndDependencyGroups covers the dependency tables
+// that uv and pdm install from but pymanifest previously ignored: PEP 735
+// [dependency-groups], uv's legacy [tool.uv] dev-dependencies, and
+// [tool.pdm.dev-dependencies]. On a fresh checkout with no lockfile, a package
+// declared only in one of these sections would otherwise sail through
+// `uv sync` / `pdm install` ungated — a direct-dependency fail-open.
+func TestExpandPyProjectUvPdmAndDependencyGroups(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pyproject.toml")
+
+	contents := `
+[project]
+name = "demo"
+dependencies = ["requests"]
+
+[dependency-groups]
+dev = ["pytest>=7", "groups-evil==1.2.3", {include-group = "extra"}]
+extra = ["sphinx>=7"]
+
+[tool.uv]
+dev-dependencies = ["ruff==0.4.4", "uv-evil"]
+
+[tool.pdm.dev-dependencies]
+test = ["mypy>=1.0", "pdm-evil==9.9.9"]
+lint = ["flake8"]
+`
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o644))
+
+	exp := pymanifest.New()
+	installs, err := exp.Expand(packagemanager.ManifestRef{
+		Path: path,
+		Kind: packagemanager.ManifestKindPyProject,
+	})
+	require.NoError(t, err)
+
+	byName := make(map[string]packagemanager.Install, len(installs))
+	for _, ins := range installs {
+		require.Equal(t, intel.EcosystemPyPI, ins.Ref.Ecosystem)
+		require.NotEmpty(t, ins.Ref.Name, "include-group reference must not create a nameless install")
+		byName[ins.Ref.Name] = ins
+	}
+
+	// PEP 735 [dependency-groups]
+	require.Contains(t, byName, "pytest")
+	require.Contains(t, byName, "groups-evil")
+	require.Equal(t, "1.2.3", byName["groups-evil"].Ref.Version)
+	require.Contains(t, byName, "sphinx", "include-group reference still resolves the included group")
+
+	// uv legacy [tool.uv] dev-dependencies
+	require.Contains(t, byName, "ruff")
+	require.Equal(t, "0.4.4", byName["ruff"].Ref.Version)
+	require.Contains(t, byName, "uv-evil")
+
+	// [tool.pdm.dev-dependencies], all groups merged
+	require.Contains(t, byName, "mypy")
+	require.Contains(t, byName, "pdm-evil")
+	require.Equal(t, "9.9.9", byName["pdm-evil"].Ref.Version)
+	require.Contains(t, byName, "flake8")
+}
+
 func TestExpandMissingFileReturnsEmpty(t *testing.T) {
 	exp := pymanifest.New()
 	installs, err := exp.Expand(packagemanager.ManifestRef{

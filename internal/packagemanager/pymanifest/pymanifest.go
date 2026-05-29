@@ -9,8 +9,11 @@
 //
 //   - [project] dependencies = [...]          (PEP 621 standard)
 //   - [project.optional-dependencies.<group>] (PEP 621 extras)
+//   - [dependency-groups.<group>]             (PEP 735 dependency groups)
 //   - [tool.poetry.dependencies]              (Poetry)
 //   - [tool.poetry.group.<name>.dependencies] (Poetry group deps)
+//   - [tool.uv] dev-dependencies              (uv legacy dev deps)
+//   - [tool.pdm.dev-dependencies.<group>]     (PDM dev deps)
 //
 // Direct deps only. The intel store's name-keyed fallback catches every
 // flagged version when the spec is a range we can't pin.
@@ -59,11 +62,28 @@ type pyproject struct {
 		Dependencies         []string            `toml:"dependencies"`
 		OptionalDependencies map[string][]string `toml:"optional-dependencies"`
 	} `toml:"project"`
-	Tool struct {
+	// PEP 735 dependency groups. Each group is a list whose entries are
+	// usually PEP 508 strings, but an entry can also be an
+	// {include-group = "..."} table referencing another group. Decoded as
+	// []any so the include-group tables don't break the decode; they carry no
+	// package name and are skipped (the referenced group is walked on its own).
+	DependencyGroups map[string][]any `toml:"dependency-groups"`
+	Tool             struct {
 		Poetry struct {
 			Dependencies map[string]any         `toml:"dependencies"`
 			Group        map[string]poetryGroup `toml:"group"`
 		} `toml:"poetry"`
+		// uv's pre-PEP-735 dev dependency list. PEP 508 strings; decoded as
+		// []any so an unexpected shape is skipped rather than aborting the
+		// whole-file decode.
+		UV struct {
+			DevDependencies []any `toml:"dev-dependencies"`
+		} `toml:"uv"`
+		// PDM dev dependencies: group name → list of PEP 508 (or `-e path`)
+		// strings. Decoded as []any for the same robustness reason.
+		PDM struct {
+			DevDependencies map[string][]any `toml:"dev-dependencies"`
+		} `toml:"pdm"`
 	} `toml:"tool"`
 }
 
@@ -115,6 +135,17 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 		installs = append(installs, ins)
 	}
 
+	// addSpecStrings parses and adds every PEP 508 string entry in specs.
+	// Non-string entries — e.g. a PEP 735 {include-group = "..."} table, which
+	// names another group walked separately — carry no package and are skipped.
+	addSpecStrings := func(specs []any) {
+		for _, entry := range specs {
+			if spec, ok := entry.(string); ok {
+				addInstall(pyspec.Parse(spec))
+			}
+		}
+	}
+
 	// PEP 621: [project] dependencies = ["requests>=2.0", ...]
 	for _, spec := range pyp.Project.Dependencies {
 		addInstall(pyspec.Parse(spec))
@@ -137,6 +168,19 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 		for _, ins := range poetryDeps(group.Dependencies) {
 			addInstall(ins)
 		}
+	}
+
+	// PEP 735: [dependency-groups].<group> = ["pytest>=7", {include-group = ...}]
+	for _, group := range pyp.DependencyGroups {
+		addSpecStrings(group)
+	}
+
+	// uv (pre-PEP-735): [tool.uv] dev-dependencies = ["ruff==0.4.4", ...]
+	addSpecStrings(pyp.Tool.UV.DevDependencies)
+
+	// PDM: [tool.pdm.dev-dependencies].<group> = ["mypy>=1.0", ...]
+	for _, group := range pyp.Tool.PDM.DevDependencies {
+		addSpecStrings(group)
 	}
 
 	return installs, nil

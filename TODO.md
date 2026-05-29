@@ -45,11 +45,15 @@ current user-facing behavior.
   on the now-stale (or absent) `uv.lock`. Remaining: `uv add -r requirements.txt`
   (no positional spec) still falls back to requirements-file expansion without a
   transitive probe; project-level `uv sync` continues to rely on the locked tree.
-- Phase 1.7.5 partial: pymanifest does NOT yet read
-  `[tool.uv] dependencies / dev-dependencies / workspace.members`
-  or `[tool.pdm.dev-dependencies]`. uv/pdm projects fall back to
-  the lockfile path (covered) but a fresh checkout with no lockfile
-  yet would miss these direct deps.
+- Phase 1.7.5 (dev-deps + PEP 735 done): pymanifest now walks PEP 735
+  `[dependency-groups]`, uv's legacy `[tool.uv] dev-dependencies`, and
+  `[tool.pdm.dev-dependencies]`, closing the direct-dependency fail-open
+  where a package declared only in those sections sailed through
+  `uv sync` / `pdm install` on a fresh checkout (no lockfile). Remaining:
+  `[tool.uv.workspace] members` (needs recursive per-member pyproject
+  walking for monorepos) and `[tool.uv.sources]` (can redirect a named dep
+  to a git/url; the name-keyed gate still fires, but the opaque-remote
+  fetch isn't surfaced).
 - Phase 1.8.2 deferred: cargo coverage still needs `publish` in
   ParseInstalls (it fetches + builds); `doc`, `package` added to
   ProjectPreflight (they run build.rs / proc-macros);
