@@ -49,11 +49,12 @@ current user-facing behavior.
   `[dependency-groups]`, uv's legacy `[tool.uv] dev-dependencies`, and
   `[tool.pdm.dev-dependencies]`, closing the direct-dependency fail-open
   where a package declared only in those sections sailed through
-  `uv sync` / `pdm install` on a fresh checkout (no lockfile). Remaining:
-  `[tool.uv.workspace] members` (needs recursive per-member pyproject
-  walking for monorepos) and `[tool.uv.sources]` (can redirect a named dep
-  to a git/url; the name-keyed gate still fires, but the opaque-remote
-  fetch isn't surfaced).
+  `uv sync` / `pdm install` on a fresh checkout (no lockfile). pymanifest
+  also now reads `[tool.uv.sources]` and flags a declared dep redirected to a
+  git/url source as OpaqueRemote (path/workspace → LocalPath), so a source
+  redirect can't launder a remote-code fetch past the gate's unconditional
+  opaque-remote refusal. Remaining: `[tool.uv.workspace] members` (needs
+  recursive per-member pyproject walking for monorepos).
 - Phase 1.8.2 deferred: cargo coverage still needs `publish` in
   ParseInstalls (it fetches + builds); `doc`, `package` added to
   ProjectPreflight (they run build.rs / proc-macros);

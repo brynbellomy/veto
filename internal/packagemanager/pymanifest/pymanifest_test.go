@@ -151,6 +151,84 @@ lint = ["flake8"]
 	require.Contains(t, byName, "flake8")
 }
 
+// TestExpandPyProjectUvSourcesFlagRedirectedDeps ensures a dependency that
+// [tool.uv.sources] redirects to a git/url source is flagged OpaqueRemote, and
+// a path/workspace redirect is flagged LocalPath. Without this, uv fetches
+// arbitrary remote code for a dep that looks clean by name — laundering past
+// the gate's unconditional opaque-remote refusal. Over-gating multi-source
+// (marker-gated) deps to OpaqueRemote is the safe posture: veto can't evaluate
+// markers, so if any platform fetches remote code, refuse.
+func TestExpandPyProjectUvSourcesFlagRedirectedDeps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pyproject.toml")
+
+	contents := `
+[project]
+name = "demo"
+dependencies = [
+  "git-redirect",
+  "url-redirect",
+  "path-redirect",
+  "ws-redirect",
+  "index-redirect",
+  "multi-redirect",
+  "plain",
+]
+
+[dependency-groups]
+dev = ["dev-git-redirect"]
+
+[tool.uv.sources]
+git-redirect = { git = "https://evil.example/repo.git" }
+url-redirect = { url = "https://evil.example/pkg.whl" }
+path-redirect = { path = "../sibling" }
+ws-redirect = { workspace = true }
+index-redirect = { index = "my-index" }
+multi-redirect = [
+  { git = "https://evil.example/win.git", marker = "sys_platform == 'win32'" },
+  { index = "pypi" },
+]
+dev-git-redirect = { git = "https://evil.example/dev.git" }
+`
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o644))
+
+	exp := pymanifest.New()
+	installs, err := exp.Expand(packagemanager.ManifestRef{
+		Path: path,
+		Kind: packagemanager.ManifestKindPyProject,
+	})
+	require.NoError(t, err)
+
+	byName := make(map[string]packagemanager.Install, len(installs))
+	for _, ins := range installs {
+		byName[ins.Ref.Name] = ins
+	}
+
+	// git / url redirects → OpaqueRemote so the gate refuses the remote fetch.
+	require.True(t, byName["git-redirect"].OpaqueRemote, "git source must flag OpaqueRemote")
+	require.False(t, byName["git-redirect"].LocalPath)
+	require.True(t, byName["url-redirect"].OpaqueRemote, "url source must flag OpaqueRemote")
+
+	// path / workspace redirects → LocalPath (local code the user controls).
+	require.True(t, byName["path-redirect"].LocalPath, "path source must flag LocalPath")
+	require.False(t, byName["path-redirect"].OpaqueRemote)
+	require.True(t, byName["ws-redirect"].LocalPath, "workspace source must flag LocalPath")
+
+	// A named alternate index is still resolved from a registry by name — no flag.
+	require.False(t, byName["index-redirect"].OpaqueRemote)
+	require.False(t, byName["index-redirect"].LocalPath)
+
+	// Multi-source (marker-gated) with a git variant → over-gate to OpaqueRemote.
+	require.True(t, byName["multi-redirect"].OpaqueRemote, "multi-source with a git variant must flag OpaqueRemote")
+
+	// A dep with no source override keeps its clean record.
+	require.False(t, byName["plain"].OpaqueRemote)
+	require.False(t, byName["plain"].LocalPath)
+
+	// Source overrides apply across sections, not just [project] dependencies.
+	require.True(t, byName["dev-git-redirect"].OpaqueRemote, "source override must apply to dependency-groups deps too")
+}
+
 func TestExpandMissingFileReturnsEmpty(t *testing.T) {
 	exp := pymanifest.New()
 	installs, err := exp.Expand(packagemanager.ManifestRef{

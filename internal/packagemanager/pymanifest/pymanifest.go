@@ -15,6 +15,10 @@
 //   - [tool.uv] dev-dependencies              (uv legacy dev deps)
 //   - [tool.pdm.dev-dependencies.<group>]     (PDM dev deps)
 //
+// It also reads [tool.uv.sources] to flag declared deps that uv redirects to a
+// git/url source (OpaqueRemote) or a path/workspace source (LocalPath), so a
+// source redirect can't launder a remote-code fetch past the gate.
+//
 // Direct deps only. The intel store's name-keyed fallback catches every
 // flagged version when the spec is a range we can't pin.
 //
@@ -76,8 +80,14 @@ type pyproject struct {
 		// uv's pre-PEP-735 dev dependency list. PEP 508 strings; decoded as
 		// []any so an unexpected shape is skipped rather than aborting the
 		// whole-file decode.
+		//
+		// Sources redirects a declared dependency to a non-PyPI source
+		// (git/url/path/workspace/index). Each value is an inline table or an
+		// array of marker-gated inline tables, so it is decoded as `any` and
+		// type-switched in classifyUvSource.
 		UV struct {
-			DevDependencies []any `toml:"dev-dependencies"`
+			DevDependencies []any          `toml:"dev-dependencies"`
+			Sources         map[string]any `toml:"sources"`
 		} `toml:"uv"`
 		// PDM dev dependencies: group name → list of PEP 508 (or `-e path`)
 		// strings. Decoded as []any for the same robustness reason.
@@ -183,7 +193,110 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 		addSpecStrings(group)
 	}
 
+	// uv: [tool.uv.sources] redirects a declared dep to git/url/path/workspace.
+	// A name-keyed lookup can't see that the fetch is opaque-remote, so flag
+	// the corresponding install before the gate decides.
+	applyUvSources(installs, pyp.Tool.UV.Sources)
+
 	return installs, nil
+}
+
+// sourceKind classifies how a [tool.uv.sources] entry resolves a dependency.
+type sourceKind int
+
+const (
+	sourceOpaqueRemote sourceKind = iota + 1 // git / url — fetches remote code
+	sourceLocalPath                          // path / workspace — local code
+)
+
+// applyUvSources mutates installs in place, flagging any whose name is
+// redirected by a [tool.uv.sources] entry. Sources only ever redirect deps
+// that are already declared elsewhere, so orphan sources (no matching install)
+// are ignored — they install nothing. Names are matched under PyPI (PEP 503)
+// normalization so a `my_pkg` dep matches a `my-pkg` source.
+func applyUvSources(installs []packagemanager.Install, sources map[string]any) {
+	if len(sources) == 0 {
+		return
+	}
+	kinds := make(map[string]sourceKind, len(sources))
+	for name, raw := range sources {
+		if kind, ok := classifyUvSource(raw); ok {
+			kinds[intel.NormalizeName(intel.EcosystemPyPI, name)] = kind
+		}
+	}
+	for i := range installs {
+		kind, ok := kinds[intel.NormalizeName(intel.EcosystemPyPI, installs[i].Ref.Name)]
+		if !ok {
+			continue
+		}
+		switch kind {
+		case sourceOpaqueRemote:
+			installs[i].OpaqueRemote = true
+		case sourceLocalPath:
+			installs[i].LocalPath = true
+		}
+	}
+}
+
+// classifyUvSource inspects a [tool.uv.sources] value. A value is either a
+// single inline table or an array of marker-gated inline tables. For an array,
+// the most restrictive variant wins: if any platform would fetch git/url code,
+// the dep is OpaqueRemote (veto can't evaluate markers, so it over-gates to the
+// safe posture). Returns (_, false) for index/registry-only sources, which are
+// still resolved from a registry by name.
+func classifyUvSource(raw any) (sourceKind, bool) {
+	switch v := raw.(type) {
+	case map[string]any:
+		return classifyUvSourceTable(v)
+	case []map[string]any:
+		best, found := sourceKind(0), false
+		for _, tbl := range v {
+			if kind, ok := classifyUvSourceTable(tbl); ok {
+				if kind == sourceOpaqueRemote {
+					return sourceOpaqueRemote, true
+				}
+				best, found = kind, true
+			}
+		}
+		return best, found
+	case []any:
+		best, found := sourceKind(0), false
+		for _, entry := range v {
+			tbl, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			if kind, ok := classifyUvSourceTable(tbl); ok {
+				if kind == sourceOpaqueRemote {
+					return sourceOpaqueRemote, true
+				}
+				best, found = kind, true
+			}
+		}
+		return best, found
+	default:
+		return 0, false
+	}
+}
+
+// classifyUvSourceTable classifies one [tool.uv.sources] inline table. git/url
+// fetch remote code; path and workspace members are local. A bare
+// `{ index = "..." }` / `{ registry = "..." }` is a named alternate registry —
+// still resolved by name, so it gets no flag.
+func classifyUvSourceTable(tbl map[string]any) (sourceKind, bool) {
+	if _, ok := tbl["git"]; ok {
+		return sourceOpaqueRemote, true
+	}
+	if _, ok := tbl["url"]; ok {
+		return sourceOpaqueRemote, true
+	}
+	if _, ok := tbl["path"]; ok {
+		return sourceLocalPath, true
+	}
+	if ws, ok := tbl["workspace"].(bool); ok && ws {
+		return sourceLocalPath, true
+	}
+	return 0, false
 }
 
 // poetryDeps turns a Poetry-shaped dep map into Installs.
