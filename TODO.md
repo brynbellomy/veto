@@ -26,18 +26,25 @@ current user-facing behavior.
   `isLegalNpmName(name)` so `user/repo@npm:evil@1` is treated as
   github-shorthand (OpaqueRemote) rather than alias-unwrapped to
   `evil`. Minor precedence quirk; no known exploit path in argv.
-- Phase 1.7.3 deferred: pip and uv resolver prescans should forward
-  user-supplied `--index-url`, `--extra-index-url`, `--find-links`,
-  `--keyring-provider`, `--override`, `--prerelease`, `--resolution`,
-  `--python` flags so private-index installs prescan correctly, and
-  should strip `--no-deps` / `--no-build-isolation` so the dry-run
-  sees the full transitive set the real install will pull. Today
-  the prescan synthesizes a fixed argv and silently misses these.
-- Phase 1.7.4 deferred: `uv add` / `uv install` against a missing or
-  stale lockfile should fall through to ResolverPreScan (synthesize
-  a requirements input, run `uv pip compile`) instead of gating the
-  pre-existing — now incomplete — lockfile. Real fail-OPEN against
-  `uv add <new-malware>`.
+- Phase 1.7.3 (uv side done): the uv `pip compile` prescan now forwards the
+  user's resolver-affecting flags (`--index`, `--default-index`, `--index-url`/
+  `-i`, `--extra-index-url`, `--find-links`/`-f`, `--index-strategy`,
+  `--keyring-provider`, `--prerelease`, `--resolution`, `--python`/`-p`) via
+  `forwardResolverFlags`, so private-index installs prescan instead of aborting.
+  pip's prescan already forwards these because it reuses the original argv. The
+  original `--override` item is uv-only and not yet in the allowlist (add if a
+  real use surfaces). NOTE: the earlier "strip `--no-deps` / `--no-build-isolation`"
+  idea was dropped as a bug — with `--no-deps` the real install pulls NO
+  transitives, so stripping it would over-block deps that never get fetched, and
+  `--no-build-isolation` is inert under the forced `--only-binary=:all:`.
+- Phase 1.7.4 (done for explicit specs): `uv add` / `uv install` now fall
+  through to ResolverPreScan — `addPreScan` compiles the seeded `pyproject.toml`
+  plus a synthetic input for the newly-named specs (`uv pip compile pyproject.toml
+  veto-uv-requirements.in --format pylock.toml --only-binary :all:`), so the new
+  package's transitive tree is gated before the install runs instead of relying
+  on the now-stale (or absent) `uv.lock`. Remaining: `uv add -r requirements.txt`
+  (no positional spec) still falls back to requirements-file expansion without a
+  transitive probe; project-level `uv sync` continues to rely on the locked tree.
 - Phase 1.7.5 partial: pymanifest does NOT yet read
   `[tool.uv] dependencies / dev-dependencies / workspace.members`
   or `[tool.pdm.dev-dependencies]`. uv/pdm projects fall back to
