@@ -53,8 +53,12 @@ current user-facing behavior.
   also now reads `[tool.uv.sources]` and flags a declared dep redirected to a
   git/url source as OpaqueRemote (path/workspace → LocalPath), so a source
   redirect can't launder a remote-code fetch past the gate's unconditional
-  opaque-remote refusal. Remaining: `[tool.uv.workspace] members` (needs
-  recursive per-member pyproject walking for monorepos).
+  opaque-remote refusal. pymanifest also walks `[tool.uv.workspace]` members
+  now: each member's pyproject.toml (deps, groups, dev-deps, and its own
+  `[tool.uv.sources]`) is gated because `uv sync` at the root installs every
+  member's deps. `exclude` is honored; glob matches without a pyproject.toml
+  are skipped. (Member-transitive coverage on a fresh checkout still depends on
+  a future `uv sync` resolver prescan — see below.)
 - Phase 1.8.2 deferred: cargo coverage still needs `publish` in
   ParseInstalls (it fetches + builds); `doc`, `package` added to
   ProjectPreflight (they run build.rs / proc-macros);

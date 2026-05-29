@@ -229,6 +229,80 @@ dev-git-redirect = { git = "https://evil.example/dev.git" }
 	require.True(t, byName["dev-git-redirect"].OpaqueRemote, "source override must apply to dependency-groups deps too")
 }
 
+// TestExpandPyProjectUvWorkspaceMembers ensures that when the root pyproject
+// declares a [tool.uv.workspace], the deps of every (non-excluded) member are
+// gated too. `uv sync` at the root installs all member deps, so a member-only
+// malicious dep on a fresh checkout (no lockfile) is otherwise a
+// direct-dependency fail-open. Member [tool.uv.sources] redirects and
+// [dependency-groups] are honored; the `exclude` list is respected; a matched
+// directory without a pyproject.toml is skipped without error.
+func TestExpandPyProjectUvWorkspaceMembers(t *testing.T) {
+	root := t.TempDir()
+
+	writeFile := func(rel, contents string) {
+		full := filepath.Join(root, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+		require.NoError(t, os.WriteFile(full, []byte(contents), 0o644))
+	}
+
+	writeFile("pyproject.toml", `
+[project]
+name = "root"
+dependencies = ["root-dep"]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+exclude = ["packages/legacy"]
+`)
+	writeFile("packages/foo/pyproject.toml", `
+[project]
+name = "foo"
+dependencies = ["foo-evil==1.0.0"]
+
+[dependency-groups]
+dev = ["foo-dev-evil"]
+`)
+	writeFile("packages/bar/pyproject.toml", `
+[project]
+name = "bar"
+dependencies = ["bar-evil"]
+
+[tool.uv.sources]
+bar-evil = { git = "https://evil.example/bar.git" }
+`)
+	writeFile("packages/legacy/pyproject.toml", `
+[project]
+name = "legacy"
+dependencies = ["legacy-dep"]
+`)
+	// A glob match with no pyproject.toml must be skipped gracefully.
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "packages/notapkg"), 0o755))
+
+	exp := pymanifest.New()
+	installs, err := exp.Expand(packagemanager.ManifestRef{
+		Path: filepath.Join(root, "pyproject.toml"),
+		Kind: packagemanager.ManifestKindPyProject,
+	})
+	require.NoError(t, err)
+
+	byName := make(map[string]packagemanager.Install, len(installs))
+	for _, ins := range installs {
+		byName[ins.Ref.Name] = ins
+	}
+
+	require.Contains(t, byName, "root-dep")
+
+	// Member deps, dependency-groups, and source redirects are all gated.
+	require.Contains(t, byName, "foo-evil")
+	require.Equal(t, "1.0.0", byName["foo-evil"].Ref.Version)
+	require.Contains(t, byName, "foo-dev-evil")
+	require.Contains(t, byName, "bar-evil")
+	require.True(t, byName["bar-evil"].OpaqueRemote, "member [tool.uv.sources] git redirect must flag OpaqueRemote")
+
+	// Excluded members are not walked.
+	require.NotContains(t, byName, "legacy-dep", "excluded workspace member must not be gated")
+}
+
 func TestExpandMissingFileReturnsEmpty(t *testing.T) {
 	exp := pymanifest.New()
 	installs, err := exp.Expand(packagemanager.ManifestRef{

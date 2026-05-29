@@ -19,6 +19,10 @@
 // git/url source (OpaqueRemote) or a path/workspace source (LocalPath), so a
 // source redirect can't launder a remote-code fetch past the gate.
 //
+// When the root declares a [tool.uv.workspace], each member's pyproject.toml is
+// walked too (members/exclude are directory globs), because `uv sync` installs
+// every member's dependencies alongside the root's.
+//
 // Direct deps only. The intel store's name-keyed fallback catches every
 // flagged version when the spec is a range we can't pin.
 //
@@ -34,6 +38,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -88,6 +93,13 @@ type pyproject struct {
 		UV struct {
 			DevDependencies []any          `toml:"dev-dependencies"`
 			Sources         map[string]any `toml:"sources"`
+			// Workspace lists member packages whose own pyproject.toml files
+			// `uv sync` installs alongside the root. members/exclude are
+			// directory globs relative to this file's directory.
+			Workspace struct {
+				Members []string `toml:"members"`
+				Exclude []string `toml:"exclude"`
+			} `toml:"workspace"`
 		} `toml:"uv"`
 		// PDM dev dependencies: group name → list of PEP 508 (or `-e path`)
 		// strings. Decoded as []any for the same robustness reason.
@@ -114,17 +126,9 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 		return nil, nil
 	}
 
-	data, err := os.ReadFile(ref.Path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, vetoerrors.With(err, "reading pyproject.toml").Set("path", ref.Path)
-	}
-
-	var pyp pyproject
-	if _, err := toml.Decode(string(data), &pyp); err != nil {
-		return nil, vetoerrors.With(err, "parse pyproject.toml").Set("path", ref.Path)
+	pyp, ok, err := decodePyproject(ref.Path)
+	if err != nil || !ok {
+		return nil, err
 	}
 
 	// Dedupe by lower-cased PyPI name across all sources; the install set is
@@ -145,38 +149,113 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 		installs = append(installs, ins)
 	}
 
+	// Collect every [tool.uv.sources] table — the root's plus each workspace
+	// member's — and apply them once at the end. Source overrides flag where a
+	// dep is fetched from, so they must run after all deps are collected. The
+	// root's entries take precedence on name collisions (first writer wins).
+	var sources map[string]any
+	mergeSources := func(s map[string]any) {
+		if len(s) == 0 {
+			return
+		}
+		if sources == nil {
+			sources = make(map[string]any, len(s))
+		}
+		for name, raw := range s {
+			if _, dup := sources[name]; !dup {
+				sources[name] = raw
+			}
+		}
+	}
+
+	walkPyprojectDeps(pyp, addInstall)
+	mergeSources(pyp.Tool.UV.Sources)
+
+	// uv workspaces: `uv sync` at the root installs every member's deps too, so
+	// a member-only malicious dep would otherwise be missed on a fresh checkout.
+	// Members are discovered from the ROOT only — uv workspaces don't nest, and
+	// not recursing avoids cycles.
+	members, err := workspaceMemberPyprojects(filepath.Dir(ref.Path), pyp.Tool.UV.Workspace.Members, pyp.Tool.UV.Workspace.Exclude)
+	if err != nil {
+		return nil, err
+	}
+	for _, memberPath := range members {
+		mpyp, ok, err := decodePyproject(memberPath)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		walkPyprojectDeps(mpyp, addInstall)
+		mergeSources(mpyp.Tool.UV.Sources)
+	}
+
+	// uv: [tool.uv.sources] redirects a declared dep to git/url/path/workspace.
+	// A name-keyed lookup can't see that the fetch is opaque-remote, so flag
+	// the corresponding install before the gate decides.
+	applyUvSources(installs, sources)
+
+	return installs, nil
+}
+
+// decodePyproject reads and parses a pyproject.toml. The bool is false (with a
+// nil error) when the file does not exist — install verbs run from non-project
+// directories, and workspace globs can name dirs without a pyproject. Malformed
+// TOML or any other read error returns a wrapped error so the gate fails closed.
+func decodePyproject(path string) (pyproject, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return pyproject{}, false, nil
+		}
+		return pyproject{}, false, vetoerrors.With(err, "reading pyproject.toml").Set("path", path)
+	}
+	var pyp pyproject
+	if _, err := toml.Decode(string(data), &pyp); err != nil {
+		return pyproject{}, false, vetoerrors.With(err, "parse pyproject.toml").Set("path", path)
+	}
+	return pyp, true, nil
+}
+
+// walkPyprojectDeps adds every direct dependency declared in pyp's dependency
+// tables via add. It does NOT handle [tool.uv.sources] (a cross-cutting flag
+// applied after all deps are collected) or [tool.uv.workspace] (expanded only
+// from the root). Safe to call for the root and for each workspace member,
+// accumulating into a shared dedupe set through add.
+func walkPyprojectDeps(pyp pyproject, add func(packagemanager.Install)) {
 	// addSpecStrings parses and adds every PEP 508 string entry in specs.
 	// Non-string entries — e.g. a PEP 735 {include-group = "..."} table, which
 	// names another group walked separately — carry no package and are skipped.
 	addSpecStrings := func(specs []any) {
 		for _, entry := range specs {
 			if spec, ok := entry.(string); ok {
-				addInstall(pyspec.Parse(spec))
+				add(pyspec.Parse(spec))
 			}
 		}
 	}
 
 	// PEP 621: [project] dependencies = ["requests>=2.0", ...]
 	for _, spec := range pyp.Project.Dependencies {
-		addInstall(pyspec.Parse(spec))
+		add(pyspec.Parse(spec))
 	}
 
 	// PEP 621: [project.optional-dependencies.<group>] = ["pytest>=7", ...]
 	for _, group := range pyp.Project.OptionalDependencies {
 		for _, spec := range group {
-			addInstall(pyspec.Parse(spec))
+			add(pyspec.Parse(spec))
 		}
 	}
 
 	// Poetry: [tool.poetry.dependencies]
 	for _, ins := range poetryDeps(pyp.Tool.Poetry.Dependencies) {
-		addInstall(ins)
+		add(ins)
 	}
 
 	// Poetry: [tool.poetry.group.<name>.dependencies]
 	for _, group := range pyp.Tool.Poetry.Group {
 		for _, ins := range poetryDeps(group.Dependencies) {
-			addInstall(ins)
+			add(ins)
 		}
 	}
 
@@ -192,13 +271,51 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 	for _, group := range pyp.Tool.PDM.DevDependencies {
 		addSpecStrings(group)
 	}
+}
 
-	// uv: [tool.uv.sources] redirects a declared dep to git/url/path/workspace.
-	// A name-keyed lookup can't see that the fetch is opaque-remote, so flag
-	// the corresponding install before the gate decides.
-	applyUvSources(installs, pyp.Tool.UV.Sources)
+// workspaceMemberPyprojects expands the members/exclude directory globs
+// (relative to rootDir) and returns the pyproject.toml path inside each
+// non-excluded member directory that actually has one. Glob matches that are
+// not directories, or directories without a pyproject.toml, are skipped — a
+// matched README or a plain data dir must not abort the whole expansion.
+func workspaceMemberPyprojects(rootDir string, members, exclude []string) ([]string, error) {
+	if len(members) == 0 {
+		return nil, nil
+	}
+	excluded := make(map[string]struct{})
+	for _, pat := range exclude {
+		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		if err != nil {
+			return nil, vetoerrors.With(err, "expand workspace exclude glob").Set("pattern", pat)
+		}
+		for _, m := range matches {
+			excluded[m] = struct{}{}
+		}
+	}
 
-	return installs, nil
+	var out []string
+	seenDir := make(map[string]struct{})
+	for _, pat := range members {
+		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		if err != nil {
+			return nil, vetoerrors.With(err, "expand workspace member glob").Set("pattern", pat)
+		}
+		for _, dir := range matches {
+			if _, ex := excluded[dir]; ex {
+				continue
+			}
+			if _, dup := seenDir[dir]; dup {
+				continue
+			}
+			seenDir[dir] = struct{}{}
+			pj := filepath.Join(dir, "pyproject.toml")
+			if info, err := os.Stat(pj); err != nil || info.IsDir() {
+				continue
+			}
+			out = append(out, pj)
+		}
+	}
+	return out, nil
 }
 
 // sourceKind classifies how a [tool.uv.sources] entry resolves a dependency.
