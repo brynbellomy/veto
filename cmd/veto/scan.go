@@ -16,6 +16,7 @@ import (
 	"github.com/brynbellomy/veto/internal/scan"
 	"github.com/brynbellomy/veto/internal/scan/agentsurface"
 	"github.com/brynbellomy/veto/internal/scan/cache"
+	"github.com/brynbellomy/veto/internal/scan/gyp"
 	"github.com/brynbellomy/veto/internal/scan/project"
 )
 
@@ -146,6 +147,12 @@ func runScanWithOpts(logger zerolog.Logger, cfg config, opts scanOpts) int {
 	results := []scan.Result{}
 	if opts.projects {
 		results = append(results, project.New(project.Options{Roots: roots, Store: store, Expander: newCompoundExpander()}).Scan(ctx))
+		// The gyp scanner is a content heuristic, not an intel lookup, so it
+		// runs alongside the project scanner without needing the store. It
+		// descends into node_modules (which the project scanner prunes) to
+		// catch installed phantom-gyp / Miasma worms the name+version feeds
+		// cannot see.
+		results = append(results, gyp.New(gyp.Options{Roots: roots}).Scan(ctx))
 	}
 	cacheRootEntries := cache.DefaultRootEntries(home)
 	cacheRoots := cachePaths(cacheRootEntries)
