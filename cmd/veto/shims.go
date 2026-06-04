@@ -4,16 +4,16 @@
 // doesn't expose a per-tool hook protocol (Codex CLI, Sirene, generic CI
 // runners, ad-hoc terminals). The mechanism:
 //
-//   1. `veto install-shims [--dir DIR]` creates a symlink for each
-//      supported package manager binary inside DIR (default ~/.local/bin):
-//          DIR/npm   → /absolute/path/to/veto
-//          DIR/pnpm  → /absolute/path/to/veto
-//          ...
-//   2. When the user runs `npm install foo`, the shell resolves `npm` to
-//      DIR/npm, which is the veto binary. veto's main() detects the
-//      shim invocation via `filepath.Base(os.Args[0]) == "npm"` and
-//      prepends "npm" to args, so the rest of the code sees the same
-//      shape as `veto npm install foo`.
+//  1. `veto install-shims [--dir DIR]` creates a symlink for each
+//     supported package manager binary inside DIR (default ~/.local/bin):
+//     DIR/npm   → /absolute/path/to/veto
+//     DIR/pnpm  → /absolute/path/to/veto
+//     ...
+//  2. When the user runs `npm install foo`, the shell resolves `npm` to
+//     DIR/npm, which is the veto binary. veto's main() detects the
+//     shim invocation via `filepath.Base(os.Args[0]) == "npm"` and
+//     prepends "npm" to args, so the rest of the code sees the same
+//     shape as `veto npm install foo`.
 //
 // For this to work, DIR must come BEFORE the directories holding the real
 // npm/pnpm/... binaries in $PATH. install-shims prints a warning if the

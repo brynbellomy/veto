@@ -100,6 +100,33 @@ node` or `mise install node@whatever` overwrites the wrapper. Re-run
 `veto install-wrappers` after toolchain upgrades; `veto doctor`
 flags drift.
 
+### Verb-aware environment sanitization
+
+Layer 3 needs `VETO_PATH` set in the environment to function. By
+default, `veto` strips `VETO_PATH` from the child env before exec'ing the
+real package manager; this breaks a potential interposer-recursion loop
+for PM-style invocations.
+
+For multi-verb tools like `go`, that strip is too coarse: `go run`, `go
+build`, and `go test` invoke user-authored binaries, not nested PM calls.
+Stripping `VETO_PATH` for these verbs silently disables Layer 3 across
+the entire descendant tree, defeating the env-bypass defense.
+
+Veto classifies `go` verbs by recursion risk:
+
+- **Preserved** (`VETO_PATH` survives): `run`, `build`, `test`, `vet`,
+  `get`, `list`, `mod *`, `work *`, `env`, `version`, `fmt`, `doc`,
+  `clean`, `fix`, `telemetry`, `bug`.
+- **Stripped** (status quo): `install`, `generate`, `tool *`.
+- **Stripped** (default-deny for safety): any verb not on the list above.
+
+New Go releases that introduce verbs default to stripped until the
+classifier is updated. To add a verb to the preserved set, edit
+`internal/packagemanager/golang/golang.go` `EnvRecursionRisk`.
+
+Other multi-verb tools (`cargo`, `uv`, `npm`, `pip`) can adopt the same
+pattern by implementing `packagemanager.EnvRecursionPolicy`.
+
 ## Why this design
 
 Existing shell-function-based protection (e.g. Aikido `safe-chain`)

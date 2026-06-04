@@ -30,15 +30,15 @@ var alwaysReadsManifest = map[string]struct{}{}
 // Bun's CLI is still evolving; this is the realistic set agents/users
 // reach for, not an exhaustive mirror of `bun --help`.
 var flagsWithValues = argv.FlagsWithValues{
-	"--cwd":         {},
-	"--config":      {},
-	"-c":            {},
-	"--registry":    {},
-	"--cache-dir":   {},
-	"--backend":     {},
-	"--lockfile":    {},
-	"--prefix":      {},
-	"--target":      {},
+	"--cwd":           {},
+	"--config":        {},
+	"-c":              {},
+	"--registry":      {},
+	"--cache-dir":     {},
+	"--backend":       {},
+	"--lockfile":      {},
+	"--prefix":        {},
+	"--target":        {},
 	"--bun-debug-jsc": {},
 }
 

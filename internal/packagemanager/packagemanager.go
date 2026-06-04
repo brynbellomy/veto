@@ -222,3 +222,26 @@ type ResolverPreScanner interface {
 type ProjectPreflighter interface {
 	ProjectPreflight(args []string) (ProjectPreflightPlan, bool)
 }
+
+// EnvRecursionPolicy is an optional capability for package managers whose
+// verbs differ in whether their child process could re-enter the veto gate via
+// the interposer. PMs that don't implement this interface get the conservative
+// strip behavior by default.
+type EnvRecursionPolicy interface {
+	EnvRecursionRisk(args []string) EnvRecursionRiskLevel
+}
+
+type EnvRecursionRiskLevel int
+
+const (
+	// RecursionRiskUnknown is the zero value and the safe default. Callers
+	// MUST strip VETO_PATH when they see this.
+	RecursionRiskUnknown EnvRecursionRiskLevel = iota
+	// RecursionRiskLow means the verb produces a child that will not re-enter
+	// the veto gate via the interposer. Safe to preserve VETO_PATH.
+	RecursionRiskLow
+	// RecursionRiskHigh means the verb is package-manager-like or runs
+	// arbitrary commands that could trigger PM invocations. Callers MUST strip
+	// VETO_PATH.
+	RecursionRiskHigh
+)

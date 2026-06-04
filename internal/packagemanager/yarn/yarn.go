@@ -39,19 +39,19 @@ var alwaysReadsManifest = map[string]struct{}{}
 // (--cwd, --cache-folder) shapes where they differ; the union is safe
 // since the goal is to avoid mistaking a flag-value for a positional.
 var flagsWithValues = argv.FlagsWithValues{
-	"--cwd":             {},
-	"--cache-folder":    {},
-	"--modules-folder":  {},
-	"--registry":        {},
-	"--prefix":          {},
-	"--use-yarnrc":      {},
-	"--proxy":           {},
-	"--https-proxy":     {},
-	"--network-timeout": {},
+	"--cwd":                 {},
+	"--cache-folder":        {},
+	"--modules-folder":      {},
+	"--registry":            {},
+	"--prefix":              {},
+	"--use-yarnrc":          {},
+	"--proxy":               {},
+	"--https-proxy":         {},
+	"--network-timeout":     {},
 	"--network-concurrency": {},
-	"--mutex":           {},
-	"--otp":             {},
-	"--tag":             {},
+	"--mutex":               {},
+	"--otp":                 {},
+	"--tag":                 {},
 }
 
 // Manager parses yarn install commands.

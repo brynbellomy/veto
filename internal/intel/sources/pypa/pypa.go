@@ -321,4 +321,3 @@ func parseYAMLAdvisory(body []byte) (osvschema.Advisory, error) {
 	}
 	return adv, nil
 }
-

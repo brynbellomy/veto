@@ -44,8 +44,8 @@ affected:
 	readme := "# advisory-database\nNot a vuln entry.\n"
 
 	tarball := makeTarball(t, map[string]string{
-		"advisory-database-main/README.md":                        readme,
-		"advisory-database-main/vulns/evil-pkg/MAL-2026-1.yaml":   malware,
+		"advisory-database-main/README.md":                             readme,
+		"advisory-database-main/vulns/evil-pkg/MAL-2026-1.yaml":        malware,
 		"advisory-database-main/vulns/normal-pkg/PYSEC-2024-1234.yaml": regularCVE,
 	})
 
