@@ -163,10 +163,11 @@ var pythonDashMTargets = map[string]string{
 // argv tail (everything after argv[0]).
 //
 // Accepts:
-//   -m <pm> ...                      (canonical)
-//   -m<pm> ...                       (no space — valid CPython syntax)
-//   <no-arg-flag-bundle> -m <pm> ... (e.g. -I -m pip, -IES -m pip)
-//   <no-arg-flag-bundle> -m<pm> ...
+//
+//	-m <pm> ...                      (canonical)
+//	-m<pm> ...                       (no space — valid CPython syntax)
+//	<no-arg-flag-bundle> -m <pm> ... (e.g. -I -m pip, -IES -m pip)
+//	<no-arg-flag-bundle> -m<pm> ...
 //
 // Pre-`-m` flag bundles are the union of CPython's no-argument short
 // options: -b -B -d -E -h -i -I -O -P -q -s -S -u -v -V -x -? .
@@ -406,6 +407,28 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 		default:
 			logger.Error().Str("outcome", string(decision.Outcome)).Msg("unknown resolver pre-scan gate outcome")
 			return exitInternal
+		}
+	}
+
+	// binding.gyp worm layers (phantom-gyp / Miasma). The intel gate above
+	// cannot see this worm — it rides a trusted name and keeps package.json
+	// scripts clean — so for npm-family installs we apply two content
+	// heuristics before letting the real package manager run.
+	if isNpmFamily(pm.Ecosystem()) {
+		// (a) Tarball inspection: fetch the package(s) about to be installed
+		// with `npm pack --ignore-scripts` (download only) and inspect each
+		// binding.gyp. Catches a freshly-resolved/compromised version that is
+		// not yet in node_modules and not yet in any intel feed. The
+		// --package-lock-only resolver pre-scan never fetches tarballs, so
+		// this is the only layer that sees a brand-new worm at install time.
+		if gypTarballPreflight(logger, os.Stderr, cfg, installs, preScanInstalls) {
+			return exitRefused
+		}
+		// (b) Existing-tree scan: an `npm install` re-runs node-gyp for the
+		// WHOLE tree, so a worm already in node_modules (from an earlier
+		// install) would detonate on this unrelated install. Scan it.
+		if runGypPreflightIfNpmFamily(logger, pm, pmArgs) {
+			return exitRefused
 		}
 	}
 	return execPMOrPythonM(cfg, pmName, pmArgs)
