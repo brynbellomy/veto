@@ -72,6 +72,16 @@ current user-facing behavior.
   - The hook's cwd worm check assumes the install runs in cwd; an `npm install
     --prefix <dir>` would install elsewhere. Parse `--prefix`/`-C` in the hook
     and scan that tree instead.
+  - P2 npm config/env prefix redirection (`gyp_target_dir.go`):
+    `npm_config_prefix` / `.npmrc` `prefix=` can redirect the real install to
+    a dir the argv parser doesn't see. Fix would resolve target roots from the
+    same config inputs npm consumes (e.g. a non-executing
+    `npm config get prefix`). Deferred — needs care to stay non-executing and
+    cross-PM.
+  - P2 local-path install inspection (`gyp_tarball.go`/gate):
+    `npm install ./pkg` reaches npm without the gyp detector inspecting the
+    local package. Fix would inspect the local dir / local `.tgz` via
+    `internal/gypscan/tarball.Inspect` before exec. Deferred.
 - Add an authenticated online lookup layer for vulnerability surfaces that do
   not fit the cached bulk-source model yet, especially Socket.dev vuln data and
   SafeDep PMG real-time package analysis.

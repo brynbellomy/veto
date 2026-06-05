@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -104,6 +105,42 @@ func TestScannerFlagsPayloadInIncludedGypi(t *testing.T) {
 	require.Len(t, res.Findings, 1)
 	require.Equal(t, scan.SeverityCritical, res.Findings[0].Severity)
 	requireEvidenceCode(t, res.Findings[0], "gyp-command-in-sources")
+}
+
+func TestScannerFlagsOversizedRootBindingGyp(t *testing.T) {
+	root := t.TempDir()
+	pkgDir := filepath.Join(root, "node_modules", "innocent-looking-util")
+	writeFile(t, filepath.Join(pkgDir, "binding.gyp"), strings.Repeat(" ", 256*1024+1)+wormGyp)
+	writeFile(t, filepath.Join(pkgDir, "package.json"), `{"name":"innocent-looking-util","version":"1.2.4","main":"index.js"}`)
+	writeFile(t, filepath.Join(pkgDir, "index.js"), "// blob")
+
+	res := gyp.New(gyp.Options{Roots: []string{root}}).Scan(context.Background())
+
+	require.Empty(t, res.Errors)
+	require.Equal(t, 1, res.FilesScanned)
+	require.Len(t, res.Findings, 1)
+	require.Equal(t, scan.SeverityCritical, res.Findings[0].Severity)
+	requireEvidenceCode(t, res.Findings[0], "gyp-file-too-large")
+}
+
+func TestScannerFlagsOversizedIncludedGypi(t *testing.T) {
+	root := t.TempDir()
+	pkgDir := filepath.Join(root, "node_modules", "innocent-looking-util")
+	writeFile(t, filepath.Join(pkgDir, "binding.gyp"), `{
+  "includes": ["payload.gypi"],
+  "targets": [{ "target_name": "Setup", "type": "loadable_module", "sources": ["addon.cc"] }]
+}`)
+	writeFile(t, filepath.Join(pkgDir, "payload.gypi"), strings.Repeat(" ", 256*1024+1)+wormGyp)
+	writeFile(t, filepath.Join(pkgDir, "package.json"), `{"name":"innocent-looking-util","version":"1.2.4","dependencies":{"node-addon-api":"^7.0.0"}}`)
+	writeFile(t, filepath.Join(pkgDir, "addon.cc"), "// native")
+
+	res := gyp.New(gyp.Options{Roots: []string{root}}).Scan(context.Background())
+
+	require.Empty(t, res.Errors)
+	require.Equal(t, 1, res.FilesScanned)
+	require.Len(t, res.Findings, 1)
+	require.Equal(t, scan.SeverityCritical, res.Findings[0].Severity)
+	requireEvidenceCode(t, res.Findings[0], "gyp-file-too-large")
 }
 
 func TestScannerDoesNotFollowEscapingInclude(t *testing.T) {
