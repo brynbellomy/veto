@@ -284,11 +284,20 @@ Veto detects this by **content**, not by name. The `gypscan` package reads a
 `binding.gyp` (plus its sibling `package.json` and file listing when
 available) and classifies it:
 
-- **critical** — a command expansion inside a `sources`/`inputs`/`outputs`
-  array (those hold filenames; node-gyp shells out each one), or
-  payload-shaped shell (chaining, redirection, piping into an interpreter,
-  `curl`/`wget`/`eval`) inside any expansion. This is the worm's
-  install-time execution vector.
+- **critical** — any of node-gyp's install-time execution surfaces carrying a
+  payload:
+  - a command expansion `<!(...)`/`<!@(...)` inside a `sources`/`inputs`/`outputs`
+    array (those hold filenames; node-gyp shells out each one);
+  - payload-shaped shell (chaining, redirection, piping into an interpreter,
+    `curl`/`wget`/`eval`) inside any expansion;
+  - an `actions[].action` or `rules[].action` argv array whose command is an
+    interpreter/shell/package-manager (`node`, `python`, `sh`, `npm`, …) — these
+    are plain argv that node-gyp runs directly, no `<!()` required;
+  - a command expansion in an execution-sensitive build key (`libraries`,
+    `cflags`, `ldflags`, `include_dirs`, `library_dirs`) that invokes a
+    package-local interpreter script rather than a print-only path lookup;
+  - a `binding.gyp` (or included `.gypi`) too large to fully scan — treated as
+    **unscannable → critical** (fail-closed) rather than trusting a clean prefix.
 - **medium** — structural anomalies consistent with the worm but without a
   confirmed payload: a `type: "none"` target (builds nothing; its only job
   is to run a command), or a `binding.gyp` in a package that ships no native
@@ -296,22 +305,31 @@ available) and classifies it:
   `nan`, `prebuild`, `gypfile`) — a pure-JS package has no reason to carry
   one.
 
-The detector deliberately does **not** flag the common legitimate pattern —
-`<!@(node -p "require('node-addon-api').include")` in `include_dirs` to
-locate headers — so it stays quiet on `sharp`, `bcrypt`, `better-sqlite3`,
-`ssh2`, and friends (validated against the live registry). It runs no
-`node-gyp` and never executes the package.
+The detector follows GYP `includes:` references transitively (depth-capped,
+cycle-guarded, confined to the package subtree), so a payload relocated into an
+included `.gypi` is caught, and it strips GYP `#` comments before matching so a
+commented-out example can't trigger a false block.
+
+The detector deliberately does **not** flag the legitimate native-addon
+header-lookup idiom — an anchored, pure `<!(node -p/-e "require('<helper>')")`
+where `<helper>` is `nan`, `node-addon-api`, `bindings`, or `node-gyp-build`
+(optionally `.include`, optionally wrapped in `console.log`). So it stays quiet
+on `sharp`, `bcrypt`, `better-sqlite3`, `ssh2`, `canvas`, `node-sass`, and
+friends (validated against the live registry). Anything beyond that exact shape
+— a second statement, an invoked call, a local `.js`, a non-allowlisted module —
+stays critical. It runs no `node-gyp` and never executes the package.
 
 The heuristic runs at **three** points, so the worm is caught whether it is
 already installed, about to be installed, or merely invoked from an agent
 shell:
 
 1. **Install hot path — existing tree.** Before an npm-family install or `ci`
-   runs, veto scans the project's existing `node_modules` binding.gyp files.
-   An `npm install` re-runs `node-gyp` for the *whole* tree, so a worm already
-   sitting in `node_modules` from an earlier install would detonate on the
-   next, unrelated install. A critical match refuses before the real package
-   manager runs.
+   runs, veto scans the existing `node_modules` binding.gyp files in the tree
+   the install will populate — cwd, or the `--prefix`/`-C`/`--cwd` target when
+   one is given. An `npm install` re-runs `node-gyp` for the *whole* tree, so a
+   worm already sitting in `node_modules` from an earlier install would detonate
+   on the next, unrelated install. A critical match refuses before the real
+   package manager runs.
 2. **Install hot path — incoming tarball.** Before install, veto fetches the
    package(s) about to be installed with `npm pack --ignore-scripts`
    (download only; runs nothing) and inspects each tarball's `binding.gyp` in
@@ -331,8 +349,8 @@ shell:
 trees under the project roots (the manifest scanner prunes `node_modules`;
 the gyp scanner descends into it, because an installed worm lives there).
 
-Only **critical** matches (command-in-`sources` / payload-shell) block an
-install; **medium** structural anomalies are surfaced by `veto scan` for
+Only **critical** matches (any of the install-time execution surfaces listed
+above) block an install; **medium** structural anomalies are surfaced by `veto scan` for
 review but do not refuse on the hot path, where a false block stops real
 work.
 

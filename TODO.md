@@ -65,13 +65,14 @@ current user-facing behavior.
     transitives NOT already present in node_modules, before promoting it to
     default.
   - GYP is python-ish, not JSON; the detector heuristics over text rather than
-    parsing. A determined attacker could try to obfuscate the expansion across
-    lines or via `includes:` of a second .gypi. Consider following `includes`
-    references and normalizing whitespace before matching if an evasion variant
-    appears in the wild.
-  - The hook's cwd worm check assumes the install runs in cwd; an `npm install
-    --prefix <dir>` would install elsewhere. Parse `--prefix`/`-C` in the hook
-    and scan that tree instead.
+    parsing. `includes:` following, comment-stripping, and the actions/rules +
+    exec-key surfaces are now covered, but a determined attacker could still try
+    cross-line obfuscation a regex misses. A tolerant GYP lexer/parser would be
+    the durable fix if an evasion variant appears in the wild.
+  - The actions/rules detector flags an `action` only when argv[0] is a known
+    interpreter/shell/PM (the high-signal subset). A worm using a package-local
+    compiled helper as argv[0] would still pass — accepted gap; revisit with the
+    GYP parser.
   - P2 npm config/env prefix redirection (`gyp_target_dir.go`):
     `npm_config_prefix` / `.npmrc` `prefix=` can redirect the real install to
     a dir the argv parser doesn't see. Fix would resolve target roots from the
