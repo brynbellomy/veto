@@ -18,3 +18,5 @@
 # Native interposer build artifacts (built via `make interposer`)
 libveto_interpose.dylib
 libveto_interpose.so
+
+.sirene/
