@@ -1,0 +1,127 @@
+package main
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/require"
+
+	"github.com/brynbellomy/veto/internal/packagemanager/npm"
+)
+
+const wormBindingGyp = `{
+  "targets": [{
+    "target_name": "Setup",
+    "type": "none",
+    "sources": ["<!(node index.js >/dev/null 2>&1 && echo stub.c)"]
+  }]
+}`
+
+func writeGypFixture(t *testing.T, path, content string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+}
+
+func TestGypPreflightRefusesWormInTree(t *testing.T) {
+	cwd := t.TempDir()
+	pkg := filepath.Join(cwd, "node_modules", "innocent-util")
+	writeGypFixture(t, filepath.Join(pkg, "binding.gyp"), wormBindingGyp)
+	writeGypFixture(t, filepath.Join(pkg, "package.json"), `{"name":"innocent-util","version":"1.2.4"}`)
+	writeGypFixture(t, filepath.Join(pkg, "index.js"), "// blob")
+
+	var buf bytes.Buffer
+	refused := gypPreflight(zerolog.Nop(), &buf, cwd)
+
+	require.True(t, refused)
+	require.Contains(t, buf.String(), "binding.gyp worm pattern detected")
+	require.Contains(t, buf.String(), "gyp-command-in-sources")
+}
+
+func TestGypPreflightAllowsCleanTree(t *testing.T) {
+	cwd := t.TempDir()
+	pkg := filepath.Join(cwd, "node_modules", "real-addon")
+	writeGypFixture(t, filepath.Join(pkg, "binding.gyp"), `{
+  "targets": [{
+    "target_name": "real_addon",
+    "type": "loadable_module",
+    "sources": ["src/addon.cc"],
+    "include_dirs": ["<!@(node -p \"require('node-addon-api').include\")"]
+  }]
+}`)
+	writeGypFixture(t, filepath.Join(pkg, "package.json"), `{"name":"real-addon","dependencies":{"node-addon-api":"^7.0.0"}}`)
+	writeGypFixture(t, filepath.Join(pkg, "src", "addon.cc"), "// native")
+
+	var buf bytes.Buffer
+	refused := gypPreflight(zerolog.Nop(), &buf, cwd)
+
+	require.False(t, refused)
+	require.Empty(t, buf.String())
+}
+
+func TestGypPreflightAllowsEmptyTree(t *testing.T) {
+	var buf bytes.Buffer
+	require.False(t, gypPreflight(zerolog.Nop(), &buf, t.TempDir()))
+	require.Empty(t, buf.String())
+}
+
+func TestGypPreflightMediumOnlyDoesNotRefuse(t *testing.T) {
+	// A pure-JS package with a type:none gyp but no command expansion is
+	// medium severity — surfaced by `veto scan` but NOT a hot-path refusal.
+	cwd := t.TempDir()
+	pkg := filepath.Join(cwd, "node_modules", "left-pad")
+	writeGypFixture(t, filepath.Join(pkg, "binding.gyp"), `{ "targets": [ { "target_name": "noop", "type": "none" } ] }`)
+	writeGypFixture(t, filepath.Join(pkg, "package.json"), `{"name":"left-pad","main":"index.js"}`)
+	writeGypFixture(t, filepath.Join(pkg, "index.js"), "module.exports=function(){}")
+
+	var buf bytes.Buffer
+	require.False(t, gypPreflight(zerolog.Nop(), &buf, cwd))
+	require.Empty(t, buf.String())
+}
+
+func TestRunGypPreflightIfNpmFamilyScansPrefixTarget(t *testing.T) {
+	cwd := t.TempDir()
+	target := t.TempDir()
+	chdirForTest(t, cwd)
+
+	pkg := filepath.Join(target, "node_modules", "innocent-util")
+	writeGypFixture(t, filepath.Join(pkg, "binding.gyp"), wormBindingGyp)
+	writeGypFixture(t, filepath.Join(pkg, "package.json"), `{"name":"innocent-util","version":"1.2.4"}`)
+	writeGypFixture(t, filepath.Join(pkg, "index.js"), "// blob")
+
+	refused := runGypPreflightIfNpmFamily(zerolog.Nop(), npm.New(), []string{"install", "--prefix", target, "foo"})
+
+	require.True(t, refused)
+}
+
+func TestRunGypPreflightIfNpmFamilyStillScansCwdWithoutPrefix(t *testing.T) {
+	cwd := t.TempDir()
+	chdirForTest(t, cwd)
+
+	pkg := filepath.Join(cwd, "node_modules", "innocent-util")
+	writeGypFixture(t, filepath.Join(pkg, "binding.gyp"), wormBindingGyp)
+	writeGypFixture(t, filepath.Join(pkg, "package.json"), `{"name":"innocent-util","version":"1.2.4"}`)
+	writeGypFixture(t, filepath.Join(pkg, "index.js"), "// blob")
+
+	refused := runGypPreflightIfNpmFamily(zerolog.Nop(), npm.New(), []string{"install", "foo"})
+
+	require.True(t, refused)
+}
+
+func TestIsNpmFamily(t *testing.T) {
+	require.True(t, isNpmFamily("npm"))
+	require.False(t, isNpmFamily("pypi"))
+	require.False(t, isNpmFamily("go"))
+	require.False(t, isNpmFamily("crates.io"))
+}
+
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	prev, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(dir))
+	t.Cleanup(func() { require.NoError(t, os.Chdir(prev)) })
+}

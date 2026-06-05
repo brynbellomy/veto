@@ -6,6 +6,14 @@ default, optionally gates broader CVE/GHSA advisories, scans existing
 projects and caches for exposure, and audits common agent persistence
 surfaces before they can launch package-manager code.
 
+Beyond name+version intel lookup, veto carries a content heuristic for
+the **phantom-gyp / Miasma** worm class (the June 2026 `binding.gyp` npm
+campaign) — a self-propagating supply-chain worm that the intel model
+cannot see on its own, because it rides trusted package names via
+maintainer-account takeover and hides install-time code execution in a
+`binding.gyp` rather than a flagged package or a lifecycle script. See
+"binding.gyp worm detection" below.
+
 ## Quickstart
 
 ```sh
@@ -186,6 +194,13 @@ packagemanager/
                                 interposer via a generated pm_names.h)
 
 gate/              ← decision logic (allow / refuse / passthrough / abort)
+gypscan/           ← pure content heuristic for the phantom-gyp/Miasma
+                     binding.gyp worm (no I/O, runs no node-gyp); reused by
+                     the scan walker, the install hot path, and the hook
+gypscan/tarball/   ← inspects an npm .tgz in memory (gzip+tar, no extract,
+                     no node-gyp); install-time complement to the walker
+scan/gyp/          ← existing-exposure scanner: walks node_modules trees and
+                     runs each binding.gyp through gypscan
 internal/hook/     ← Claude Code analyzer (Layer 1)
 internal/interposer/  ← native execve/posix_spawn hooks in C (Layer 3)
   cmd/genpmlist/   ← go-generate tool that emits pm_names.h from pmlist
@@ -252,6 +267,74 @@ and `cargo clippy`. Default Go and Cargo preflight walks upward for
 parent `go.mod`, `Cargo.toml`, and workspace `Cargo.lock`/`Cargo.toml`
 files when the command runs from a nested directory; explicit path flags
 still take precedence.
+
+**binding.gyp worm detection (phantom-gyp / Miasma).** The June 2026
+`binding.gyp` campaign defeats every name-and-version defense at once: it
+republishes ~trusted packages under stolen maintainer tokens (so the name
+is not in any malware feed for hours), keeps `package.json` `scripts`
+clean (so lifecycle-script inspection sees nothing), and hides arbitrary
+shell in a tiny `binding.gyp`. When npm finds a `binding.gyp` at a package
+root with no preinstall/install script, it falls back to `node-gyp`, which
+evaluates GYP command expansion (`<!(...)`, `<!@(...)`) **as a shell during
+configure — even under `--ignore-scripts`**, because this is not a lifecycle
+hook. The worm puts `<!(node index.js …)` in the `sources` array; node-gyp
+runs it at install time.
+
+Veto detects this by **content**, not by name. The `gypscan` package reads a
+`binding.gyp` (plus its sibling `package.json` and file listing when
+available) and classifies it:
+
+- **critical** — a command expansion inside a `sources`/`inputs`/`outputs`
+  array (those hold filenames; node-gyp shells out each one), or
+  payload-shaped shell (chaining, redirection, piping into an interpreter,
+  `curl`/`wget`/`eval`) inside any expansion. This is the worm's
+  install-time execution vector.
+- **medium** — structural anomalies consistent with the worm but without a
+  confirmed payload: a `type: "none"` target (builds nothing; its only job
+  is to run a command), or a `binding.gyp` in a package that ships no native
+  source and declares no native-build tooling (`node-gyp`, `node-addon-api`,
+  `nan`, `prebuild`, `gypfile`) — a pure-JS package has no reason to carry
+  one.
+
+The detector deliberately does **not** flag the common legitimate pattern —
+`<!@(node -p "require('node-addon-api').include")` in `include_dirs` to
+locate headers — so it stays quiet on `sharp`, `bcrypt`, `better-sqlite3`,
+`ssh2`, and friends (validated against the live registry). It runs no
+`node-gyp` and never executes the package.
+
+The heuristic runs at **three** points, so the worm is caught whether it is
+already installed, about to be installed, or merely invoked from an agent
+shell:
+
+1. **Install hot path — existing tree.** Before an npm-family install or `ci`
+   runs, veto scans the project's existing `node_modules` binding.gyp files.
+   An `npm install` re-runs `node-gyp` for the *whole* tree, so a worm already
+   sitting in `node_modules` from an earlier install would detonate on the
+   next, unrelated install. A critical match refuses before the real package
+   manager runs.
+2. **Install hot path — incoming tarball.** Before install, veto fetches the
+   package(s) about to be installed with `npm pack --ignore-scripts`
+   (download only; runs nothing) and inspects each tarball's `binding.gyp` in
+   memory, without extracting to a runnable tree. This is the only layer that
+   sees a *brand-new* compromised version — the `--package-lock-only` resolver
+   pre-scan never fetches tarballs, and a freshly-published worm is not in any
+   feed for hours. Controlled by `VETO_GYP_TARBALL_SCAN` (default on for the
+   argv-named packages; `=full` to also fetch every resolved transitive;
+   `=off` to disable). Fail-open on its own errors (a registry hiccup must not
+   block every install); a confirmed critical match always refuses.
+3. **Claude Code hook (Layer 1).** A Bash `npm install` in a worm-bearing
+   tree is denied at the earliest point, before the shell sees it — the worm
+   reason supersedes the usual "re-run with veto" nudge, because prefixing
+   would not make that tree safe to install into.
+
+`veto scan` also runs the existing-tree walk on demand over `node_modules`
+trees under the project roots (the manifest scanner prunes `node_modules`;
+the gyp scanner descends into it, because an installed worm lives there).
+
+Only **critical** matches (command-in-`sources` / payload-shell) block an
+install; **medium** structural anomalies are surfaced by `veto scan` for
+review but do not refuse on the hot path, where a false block stops real
+work.
 
 **Fail-closed defaults.** Per-source malware feeds are fetched
 concurrently with etag-based caching in `~/.cache/veto/`.
@@ -337,6 +420,7 @@ configuration rather than package-intel matches.
 | `VETO_SOURCES` | `aikido,openssf,osv,pypa` | comma-separated source IDs to enable; add `ghsa` to opt into broad GitHub Advisory Database CVE/GHSA blocking |
 | `VETO_LOG` | (info) | set `debug` for verbose logging |
 | `VETO_PATH` | (set by install-preload) | consumed by the Layer 3 interposer |
+| `VETO_GYP_TARBALL_SCAN` | (on) | install-time binding.gyp worm tarball inspection. `0`/`off`/`false` disables; `full` also fetches every resolved transitive (slower) |
 
 ### Refuse-opaque-by-default
 

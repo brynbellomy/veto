@@ -130,6 +130,20 @@ func runClaudeCodeHook(logger zerolog.Logger, stdin io.Reader, stdout io.Writer)
 		return writeDecisionOrFail(stdout, msg)
 	}
 
+	// binding.gyp worm check (phantom-gyp / Miasma). This is the earliest
+	// layer: an npm-family install in a worm-bearing tree re-runs node-gyp
+	// for the whole tree and detonates at install time, prefix or no prefix.
+	// The analyzer stays pure (no I/O), so the cwd content scan lives here in
+	// the transport. We only scan for npm-family findings — node-gyp is an
+	// npm concern. A worm hit denies directly with the worm reason rather
+	// than the generic "re-run with veto" nudge, since prefixing with veto
+	// would not make this tree safe to install into.
+	if isNpmFamilyPM(finding.PM) {
+		if reason, found := gypWormReasonForTree(logger, finding.PM, hookPMArgs(finding.Tokens)); found {
+			return writeDecisionOrFail(stdout, reason)
+		}
+	}
+
 	// Defense layer 2: if veto itself isn't on PATH at hook time,
 	// telling the agent to "prefix with veto" is useless. Fail closed
 	// loudly so the mis-install is visible.
@@ -157,6 +171,46 @@ func runClaudeCodeHook(logger zerolog.Logger, stdin io.Reader, stdout io.Writer)
 		finding.PM, corrected,
 	)
 	return writeDecisionOrFail(stdout, msg)
+}
+
+// npmFamilyHookPMs are the package-manager finding names whose installs
+// trigger node-gyp, and therefore could detonate a binding.gyp worm.
+var npmFamilyHookPMs = map[string]struct{}{
+	"npm": {}, "pnpm": {}, "yarn": {}, "bun": {},
+	"npx": {}, "pnpx": {}, "bunx": {},
+}
+
+// isNpmFamilyPM reports whether a hook finding's PM name resolves npm
+// packages (and so could run a binding.gyp at install time).
+func isNpmFamilyPM(pm string) bool {
+	_, ok := npmFamilyHookPMs[pm]
+	return ok
+}
+
+func hookPMArgs(tokens []string) []string {
+	if len(tokens) <= 1 {
+		return nil
+	}
+	return tokens[1:]
+}
+
+// gypWormReasonForTree scans the target install tree's node_modules for a
+// critical binding.gyp worm match and, if found, returns a hook-shaped deny
+// reason. found=false means the tree is clean (or cwd is unresolvable / the
+// scan errored — all non-blocking, because this is an additive heuristic, not
+// a fail-closed gate). It reuses the same gypPreflight engine the install
+// hot path uses, capturing its output to a buffer for the hook envelope.
+func gypWormReasonForTree(logger zerolog.Logger, pmName string, pmArgs []string) (string, bool) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		logger.Warn().Err(err).Msg("hook gyp check: resolve cwd failed; skipping")
+		return "", false
+	}
+	var buf strings.Builder
+	if !gypPreflightRoots(logger, &buf, gypScanRootsForInstall(pmName, pmArgs, cwd)) {
+		return "", false
+	}
+	return "veto-hook: BLOCKED — " + buf.String(), true
 }
 
 // writeDecisionOrFail writes a `deny` envelope or, if even that fails,

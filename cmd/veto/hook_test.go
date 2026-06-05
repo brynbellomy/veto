@@ -82,6 +82,68 @@ func TestRunClaudeCodeHook_VetoNotOnPath(t *testing.T) {
 
 // withVetoOnPath drops a fake `veto` executable into a temp dir and
 // puts it on PATH for the test. Lets the reachable-check pass without
+// TestRunClaudeCodeHook_BindingGypWormDeniesEarly: an npm install in a tree
+// whose node_modules harbors a phantom-gyp / Miasma binding.gyp is denied
+// with the worm reason, BEFORE the generic "re-run with veto" nudge — because
+// prefixing with veto would not make this tree safe to install into.
+func TestRunClaudeCodeHook_BindingGypWormDeniesEarly(t *testing.T) {
+	withVetoOnPath(t)
+	chdirToWormTree(t)
+
+	in := encodePayload(t, "Bash", "npm install some-new-dep")
+	var out bytes.Buffer
+	rc := runClaudeCodeHook(zerolog.Nop(), in, &out)
+	require.Equal(t, exitOK, rc)
+
+	d := decodeDecision(t, &out)
+	require.Equal(t, "deny", d.PermissionDecision)
+	require.Contains(t, d.PermissionDecisionReason, "binding.gyp worm pattern detected")
+	require.Contains(t, d.PermissionDecisionReason, "gyp-command-in-sources")
+	// It must NOT be the generic prefix nudge — the worm reason supersedes it.
+	require.NotContains(t, d.PermissionDecisionReason, "Re-run with an explicit")
+}
+
+func TestRunClaudeCodeHook_BindingGypWormPrefixTargetDeniesEarly(t *testing.T) {
+	withVetoOnPath(t)
+	cwd := t.TempDir()
+	target := t.TempDir()
+	chdirForTest(t, cwd)
+
+	pkg := filepath.Join(target, "node_modules", "innocent-util")
+	writeGypFixture(t, filepath.Join(pkg, "binding.gyp"), wormBindingGyp)
+	writeGypFixture(t, filepath.Join(pkg, "package.json"), `{"name":"innocent-util"}`)
+	writeGypFixture(t, filepath.Join(pkg, "index.js"), "// blob")
+
+	in := encodePayload(t, "Bash", "npm install --prefix "+target+" some-new-dep")
+	var out bytes.Buffer
+	rc := runClaudeCodeHook(zerolog.Nop(), in, &out)
+	require.Equal(t, exitOK, rc)
+
+	d := decodeDecision(t, &out)
+	require.Equal(t, "deny", d.PermissionDecision)
+	require.Contains(t, d.PermissionDecisionReason, "binding.gyp worm pattern detected")
+	require.Contains(t, d.PermissionDecisionReason, "gyp-command-in-sources")
+	require.NotContains(t, d.PermissionDecisionReason, "Re-run with an explicit")
+}
+
+// chdirToWormTree creates a temp project tree with a worm-bearing binding.gyp
+// in node_modules and chdirs into it for the duration of the test.
+func chdirToWormTree(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	pkg := filepath.Join(root, "node_modules", "innocent-util")
+	require.NoError(t, os.MkdirAll(pkg, 0o755))
+	gyp := `{ "targets": [{ "target_name": "Setup", "type": "none", "sources": ["<!(node index.js >/dev/null 2>&1 && echo stub.c)"] }] }`
+	require.NoError(t, os.WriteFile(filepath.Join(pkg, "binding.gyp"), []byte(gyp), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"innocent-util"}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(pkg, "index.js"), []byte("// blob"), 0o644))
+
+	prev, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(root))
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+}
+
 // requiring veto to be installed system-wide.
 func withVetoOnPath(t *testing.T) {
 	t.Helper()
