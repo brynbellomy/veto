@@ -24,6 +24,8 @@ package gypscan
 import (
 	"regexp"
 	"strings"
+
+	"github.com/google/shlex"
 )
 
 // Severity ranks how confident gypscan is that a binding.gyp is malicious.
@@ -131,7 +133,7 @@ var (
 	// a path and uses none of these; the worm's
 	// `node index.js >/dev/null 2>&1 && echo stub.c` uses several. This is the
 	// signal that turns "uses command expansion" into "is executing a payload".
-	payloadShellRe = regexp.MustCompile("\\$\\(|`|>\\s*/|>&|2>&1|&&|\\|\\||;|\\bcurl\\b|\\bwget\\b|/dev/null|\\bbash\\b|\\beval\\b|\\bchild_process\\b")
+	payloadShellRe = regexp.MustCompile("\\$\\(|`|>\\s*/|>&|2>&1|&&|\\|\\||;|\\bcurl\\b|\\bwget\\b|/dev/null|\\bbash\\b|(^|[^A-Za-z0-9_-])eval([^A-Za-z0-9_]|$)|\\bchild_process\\b")
 
 	// nativeBuildDepRe matches package.json dependency or flag names that
 	// legitimize a native build. If any of these is declared, a binding.gyp's
@@ -143,6 +145,12 @@ var (
 	// nativeSourceExtns are the file extensions that indicate a package
 	// genuinely ships native code a binding.gyp would legitimately compile.
 	nativeSourceExtns = []string{".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm", ".h", ".hpp", ".hh", ".s", ".asm"}
+
+	// nativeHelperModules are npm packages whose binding.gyp usage is a pure
+	// native-addon header/path lookup via require("<helper>").
+	nativeHelperModules = []string{"nan", "node-addon-api", "bindings", "node-gyp-build"}
+
+	nativeHelperLookupRe = regexp.MustCompile(nativeHelperLookupPattern(nativeHelperModules))
 )
 
 // Inspect classifies a single binding.gyp. It never errors: malformed or
@@ -403,6 +411,20 @@ func commandExpansionInExecKeys(content string) int {
 			continue
 		}
 		body := content[bodyStart:bodyEnd]
+		sawLiteralExpansion := false
+		for _, literal := range gypStringLiterals(body) {
+			for _, expansion := range commandExpansionsInString(literal.value) {
+				sawLiteralExpansion = true
+				expansionBody := expansion.body
+				if allowedExecKeyExpansion(expansionBody) {
+					continue
+				}
+				return bodyStart + literal.start + expansion.start
+			}
+		}
+		if sawLiteralExpansion {
+			continue
+		}
 		for _, expansion := range expansionBodyRe.FindAllStringSubmatchIndex(body, -1) {
 			expansionStart := expansion[0]
 			expansionBodyStart, expansionBodyEnd := expansion[2], expansion[3]
@@ -496,18 +518,57 @@ func allowedExecKeyExpansion(body string) bool {
 }
 
 func allowedNodePrintExpansion(body string) bool {
-	if localJSPathRe.MatchString(body) {
+	if localJSPathRe.MatchString(body) || payloadShellRe.MatchString(body) {
 		return false
 	}
-	if hasCommandToken(body, "-p", "--print") {
-		return true
-	}
-	if !hasCommandToken(body, "-e", "--eval") {
+	expr, ok := nodeEvalExpression(body)
+	if !ok {
 		return false
 	}
-	lower := strings.ToLower(body)
-	return strings.Contains(lower, "console.log") &&
-		(strings.Contains(lower, "node-addon-api") || strings.Contains(lower, ".include"))
+	return nativeHelperLookupRe.MatchString(expr)
+}
+
+func nodeEvalExpression(body string) (string, bool) {
+	fields, err := shlex.Split(body)
+	if err != nil || len(fields) < 2 {
+		return "", false
+	}
+	switch commandBaseName(fields[0]) {
+	case "node", "nodejs":
+	default:
+		return "", false
+	}
+	flag := fields[1]
+	for _, prefix := range []string{"-p=", "--print=", "-e=", "--eval="} {
+		if strings.HasPrefix(flag, prefix) {
+			if len(fields) != 2 {
+				return "", false
+			}
+			expr := strings.TrimSpace(strings.TrimPrefix(flag, prefix))
+			return expr, expr != ""
+		}
+	}
+	switch flag {
+	case "-p", "--print", "-e", "--eval":
+		if len(fields) != 3 {
+			return "", false
+		}
+		expr := strings.TrimSpace(fields[2])
+		return expr, expr != ""
+	default:
+		return "", false
+	}
+}
+
+func nativeHelperLookupPattern(modules []string) string {
+	helpers := make([]string, 0, len(modules))
+	for _, module := range modules {
+		helpers = append(helpers, regexp.QuoteMeta(module))
+	}
+	requireExpr := `require\(\s*['"](?:` + strings.Join(helpers, "|") + `)['"]\s*\)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?`
+	return `^\s*(?:` + requireExpr +
+		`|console\.log\(\s*` + requireExpr + `\s*\)` +
+		`|process\.stdout\.write\(\s*` + requireExpr + `\s*\))\s*$`
 }
 
 func allowedPythonPrintExpansion(body string) bool {
@@ -537,11 +598,83 @@ func hasCommandToken(body string, tokens ...string) bool {
 // to inspect the command text for payload shape).
 var expansionBodyRe = regexp.MustCompile(`<!@?\s*\(([^)]*)\)`)
 
+type commandExpansionMatch struct {
+	body  string
+	start int
+}
+
+func commandExpansionsInString(content string) []commandExpansionMatch {
+	var out []commandExpansionMatch
+	for searchStart := 0; searchStart < len(content); {
+		loc := commandExpansionRe.FindStringIndex(content[searchStart:])
+		if loc == nil {
+			break
+		}
+		expansionStart := searchStart + loc[0]
+		bodyStart := searchStart + loc[1]
+		bodyEnd := commandExpansionEnd(content, bodyStart)
+		if bodyEnd < 0 {
+			bodyEnd = len(content)
+		}
+		out = append(out, commandExpansionMatch{
+			body:  content[bodyStart:bodyEnd],
+			start: expansionStart,
+		})
+		searchStart = bodyEnd
+		if bodyEnd < len(content) {
+			searchStart++
+		}
+	}
+	return out
+}
+
+func commandExpansionEnd(content string, bodyStart int) int {
+	depth := 1
+	var quote byte
+	escaped := false
+	for i := bodyStart; i < len(content); i++ {
+		ch := content[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			quote = ch
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 // payloadShellInExpansion returns the index of the first command expansion
 // whose body contains payload-shaped shell, or -1. This catches the worm even
 // when the expansion is NOT in a sources array (e.g. relocated into an action
 // or condition) while leaving a benign `<!@(node -p "...")` alone.
 func payloadShellInExpansion(content string) int {
+	for _, literal := range gypStringLiterals(content) {
+		for _, expansion := range commandExpansionsInString(literal.value) {
+			if payloadShellRe.MatchString(expansion.body) {
+				return literal.start + expansion.start
+			}
+		}
+	}
 	for _, m := range expansionBodyRe.FindAllStringSubmatchIndex(content, -1) {
 		bodyStart, bodyEnd := m[2], m[3]
 		if bodyStart < 0 {
