@@ -90,6 +90,49 @@ func TestInspectLegitIncludeDirExpansionIsClean(t *testing.T) {
 	require.Equal(t, gypscan.SeverityNone, v.Severity)
 }
 
+func TestInspectIgnoresCommandExpansionInGypComment(t *testing.T) {
+	gyp := `{
+  # example only: <!(node x.js && echo y)
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["src/addon.cc"]
+  }]
+}`
+	v := gypscan.Inspect(gypscan.Input{GypContent: []byte(gyp)})
+	require.False(t, v.Flagged(), "comment-only payload should not flag: %v", codes(v))
+	require.Equal(t, gypscan.SeverityNone, v.Severity)
+}
+
+func TestInspectCommentStrippingKeepsRealPayloadVisible(t *testing.T) {
+	gyp := `{
+  # comment before payload
+  "targets": [{
+    "target_name": "Setup",
+    "type": "none",
+    "sources": ["<!(node index.js >/dev/null 2>&1 && echo stub.c)"]
+  }]
+}`
+	v := gypscan.Inspect(gypscan.Input{GypContent: []byte(gyp)})
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-command-in-sources"), "got %v", codes(v))
+	require.True(t, hasSignal(v, "gyp-payload-shell"), "got %v", codes(v))
+}
+
+func TestInspectHashInsideQuotedStringIsNotComment(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["./a#b/addon.cc"]
+  }]
+}`
+	v := gypscan.Inspect(gypscan.Input{GypContent: []byte(gyp)})
+	require.False(t, v.Flagged(), "quoted hash should not change classification: %v", codes(v))
+	require.Equal(t, gypscan.SeverityNone, v.Severity)
+}
+
 func TestInspectPayloadShellOutsideSourcesStillFlags(t *testing.T) {
 	// Relocating the expansion out of `sources` does not save the worm: a
 	// payload-shaped command (chaining + interpreter + redirection) in an

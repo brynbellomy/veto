@@ -220,14 +220,15 @@ func Inspect(in Input) Verdict {
 
 func scanCriticalSignals(content string, fromInclude bool) []Signal {
 	var signals []Signal
-	if loc := commandExpansionInSources(content); loc >= 0 {
+	normalized := stripGypComments(content)
+	if loc := commandExpansionInSources(normalized); loc >= 0 {
 		signals = append(signals, Signal{
 			Code:    "gyp-command-in-sources",
 			Detail:  criticalDetail(fromInclude, "runs a command (<!(...) / <!@(...)) inside a `sources` array — node-gyp shells out every sources entry at install time, and a real source is a filename, never a command. This is the phantom-gyp worm's install-time execution vector and fires even with --ignore-scripts."),
 			Excerpt: excerptAround(content, loc),
 		})
 	}
-	if loc := payloadShellInExpansion(content); loc >= 0 {
+	if loc := payloadShellInExpansion(normalized); loc >= 0 {
 		signals = append(signals, Signal{
 			Code:    "gyp-payload-shell",
 			Detail:  criticalDetail(fromInclude, "embeds payload-shaped shell inside a command expansion (chaining, redirection, piping into an interpreter, or a curl/wget/eval call) — a legitimate header-path lookup prints a path and needs none of these."),
@@ -235,6 +236,43 @@ func scanCriticalSignals(content string, fromInclude bool) []Signal {
 		})
 	}
 	return signals
+}
+
+// stripGypComments blanks GYP/Python-style # comments while preserving quoted
+// strings and byte offsets. It is a heuristic normalizer for critical regexes,
+// not a full GYP parser.
+func stripGypComments(content string) string {
+	out := []byte(content)
+	var quote byte
+	escaped := false
+	for i := 0; i < len(out); i++ {
+		ch := out[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			quote = ch
+		case '#':
+			for i < len(out) && out[i] != '\n' && out[i] != '\r' {
+				out[i] = ' '
+				i++
+			}
+			i--
+		}
+	}
+	return string(out)
 }
 
 func criticalDetail(fromInclude bool, detail string) string {
