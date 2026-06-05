@@ -65,7 +65,9 @@ func Inspect(r io.Reader) (gypscan.Verdict, error) {
 
 	var (
 		gypContent  []byte
+		rootGypSeen bool
 		gypFiles    = map[string][]byte{}
+		gypTooLarge = map[string]struct{}{}
 		gypBytes    int64
 		pkgJSON     []byte
 		siblings    []string
@@ -101,26 +103,35 @@ func Inspect(r io.Reader) (gypscan.Verdict, error) {
 			// package-root binding.gyp at install time. Nested/vendored
 			// binding.gyp files are buffered only as possible explicit include
 			// targets, never as separate package-root descriptors.
-			gypContent, err = readCapped(tr, maxEntryBytes)
+			rootGypSeen = true
+			var truncated bool
+			gypContent, truncated, err = readCapped(tr, maxEntryBytes)
 			if err != nil {
 				return gypscan.Verdict{}, errors.With(err, "read binding.gyp from tarball")
 			}
+			if truncated {
+				return gypFileTooLargeVerdict("binding.gyp"), nil
+			}
 		case isGypFile(rel):
 			if gypBytes >= maxGypByteBudget {
-				break
+				gypTooLarge[rel] = struct{}{}
+				continue
 			}
 			var limit int64 = maxEntryBytes
 			if remaining := maxGypByteBudget - gypBytes; remaining < limit {
 				limit = remaining
 			}
-			content, err := readCapped(tr, limit)
+			content, truncated, err := readCapped(tr, limit)
 			if err != nil {
 				return gypscan.Verdict{}, errors.With(err, "read gyp include from tarball").Set("path", rel)
 			}
 			gypFiles[rel] = content
 			gypBytes += int64(len(content))
+			if truncated {
+				gypTooLarge[rel] = struct{}{}
+			}
 		case rel == "package.json":
-			pkgJSON, err = readCapped(tr, maxEntryBytes)
+			pkgJSON, _, err = readCapped(tr, maxEntryBytes)
 			if err != nil {
 				return gypscan.Verdict{}, errors.With(err, "read package.json from tarball")
 			}
@@ -135,12 +146,15 @@ func Inspect(r io.Reader) (gypscan.Verdict, error) {
 		}
 	}
 
-	if len(gypContent) == 0 {
+	if !rootGypSeen {
 		// No binding.gyp → nothing node-gyp would run. Clean.
 		return gypscan.Verdict{Severity: gypscan.SeverityNone}, nil
 	}
 
-	includedContents := resolveIncludedContents("binding.gyp", gypContent, gypFiles)
+	includedContents, tooLargeInclude := resolveIncludedContents("binding.gyp", gypContent, gypFiles, gypTooLarge)
+	if tooLargeInclude != "" {
+		return gypFileTooLargeVerdict(tooLargeInclude), nil
+	}
 	return gypscan.Inspect(gypscan.Input{
 		GypContent:       gypContent,
 		IncludedContents: includedContents,
@@ -153,16 +167,34 @@ func isGypFile(rel string) bool {
 	return strings.HasSuffix(rel, ".gyp") || strings.HasSuffix(rel, ".gypi")
 }
 
-func resolveIncludedContents(rootRel string, rootContent []byte, files map[string][]byte) [][]byte {
+func gypFileTooLargeVerdict(rel string) gypscan.Verdict {
+	detail := "binding.gyp exceeded the tarball scanner size cap and cannot be fully inspected; treating the package as unscannable so payloads cannot hide after the read cap."
+	if rel != "binding.gyp" {
+		detail = "included GYP file exceeded the tarball scanner size cap or aggregate GYP byte budget and cannot be fully inspected: " + rel
+	}
+	return gypscan.Verdict{
+		Severity: gypscan.SeverityCritical,
+		Signals: []gypscan.Signal{{
+			Code:   "gyp-file-too-large",
+			Detail: detail,
+		}},
+	}
+}
+
+func resolveIncludedContents(rootRel string, rootContent []byte, files map[string][]byte, tooLarge map[string]struct{}) ([][]byte, string) {
 	seen := map[string]struct{}{rootRel: {}}
 	var out [][]byte
+	var tooLargeInclude string
 	var walk func(currentRel string, content []byte, depth int)
 	walk = func(currentRel string, content []byte, depth int) {
-		if depth >= maxIncludeDepth {
+		if depth >= maxIncludeDepth || tooLargeInclude != "" {
 			return
 		}
 		baseDir := path.Dir(currentRel)
 		for _, includePath := range gypscan.ParseIncludePaths(content) {
+			if tooLargeInclude != "" {
+				return
+			}
 			candidate := path.Clean(path.Join(baseDir, includePath))
 			if !tarPathWithinRoot(candidate) {
 				continue
@@ -171,6 +203,10 @@ func resolveIncludedContents(rootRel string, rootContent []byte, files map[strin
 				continue
 			}
 			seen[candidate] = struct{}{}
+			if _, ok := tooLarge[candidate]; ok {
+				tooLargeInclude = candidate
+				return
+			}
 			included, ok := files[candidate]
 			if !ok {
 				continue
@@ -180,7 +216,7 @@ func resolveIncludedContents(rootRel string, rootContent []byte, files map[strin
 		}
 	}
 	walk(rootRel, rootContent, 0)
-	return out
+	return out, tooLargeInclude
 }
 
 func tarPathWithinRoot(rel string) bool {
@@ -202,12 +238,15 @@ func stripPackagePrefix(name string) string {
 	return clean
 }
 
-// readCapped reads up to limit bytes from r. A tar entry larger than the cap
-// is truncated to the cap — the heuristic only needs the head of the file.
-func readCapped(r io.Reader, limit int64) ([]byte, error) {
-	buf, err := io.ReadAll(io.LimitReader(r, limit))
+// readCapped reads up to limit bytes from r and reports whether more content
+// existed past the cap.
+func readCapped(r io.Reader, limit int64) ([]byte, bool, error) {
+	buf, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return buf, nil
+	if int64(len(buf)) > limit {
+		return buf[:limit], true, nil
+	}
+	return buf, false, nil
 }

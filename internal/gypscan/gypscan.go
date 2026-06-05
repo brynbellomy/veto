@@ -24,6 +24,8 @@ package gypscan
 import (
 	"regexp"
 	"strings"
+
+	"github.com/google/shlex"
 )
 
 // Severity ranks how confident gypscan is that a binding.gyp is malicious.
@@ -131,7 +133,7 @@ var (
 	// a path and uses none of these; the worm's
 	// `node index.js >/dev/null 2>&1 && echo stub.c` uses several. This is the
 	// signal that turns "uses command expansion" into "is executing a payload".
-	payloadShellRe = regexp.MustCompile("\\$\\(|`|>\\s*/|>&|2>&1|&&|\\|\\||;|\\bcurl\\b|\\bwget\\b|/dev/null|\\bbash\\b|\\beval\\b|\\bchild_process\\b")
+	payloadShellRe = regexp.MustCompile("\\$\\(|`|>\\s*/|>&|2>&1|&&|\\|\\||;|\\bcurl\\b|\\bwget\\b|/dev/null|\\bbash\\b|(^|[^A-Za-z0-9_-])eval([^A-Za-z0-9_]|$)|\\bchild_process\\b")
 
 	// nativeBuildDepRe matches package.json dependency or flag names that
 	// legitimize a native build. If any of these is declared, a binding.gyp's
@@ -143,6 +145,12 @@ var (
 	// nativeSourceExtns are the file extensions that indicate a package
 	// genuinely ships native code a binding.gyp would legitimately compile.
 	nativeSourceExtns = []string{".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm", ".h", ".hpp", ".hh", ".s", ".asm"}
+
+	// nativeHelperModules are npm packages whose binding.gyp usage is a pure
+	// native-addon header/path lookup via require("<helper>").
+	nativeHelperModules = []string{"nan", "node-addon-api", "bindings", "node-gyp-build"}
+
+	nativeHelperLookupRe = regexp.MustCompile(nativeHelperLookupPattern(nativeHelperModules))
 )
 
 // Inspect classifies a single binding.gyp. It never errors: malformed or
@@ -220,21 +228,76 @@ func Inspect(in Input) Verdict {
 
 func scanCriticalSignals(content string, fromInclude bool) []Signal {
 	var signals []Signal
-	if loc := commandExpansionInSources(content); loc >= 0 {
+	normalized := stripGypComments(content)
+	if loc := commandExpansionInSources(normalized); loc >= 0 {
 		signals = append(signals, Signal{
 			Code:    "gyp-command-in-sources",
 			Detail:  criticalDetail(fromInclude, "runs a command (<!(...) / <!@(...)) inside a `sources` array — node-gyp shells out every sources entry at install time, and a real source is a filename, never a command. This is the phantom-gyp worm's install-time execution vector and fires even with --ignore-scripts."),
 			Excerpt: excerptAround(content, loc),
 		})
 	}
-	if loc := payloadShellInExpansion(content); loc >= 0 {
+	if loc := payloadShellInExpansion(normalized); loc >= 0 {
 		signals = append(signals, Signal{
 			Code:    "gyp-payload-shell",
 			Detail:  criticalDetail(fromInclude, "embeds payload-shaped shell inside a command expansion (chaining, redirection, piping into an interpreter, or a curl/wget/eval call) — a legitimate header-path lookup prints a path and needs none of these."),
 			Excerpt: excerptAround(content, loc),
 		})
 	}
+	if loc, excerpt := commandActionArray(normalized); loc >= 0 {
+		if excerpt == "" {
+			excerpt = excerptAround(content, loc)
+		}
+		signals = append(signals, Signal{
+			Code:    "gyp-action-exec",
+			Detail:  criticalDetail(fromInclude, "declares an `action` argv array that invokes an interpreter, shell, package manager, fetch tool, computed command, or payload-shaped shell — node-gyp runs actions/rules during the native build path, so this is install-time command execution."),
+			Excerpt: excerpt,
+		})
+	}
+	if loc := commandExpansionInExecKeys(normalized); loc >= 0 {
+		signals = append(signals, Signal{
+			Code:    "gyp-exec-key-command",
+			Detail:  criticalDetail(fromInclude, "runs a non-allowlisted command expansion inside an execution-sensitive build key (`libraries`, `cflags`, `ldflags`, `include_dirs`, or related flags) — node-gyp evaluates these at configure time, so quiet package-local interpreter invocations still execute at install time."),
+			Excerpt: excerptAround(content, loc),
+		})
+	}
 	return signals
+}
+
+// stripGypComments blanks GYP/Python-style # comments while preserving quoted
+// strings and byte offsets. It is a heuristic normalizer for critical regexes,
+// not a full GYP parser.
+func stripGypComments(content string) string {
+	out := []byte(content)
+	var quote byte
+	escaped := false
+	for i := 0; i < len(out); i++ {
+		ch := out[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			quote = ch
+		case '#':
+			for i < len(out) && out[i] != '\n' && out[i] != '\r' {
+				out[i] = ' '
+				i++
+			}
+			i--
+		}
+	}
+	return string(out)
 }
 
 func criticalDetail(fromInclude bool, detail string) string {
@@ -248,6 +311,43 @@ func criticalDetail(fromInclude bool, detail string) string {
 // its array literal, capturing the array body so we can check whether a
 // command expansion hides among what should be plain filenames.
 var sourcesArrayRe = regexp.MustCompile(`["'](sources|inputs|outputs)["']\s*:\s*\[([^\]]*)\]`)
+
+// actionArrayRe matches a GYP `action` key followed by its argv array. Both
+// `actions[].action` and `rules[].action` use this same key shape.
+var actionArrayRe = regexp.MustCompile(`["']action["']\s*:\s*\[([^\]]*)\]`)
+
+// execKeyArrayRe matches GYP arrays whose values are evaluated during
+// configure/build setup rather than treated as inert source filenames.
+var execKeyArrayRe = regexp.MustCompile(`["'](libraries|cflags|cflags_c|cflags_cc|ldflags|include_dirs|library_dirs)["']\s*:\s*\[([^\]]*)\]`)
+
+var localJSPathRe = regexp.MustCompile(`(?i)(^|[\s"'(=])(?:\.{1,2}/|[A-Za-z0-9_.-]+/)[^\s"')]+\.(?:[cm]?js)\b|(^|[\s"'(=])[^/\s"')]+\.(?:[cm]?js)\b`)
+
+var actionCommandInterpreters = map[string]struct{}{
+	"bash":       {},
+	"bun":        {},
+	"bunx":       {},
+	"cmd":        {},
+	"curl":       {},
+	"dash":       {},
+	"eval":       {},
+	"node":       {},
+	"nodejs":     {},
+	"npm":        {},
+	"npx":        {},
+	"osascript":  {},
+	"perl":       {},
+	"pnpm":       {},
+	"powershell": {},
+	"pwsh":       {},
+	"python":     {},
+	"python2":    {},
+	"python3":    {},
+	"ruby":       {},
+	"sh":         {},
+	"wget":       {},
+	"yarn":       {},
+	"zsh":        {},
+}
 
 // commandExpansionInSources returns the index (into content) of a command
 // expansion found inside a sources/inputs/outputs array, or -1 if none. These
@@ -268,17 +368,313 @@ func commandExpansionInSources(content string) int {
 	return -1
 }
 
+// commandActionArray returns the location and excerpt for a risky
+// actions/rules `action` argv array. GYP action arrays are direct build
+// commands, so argv0 is high-signal when it is an interpreter/shell/package
+// manager/fetch tool, a computed command expansion, or paired with
+// payload-shaped shell in any argument.
+func commandActionArray(content string) (int, string) {
+	for _, m := range actionArrayRe.FindAllStringSubmatchIndex(content, -1) {
+		bodyStart, bodyEnd := m[2], m[3]
+		if bodyStart < 0 {
+			continue
+		}
+		body := content[bodyStart:bodyEnd]
+		args := gypStringLiterals(body)
+		if len(args) == 0 {
+			continue
+		}
+		argv0 := args[0]
+		loc := bodyStart + argv0.start
+		if commandExpansionRe.MatchString(argv0.value) || isActionInterpreter(argv0.value) {
+			return loc, excerptAround(content, loc)
+		}
+		for _, arg := range args {
+			if payloadShellRe.MatchString(arg.value) {
+				loc := bodyStart + arg.start
+				return loc, excerptAround(content, loc)
+			}
+		}
+	}
+	return -1, ""
+}
+
+// commandExpansionInExecKeys returns the index of a risky command expansion
+// inside execution-sensitive GYP keys. The allowlist is limited to common
+// print-only header/path lookups such as node-addon-api includes and
+// pkg-config queries; package-local interpreter scripts remain Critical even
+// when they contain no shell metacharacters.
+func commandExpansionInExecKeys(content string) int {
+	for _, m := range execKeyArrayRe.FindAllStringSubmatchIndex(content, -1) {
+		bodyStart, bodyEnd := m[4], m[5]
+		if bodyStart < 0 {
+			continue
+		}
+		body := content[bodyStart:bodyEnd]
+		sawLiteralExpansion := false
+		for _, literal := range gypStringLiterals(body) {
+			for _, expansion := range commandExpansionsInString(literal.value) {
+				sawLiteralExpansion = true
+				expansionBody := expansion.body
+				if allowedExecKeyExpansion(expansionBody) {
+					continue
+				}
+				return bodyStart + literal.start + expansion.start
+			}
+		}
+		if sawLiteralExpansion {
+			continue
+		}
+		for _, expansion := range expansionBodyRe.FindAllStringSubmatchIndex(body, -1) {
+			expansionStart := expansion[0]
+			expansionBodyStart, expansionBodyEnd := expansion[2], expansion[3]
+			if expansionBodyStart < 0 {
+				continue
+			}
+			expansionBody := body[expansionBodyStart:expansionBodyEnd]
+			if allowedExecKeyExpansion(expansionBody) {
+				continue
+			}
+			return bodyStart + expansionStart
+		}
+	}
+	return -1
+}
+
+type gypStringLiteral struct {
+	value string
+	start int
+}
+
+func gypStringLiterals(content string) []gypStringLiteral {
+	var out []gypStringLiteral
+	for i := 0; i < len(content); i++ {
+		quote := content[i]
+		if quote != '\'' && quote != '"' {
+			continue
+		}
+		start := i
+		var b strings.Builder
+		escaped := false
+		for i++; i < len(content); i++ {
+			ch := content[i]
+			if escaped {
+				b.WriteByte(ch)
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				out = append(out, gypStringLiteral{value: b.String(), start: start})
+				break
+			}
+			b.WriteByte(ch)
+		}
+	}
+	return out
+}
+
+func isActionInterpreter(argv0 string) bool {
+	name := commandBaseName(argv0)
+	if name == "" {
+		return false
+	}
+	_, ok := actionCommandInterpreters[name]
+	return ok
+}
+
+func commandBaseName(cmd string) string {
+	fields := strings.Fields(strings.TrimSpace(cmd))
+	if len(fields) == 0 {
+		return ""
+	}
+	cmd = fields[0]
+	if idx := strings.LastIndexAny(cmd, `/\`); idx >= 0 {
+		cmd = cmd[idx+1:]
+	}
+	cmd = strings.ToLower(cmd)
+	cmd = strings.TrimSuffix(cmd, ".exe")
+	return cmd
+}
+
+func allowedExecKeyExpansion(body string) bool {
+	body = strings.TrimSpace(body)
+	if body == "" || payloadShellRe.MatchString(body) {
+		return false
+	}
+	switch commandBaseName(body) {
+	case "node", "nodejs":
+		return allowedNodePrintExpansion(body)
+	case "pkg-config":
+		return true
+	case "python", "python2", "python3":
+		return allowedPythonPrintExpansion(body)
+	default:
+		return false
+	}
+}
+
+func allowedNodePrintExpansion(body string) bool {
+	if localJSPathRe.MatchString(body) || payloadShellRe.MatchString(body) {
+		return false
+	}
+	expr, ok := nodeEvalExpression(body)
+	if !ok {
+		return false
+	}
+	return nativeHelperLookupRe.MatchString(expr)
+}
+
+func nodeEvalExpression(body string) (string, bool) {
+	fields, err := shlex.Split(body)
+	if err != nil || len(fields) < 2 {
+		return "", false
+	}
+	switch commandBaseName(fields[0]) {
+	case "node", "nodejs":
+	default:
+		return "", false
+	}
+	flag := fields[1]
+	for _, prefix := range []string{"-p=", "--print=", "-e=", "--eval="} {
+		if strings.HasPrefix(flag, prefix) {
+			if len(fields) != 2 {
+				return "", false
+			}
+			expr := strings.TrimSpace(strings.TrimPrefix(flag, prefix))
+			return expr, expr != ""
+		}
+	}
+	switch flag {
+	case "-p", "--print", "-e", "--eval":
+		if len(fields) != 3 {
+			return "", false
+		}
+		expr := strings.TrimSpace(fields[2])
+		return expr, expr != ""
+	default:
+		return "", false
+	}
+}
+
+func nativeHelperLookupPattern(modules []string) string {
+	helpers := make([]string, 0, len(modules))
+	for _, module := range modules {
+		helpers = append(helpers, regexp.QuoteMeta(module))
+	}
+	requireExpr := `require\(\s*['"](?:` + strings.Join(helpers, "|") + `)['"]\s*\)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?`
+	return `^\s*(?:` + requireExpr +
+		`|console\.log\(\s*` + requireExpr + `\s*\)` +
+		`|process\.stdout\.write\(\s*` + requireExpr + `\s*\))\s*$`
+}
+
+func allowedPythonPrintExpansion(body string) bool {
+	if localJSPathRe.MatchString(body) || !hasCommandToken(body, "-c") {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "print(") || strings.Contains(lower, "sys.stdout.write")
+}
+
+func hasCommandToken(body string, tokens ...string) bool {
+	fields := strings.Fields(body)
+	for _, field := range fields {
+		field = strings.Trim(field, `"'`)
+		for _, token := range tokens {
+			if field == token || strings.HasPrefix(field, token+"=") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // expansionBodyRe captures the body of a GYP command expansion
 // `<!(...)` / `<!@(...)` up to the closing paren (no nested parens — GYP
 // expansions don't nest in practice, and a greedy stop at `)` is sufficient
 // to inspect the command text for payload shape).
 var expansionBodyRe = regexp.MustCompile(`<!@?\s*\(([^)]*)\)`)
 
+type commandExpansionMatch struct {
+	body  string
+	start int
+}
+
+func commandExpansionsInString(content string) []commandExpansionMatch {
+	var out []commandExpansionMatch
+	for searchStart := 0; searchStart < len(content); {
+		loc := commandExpansionRe.FindStringIndex(content[searchStart:])
+		if loc == nil {
+			break
+		}
+		expansionStart := searchStart + loc[0]
+		bodyStart := searchStart + loc[1]
+		bodyEnd := commandExpansionEnd(content, bodyStart)
+		if bodyEnd < 0 {
+			bodyEnd = len(content)
+		}
+		out = append(out, commandExpansionMatch{
+			body:  content[bodyStart:bodyEnd],
+			start: expansionStart,
+		})
+		searchStart = bodyEnd
+		if bodyEnd < len(content) {
+			searchStart++
+		}
+	}
+	return out
+}
+
+func commandExpansionEnd(content string, bodyStart int) int {
+	depth := 1
+	var quote byte
+	escaped := false
+	for i := bodyStart; i < len(content); i++ {
+		ch := content[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			quote = ch
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 // payloadShellInExpansion returns the index of the first command expansion
 // whose body contains payload-shaped shell, or -1. This catches the worm even
 // when the expansion is NOT in a sources array (e.g. relocated into an action
 // or condition) while leaving a benign `<!@(node -p "...")` alone.
 func payloadShellInExpansion(content string) int {
+	for _, literal := range gypStringLiterals(content) {
+		for _, expansion := range commandExpansionsInString(literal.value) {
+			if payloadShellRe.MatchString(expansion.body) {
+				return literal.start + expansion.start
+			}
+		}
+	}
 	for _, m := range expansionBodyRe.FindAllStringSubmatchIndex(content, -1) {
 		bodyStart, bodyEnd := m[2], m[3]
 		if bodyStart < 0 {

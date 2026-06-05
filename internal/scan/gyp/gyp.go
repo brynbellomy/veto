@@ -16,6 +16,7 @@ package gyp
 
 import (
 	"context"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -27,10 +28,10 @@ import (
 	"github.com/brynbellomy/veto/internal/scan"
 )
 
-// maxGypBytes caps how much of a binding.gyp we read. A real binding.gyp is a
-// few KB; the worm's is ~157 bytes. Anything past this is not a legitimate
-// build descriptor and reading it whole would only burn memory — we read the
-// cap and let the heuristic run on the prefix.
+// maxGypBytes caps how much of a GYP file we read. A real binding.gyp is a few
+// KB; the worm's is ~157 bytes. Files over the cap are treated as unscannable
+// and therefore Critical for the package rather than silently scanning only a
+// clean prefix.
 const maxGypBytes = 256 * 1024
 
 // maxIncludeDepth caps transitive GYP includes to avoid cycles and
@@ -113,15 +114,21 @@ func (s *Scanner) Scan(ctx context.Context) scan.Result {
 // reading the gyp are returned so the caller can surface them as non-fatal scan
 // errors; a binding.gyp that cannot be read is reported, not silently skipped.
 func (s *Scanner) scanGyp(path string) (*scan.Finding, error) {
-	content, err := readCapped(path, maxGypBytes)
+	content, truncated, err := readCapped(path, maxGypBytes)
 	if err != nil {
 		return nil, errors.With(err, "read binding.gyp").Set("path", path)
 	}
+	if truncated {
+		return gypTooLargeFinding(path, path), nil
+	}
 
 	dir := filepath.Dir(path)
-	pkgJSON, _ := readCapped(filepath.Join(dir, "package.json"), maxGypBytes) // best-effort; absence is fine
+	pkgJSON, _, _ := readCapped(filepath.Join(dir, "package.json"), maxGypBytes) // best-effort; absence/truncation is fine
 	siblings := listSiblings(dir)
-	includedContents := resolveIncludedContents(dir, content)
+	includedContents, truncatedInclude := resolveIncludedContents(dir, content)
+	if truncatedInclude != "" {
+		return gypTooLargeFinding(path, truncatedInclude), nil
+	}
 
 	verdict := gypscan.Inspect(gypscan.Input{
 		GypContent:       content,
@@ -158,21 +165,49 @@ func (s *Scanner) scanGyp(path string) (*scan.Finding, error) {
 	}, nil
 }
 
-func resolveIncludedContents(packageRoot string, rootContent []byte) [][]byte {
+func gypTooLargeFinding(path string, truncatedPath string) *scan.Finding {
+	detail := "binding.gyp exceeded the scanner size cap and cannot be fully inspected; treating the package as unscannable so payloads cannot hide after the read cap."
+	if truncatedPath != "" && truncatedPath != path {
+		detail = "included GYP file exceeded the scanner size cap and cannot be fully inspected: " + truncatedPath
+	}
+	verdict := gypscan.Verdict{
+		Severity: gypscan.SeverityCritical,
+		Signals: []gypscan.Signal{{
+			Code:   "gyp-file-too-large",
+			Detail: detail,
+		}},
+	}
+	evidence := []scan.Evidence{{Label: verdict.Signals[0].Code, Value: verdict.Signals[0].Detail}}
+	return &scan.Finding{
+		ID:          "gyp:critical:" + path + ":too-large",
+		Surface:     scan.SurfaceProject,
+		Severity:    scan.SeverityCritical,
+		Path:        path,
+		Title:       "binding.gyp is too large to scan safely (phantom-gyp / Miasma)",
+		Evidence:    evidence,
+		Remediation: "Do NOT run npm install/update in this tree until resolved — an oversized binding.gyp or included GYP file could hide node-gyp install-time execution after the scanner cap. Inspect the package manually, delete it if unexpected, clear node_modules and the lockfile entry, and rotate any credentials reachable from machines that already installed it.",
+	}
+}
+
+func resolveIncludedContents(packageRoot string, rootContent []byte) ([][]byte, string) {
 	rootAbs, err := filepath.Abs(packageRoot)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	rootAbs = filepath.Clean(rootAbs)
 
 	seen := map[string]struct{}{}
 	var out [][]byte
+	var truncatedPath string
 	var walk func(baseDir string, content []byte, depth int)
 	walk = func(baseDir string, content []byte, depth int) {
-		if depth >= maxIncludeDepth {
+		if depth >= maxIncludeDepth || truncatedPath != "" {
 			return
 		}
 		for _, includePath := range gypscan.ParseIncludePaths(content) {
+			if truncatedPath != "" {
+				return
+			}
 			candidate := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(includePath)))
 			candidateAbs, err := filepath.Abs(candidate)
 			if err != nil {
@@ -186,16 +221,20 @@ func resolveIncludedContents(packageRoot string, rootContent []byte) [][]byte {
 				continue
 			}
 			seen[candidateAbs] = struct{}{}
-			included, err := readCapped(candidateAbs, maxGypBytes)
+			included, truncated, err := readCapped(candidateAbs, maxGypBytes)
 			if err != nil || included == nil {
 				continue
+			}
+			if truncated {
+				truncatedPath = candidateAbs
+				return
 			}
 			out = append(out, included)
 			walk(filepath.Dir(candidateAbs), included, depth+1)
 		}
 	}
 	walk(rootAbs, rootContent, 0)
-	return out
+	return out, truncatedPath
 }
 
 func pathWithinRoot(root, candidate string) bool {
@@ -206,25 +245,27 @@ func pathWithinRoot(root, candidate string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-// readCapped reads up to limit bytes from path. Returns (nil, nil) when the
-// file does not exist so optional siblings (package.json) degrade quietly;
-// other errors are returned.
-func readCapped(path string, limit int64) ([]byte, error) {
+// readCapped reads up to limit bytes from path and reports whether the file had
+// more content past the cap. Returns (nil, false, nil) when the file does not
+// exist so optional siblings (package.json) degrade quietly; other errors are
+// returned.
+func readCapped(path string, limit int64) ([]byte, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
 	defer f.Close()
-	buf := make([]byte, limit)
-	n, err := f.Read(buf)
-	if err != nil && n == 0 {
-		// EOF on empty file reads as (0, io.EOF); treat as empty content.
-		return []byte{}, nil
+	buf, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, false, err
 	}
-	return buf[:n], nil
+	if int64(len(buf)) > limit {
+		return buf[:limit], true, nil
+	}
+	return buf, false, nil
 }
 
 // listSiblings returns the base names of the files (not dirs) directly inside

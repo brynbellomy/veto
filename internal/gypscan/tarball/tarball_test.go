@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -94,6 +95,38 @@ func TestInspectTarballWithoutGypIsClean(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, v.Flagged())
 	require.Empty(t, v.Signals)
+}
+
+func TestInspectOversizedRootBindingGypIsCritical(t *testing.T) {
+	tgz := buildTarball(t, map[string]string{
+		"binding.gyp":  strings.Repeat(" ", 1<<20+1) + wormGyp,
+		"package.json": `{"name":"innocent-util","version":"1.2.4","main":"index.js"}`,
+		"index.js":     "// blob",
+	})
+
+	v, err := tarball.Inspect(bytes.NewReader(tgz))
+	require.NoError(t, err)
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-file-too-large"), "got %v", codes(v))
+}
+
+func TestInspectOversizedIncludedGypiIsCritical(t *testing.T) {
+	tgz := buildTarball(t, map[string]string{
+		"binding.gyp": `{
+  "includes": ["build/payload.gypi"],
+  "targets": [{ "target_name": "addon", "type": "loadable_module", "sources": ["addon.cc"] }]
+}`,
+		"build/payload.gypi": strings.Repeat(" ", 1<<20+1) + wormGyp,
+		"package.json":       `{"name":"real-addon","dependencies":{"node-addon-api":"^7.0.0"}}`,
+		"addon.cc":           "// native source at root",
+	})
+
+	v, err := tarball.Inspect(bytes.NewReader(tgz))
+	require.NoError(t, err)
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-file-too-large"), "got %v", codes(v))
 }
 
 func TestInspectPureJSPackageWithRootGypFlags(t *testing.T) {

