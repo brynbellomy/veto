@@ -49,6 +49,29 @@ current user-facing behavior.
   `cargomanifest` registry classifier (non-crates-io `registry = ...`
   should be OpaqueRemote, mirroring cargolock); and `[workspace]`
   members expansion for monorepo Cargo.toml roots.
+- binding.gyp worm (phantom-gyp/Miasma) mitigation — SHIPPED across three
+  layers: `internal/gypscan` (pure detector), `internal/gypscan/tarball`
+  (in-memory .tgz inspector), `internal/scan/gyp` (existing-exposure walker),
+  plus install-hot-path wiring (existing-tree scan + `npm pack` tarball
+  inspection) and the Claude Code hook. Remaining edges:
+  - Tarball scan covers npm-family only (`npm pack`). pnpm/yarn/bun have their
+    own fetch verbs (`pnpm pack`? `yarn pack` is local-only) — wire a
+    per-PM safe tarball-fetch when their CLIs support a download-only pack of a
+    registry spec. Today pnpm/yarn/bun installs get the existing-tree scan but
+    not the incoming-tarball scan.
+  - Default tarball scope is argv-direct packages; `VETO_GYP_TARBALL_SCAN=full`
+    fetches every resolved transitive (one `npm pack` each — slow on big
+    trees). Consider parallelizing the fetches, or scoping `full` to only the
+    transitives NOT already present in node_modules, before promoting it to
+    default.
+  - GYP is python-ish, not JSON; the detector heuristics over text rather than
+    parsing. A determined attacker could try to obfuscate the expansion across
+    lines or via `includes:` of a second .gypi. Consider following `includes`
+    references and normalizing whitespace before matching if an evasion variant
+    appears in the wild.
+  - The hook's cwd worm check assumes the install runs in cwd; an `npm install
+    --prefix <dir>` would install elsewhere. Parse `--prefix`/`-C` in the hook
+    and scan that tree instead.
 - Add an authenticated online lookup layer for vulnerability surfaces that do
   not fit the cached bulk-source model yet, especially Socket.dev vuln data and
   SafeDep PMG real-time package analysis.
