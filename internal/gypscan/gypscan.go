@@ -235,6 +235,16 @@ func scanCriticalSignals(content string, fromInclude bool) []Signal {
 			Excerpt: excerptAround(content, loc),
 		})
 	}
+	if loc, excerpt := commandActionArray(normalized); loc >= 0 {
+		if excerpt == "" {
+			excerpt = excerptAround(content, loc)
+		}
+		signals = append(signals, Signal{
+			Code:    "gyp-action-exec",
+			Detail:  criticalDetail(fromInclude, "declares an `action` argv array that invokes an interpreter, shell, package manager, fetch tool, computed command, or payload-shaped shell — node-gyp runs actions/rules during the native build path, so this is install-time command execution."),
+			Excerpt: excerpt,
+		})
+	}
 	return signals
 }
 
@@ -287,6 +297,37 @@ func criticalDetail(fromInclude bool, detail string) string {
 // command expansion hides among what should be plain filenames.
 var sourcesArrayRe = regexp.MustCompile(`["'](sources|inputs|outputs)["']\s*:\s*\[([^\]]*)\]`)
 
+// actionArrayRe matches a GYP `action` key followed by its argv array. Both
+// `actions[].action` and `rules[].action` use this same key shape.
+var actionArrayRe = regexp.MustCompile(`["']action["']\s*:\s*\[([^\]]*)\]`)
+
+var actionCommandInterpreters = map[string]struct{}{
+	"bash":       {},
+	"bun":        {},
+	"bunx":       {},
+	"cmd":        {},
+	"curl":       {},
+	"dash":       {},
+	"eval":       {},
+	"node":       {},
+	"nodejs":     {},
+	"npm":        {},
+	"npx":        {},
+	"osascript":  {},
+	"perl":       {},
+	"pnpm":       {},
+	"powershell": {},
+	"pwsh":       {},
+	"python":     {},
+	"python2":    {},
+	"python3":    {},
+	"ruby":       {},
+	"sh":         {},
+	"wget":       {},
+	"yarn":       {},
+	"zsh":        {},
+}
+
 // commandExpansionInSources returns the index (into content) of a command
 // expansion found inside a sources/inputs/outputs array, or -1 if none. These
 // arrays are supposed to hold filenames; node-gyp shells out each entry, so a
@@ -304,6 +345,96 @@ func commandExpansionInSources(content string) int {
 		}
 	}
 	return -1
+}
+
+// commandActionArray returns the location and excerpt for a risky
+// actions/rules `action` argv array. GYP action arrays are direct build
+// commands, so argv0 is high-signal when it is an interpreter/shell/package
+// manager/fetch tool, a computed command expansion, or paired with
+// payload-shaped shell in any argument.
+func commandActionArray(content string) (int, string) {
+	for _, m := range actionArrayRe.FindAllStringSubmatchIndex(content, -1) {
+		bodyStart, bodyEnd := m[2], m[3]
+		if bodyStart < 0 {
+			continue
+		}
+		body := content[bodyStart:bodyEnd]
+		args := gypStringLiterals(body)
+		if len(args) == 0 {
+			continue
+		}
+		argv0 := args[0]
+		loc := bodyStart + argv0.start
+		if commandExpansionRe.MatchString(argv0.value) || isActionInterpreter(argv0.value) {
+			return loc, excerptAround(content, loc)
+		}
+		for _, arg := range args {
+			if payloadShellRe.MatchString(arg.value) {
+				loc := bodyStart + arg.start
+				return loc, excerptAround(content, loc)
+			}
+		}
+	}
+	return -1, ""
+}
+
+type gypStringLiteral struct {
+	value string
+	start int
+}
+
+func gypStringLiterals(content string) []gypStringLiteral {
+	var out []gypStringLiteral
+	for i := 0; i < len(content); i++ {
+		quote := content[i]
+		if quote != '\'' && quote != '"' {
+			continue
+		}
+		start := i
+		var b strings.Builder
+		escaped := false
+		for i++; i < len(content); i++ {
+			ch := content[i]
+			if escaped {
+				b.WriteByte(ch)
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				out = append(out, gypStringLiteral{value: b.String(), start: start})
+				break
+			}
+			b.WriteByte(ch)
+		}
+	}
+	return out
+}
+
+func isActionInterpreter(argv0 string) bool {
+	name := commandBaseName(argv0)
+	if name == "" {
+		return false
+	}
+	_, ok := actionCommandInterpreters[name]
+	return ok
+}
+
+func commandBaseName(cmd string) string {
+	fields := strings.Fields(strings.TrimSpace(cmd))
+	if len(fields) == 0 {
+		return ""
+	}
+	cmd = fields[0]
+	if idx := strings.LastIndexAny(cmd, `/\`); idx >= 0 {
+		cmd = cmd[idx+1:]
+	}
+	cmd = strings.ToLower(cmd)
+	cmd = strings.TrimSuffix(cmd, ".exe")
+	return cmd
 }
 
 // expansionBodyRe captures the body of a GYP command expansion

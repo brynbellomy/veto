@@ -31,6 +31,14 @@ const legitAddonGyp = `{
   ]
 }`
 
+func cleanNativeInput(gyp string) gypscan.Input {
+	return gypscan.Input{
+		GypContent:   []byte(gyp),
+		PackageJSON:  []byte(`{"name":"native-addon","dependencies":{"node-addon-api":"^7.0.0"}}`),
+		SiblingFiles: []string{"binding.gyp", "addon.cc", "package.json"},
+	}
+}
+
 func TestInspectFlagsWormCommandExpansion(t *testing.T) {
 	v := gypscan.Inspect(gypscan.Input{GypContent: []byte(wormGyp)})
 
@@ -169,6 +177,119 @@ func TestInspectFlagsPayloadInIncludedContents(t *testing.T) {
 		if s.Code == "gyp-command-in-sources" {
 			require.Contains(t, s.Detail, "included GYP file")
 			require.Contains(t, s.Excerpt, "node evil.js")
+		}
+	}
+}
+
+func TestInspectFlagsActionsActionCommandExecution(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    "actions": [{
+      "action_name": "prepare",
+      "inputs": ["package.json"],
+      "outputs": ["build/prepare.stamp"],
+      "action": ["node", "scripts/prepare.js"]
+    }]
+  }]
+}`
+	v := gypscan.Inspect(cleanNativeInput(gyp))
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-action-exec"), "got %v", codes(v))
+}
+
+func TestInspectFlagsRulesActionCommandExecution(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["schema.idl", "addon.cc"],
+    "rules": [{
+      "rule_name": "generate",
+      "extension": "idl",
+      "outputs": ["<(RULE_INPUT_ROOT).cc"],
+      "action": ["node", "tools/generate.js", "<(RULE_INPUT_PATH)"]
+    }]
+  }]
+}`
+	v := gypscan.Inspect(cleanNativeInput(gyp))
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-action-exec"), "got %v", codes(v))
+}
+
+func TestInspectAllowsNonInterpreterActionCodegen(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    "actions": [{
+      "action_name": "generate",
+      "inputs": ["x.proto"],
+      "outputs": ["x.pb.cc"],
+      "action": ["<(PRODUCT_DIR)/protoc", "--cpp_out=.", "x.proto"]
+    }]
+  }]
+}`
+	v := gypscan.Inspect(cleanNativeInput(gyp))
+	require.False(t, v.Flagged(), "legit codegen action flagged: %v", codes(v))
+	require.Equal(t, gypscan.SeverityNone, v.Severity)
+}
+
+func TestInspectFlagsComputedActionArgv0(t *testing.T) {
+	gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    "actions": [{
+      "action_name": "prepare",
+      "inputs": ["package.json"],
+      "outputs": ["build/prepare.stamp"],
+      "action": ["<!(node scripts/select-tool.js)", "scripts/prepare.js"]
+    }]
+  }]
+}`
+	v := gypscan.Inspect(cleanNativeInput(gyp))
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-action-exec"), "got %v", codes(v))
+}
+
+func TestInspectFlagsActionInIncludedContents(t *testing.T) {
+	root := `{
+  "includes": ["actions.gypi"],
+  "targets": [{ "target_name": "addon", "type": "loadable_module", "sources": ["addon.cc"] }]
+}`
+	include := `{
+  "targets": [{
+    "target_name": "addon",
+    "actions": [{
+      "action_name": "prepare",
+      "inputs": ["package.json"],
+      "outputs": ["build/prepare.stamp"],
+      "action": ["node", "scripts/prepare.js"]
+    }]
+  }]
+}`
+
+	v := gypscan.Inspect(gypscan.Input{
+		GypContent:       []byte(root),
+		IncludedContents: [][]byte{[]byte(include)},
+		PackageJSON:      []byte(`{"name":"native-addon","dependencies":{"node-addon-api":"^7.0.0"}}`),
+		SiblingFiles:     []string{"binding.gyp", "addon.cc", "package.json"},
+	})
+
+	require.True(t, v.Flagged())
+	require.Equal(t, gypscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "gyp-action-exec"), "got %v", codes(v))
+	for _, s := range v.Signals {
+		if s.Code == "gyp-action-exec" {
+			require.Contains(t, s.Detail, "included GYP file")
 		}
 	}
 }
