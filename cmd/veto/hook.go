@@ -211,9 +211,9 @@ func joinShellQuoted(tokens []string) string {
 	return strings.Join(parts, " ")
 }
 
-// shellQuote mirrors Python's `shlex.quote`: returns t unchanged if it
-// only contains "safe" characters; otherwise wraps in single quotes with
-// `'` escaped as `'\''`.
+// shellQuote mirrors Python's `shlex.quote`: returns t unchanged if it only
+// contains "safe" characters; otherwise wraps in single quotes and escapes
+// embedded single quotes with the standard POSIX close/backslash/open sequence.
 func shellQuote(t string) string {
 	if t == "" {
 		return "''"
@@ -231,4 +231,3 @@ func shellQuote(t string) string {
 	}
 	return "'" + strings.ReplaceAll(t, "'", `'\''`) + "'"
 }
-

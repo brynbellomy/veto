@@ -308,4 +308,3 @@ func parsePayload(eco intel.Ecosystem, payload []byte) ([]intel.MalwareReport, e
 	}
 	return out, nil
 }
-

@@ -163,10 +163,11 @@ var pythonDashMTargets = map[string]string{
 // argv tail (everything after argv[0]).
 //
 // Accepts:
-//   -m <pm> ...                      (canonical)
-//   -m<pm> ...                       (no space — valid CPython syntax)
-//   <no-arg-flag-bundle> -m <pm> ... (e.g. -I -m pip, -IES -m pip)
-//   <no-arg-flag-bundle> -m<pm> ...
+//
+//	-m <pm> ...                      (canonical)
+//	-m<pm> ...                       (no space — valid CPython syntax)
+//	<no-arg-flag-bundle> -m <pm> ... (e.g. -I -m pip, -IES -m pip)
+//	<no-arg-flag-bundle> -m<pm> ...
 //
 // Pre-`-m` flag bundles are the union of CPython's no-argument short
 // options: -b -B -d -E -h -i -I -O -P -q -s -S -u -v -V -x -? .
@@ -900,13 +901,30 @@ func copySeedPath(src, dst string) error {
 // The env var is consumed (Unsetenv) so a downstream interposer-driven
 // re-entry into veto doesn't inherit it and double-rewrite.
 func execPMOrPythonM(cfg config, pmName string, pmArgs []string) int {
+	env := sanitizedEnvFor(pmName, pmArgs, os.Environ())
 	if pyBin := os.Getenv(pythonDashMEnvOriginal); pyBin != "" {
 		os.Unsetenv(pythonDashMEnvOriginal)
 		// Rebuild as `<python> -m <pm> <args…>`.
 		newArgs := append([]string{"-m", pmName}, pmArgs...)
-		return execReal(cfg, pyBin, newArgs)
+		return execRealWithEnv(cfg, pyBin, newArgs, env)
 	}
-	return execReal(cfg, pmName, pmArgs)
+	return execRealWithEnv(cfg, pmName, pmArgs, env)
+}
+
+// envRecursionRiskFor returns the recursion-risk level for pmName + pmArgs.
+// Unknown PMs and PMs without EnvRecursionPolicy are RecursionRiskUnknown,
+// which callers must treat as "strip" — default-deny.
+func envRecursionRiskFor(pmName string, pmArgs []string) packagemanager.EnvRecursionRiskLevel {
+	pms := buildPackageManagers()
+	pm, ok := pms[pmName]
+	if !ok {
+		return packagemanager.RecursionRiskUnknown
+	}
+	policy, ok := pm.(packagemanager.EnvRecursionPolicy)
+	if !ok {
+		return packagemanager.RecursionRiskUnknown
+	}
+	return policy.EnvRecursionRisk(pmArgs)
 }
 
 // execReal replaces the current process with the real package-manager binary.
@@ -934,18 +952,42 @@ func execPMOrPythonM(cfg config, pmName string, pmArgs []string) int {
 // unreadable we fail closed: no sibling is trusted, and resolution
 // continues with the PATH walk.
 func execReal(cfg config, name string, args []string) int {
+	return execRealWithEnv(cfg, name, args, sanitizedEnv(os.Environ()))
+}
+
+func execRealWithEnv(cfg config, name string, args []string, env []string) int {
 	registered := wrapperRegisteredFunc(cfg)
 	realPath, err := findRealBinary(name, registered)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "veto: cannot find real %s: %v\n", name, err)
 		return exitInternal
 	}
-	if err := syscall.Exec(realPath, append([]string{name}, args...), sanitizedEnv(os.Environ())); err != nil {
+	if err := syscall.Exec(realPath, append([]string{name}, args...), env); err != nil {
 		fmt.Fprintf(os.Stderr, "veto: exec %s: %v\n", realPath, err)
 		return exitInternal
 	}
 	// syscall.Exec doesn't return on success.
 	return exitInternal
+}
+
+// sanitizedEnvFor returns env passed through sanitizedEnv (the strip primitive)
+// unless the (pmName, pmArgs) pair is explicitly classified as
+// RecursionRiskLow, in which case env is returned unchanged.
+//
+// Policy: strip when EnvRecursionPolicy says High or Unknown. Preserve only on
+// explicit Low. New verbs in Go, or new PMs that don't implement
+// EnvRecursionPolicy, must opt into preservation.
+//
+// Why preserve VETO_PATH for some verbs: for verbs like `go run` whose child is
+// user-authored code, not a PM re-invocation, stripping VETO_PATH silently
+// disables the interposer for the entire descendant tree. The sanitizedEnv
+// comment below describes the original recursion tradeoff; this refines it by
+// keeping the surgical strip for verbs that need it.
+func sanitizedEnvFor(pmName string, pmArgs []string, env []string) []string {
+	if envRecursionRiskFor(pmName, pmArgs) == packagemanager.RecursionRiskLow {
+		return env
+	}
+	return sanitizedEnv(env)
 }
 
 // sanitizedEnv returns env with veto-internal control variables removed,

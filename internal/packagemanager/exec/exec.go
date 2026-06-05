@@ -23,14 +23,14 @@ import (
 // NpxFlagsWithValues is the realistic set of npx flags whose next argv
 // token is the value (e.g. `npx --package foo cli-cmd`).
 var NpxFlagsWithValues = argv.FlagsWithValues{
-	"--package":   {},
-	"-p":          {},
-	"--call":      {},
-	"-c":          {},
-	"--workspace": {},
-	"-w":          {},
-	"--prefix":    {},
-	"--registry":  {},
+	"--package":    {},
+	"-p":           {},
+	"--call":       {},
+	"-c":           {},
+	"--workspace":  {},
+	"-w":           {},
+	"--prefix":     {},
+	"--registry":   {},
 	"--userconfig": {},
 }
 
@@ -53,11 +53,11 @@ var BunxFlagsWithValues = argv.FlagsWithValues{
 
 // PnpxFlagsWithValues mirrors pnpm's dlx (pnpx is the legacy alias).
 var PnpxFlagsWithValues = argv.FlagsWithValues{
-	"--package":  {},
-	"-p":         {},
-	"--registry": {},
+	"--package":   {},
+	"-p":          {},
+	"--registry":  {},
 	"--store-dir": {},
-	"--prefix":   {},
+	"--prefix":    {},
 }
 
 // PnpxSpecFlags: like NpxSpecFlags but for pnpm's dlx-style invocation.
@@ -68,19 +68,19 @@ var PnpxSpecFlags = argv.FlagsWithValues{
 
 // UvxFlagsWithValues lists uvx flags whose next argv token is the value.
 var UvxFlagsWithValues = argv.FlagsWithValues{
-	"--python":          {},
-	"-p":                {},
-	"--with":            {},
+	"--python":            {},
+	"-p":                  {},
+	"--with":              {},
 	"--with-requirements": {},
-	"--from":            {},
-	"--index":           {},
-	"--index-url":       {},
-	"-i":                {},
-	"--extra-index-url": {},
-	"--cache-dir":       {},
-	"--config-file":     {},
-	"--resolution":      {},
-	"--prerelease":      {},
+	"--from":              {},
+	"--index":             {},
+	"--index-url":         {},
+	"-i":                  {},
+	"--extra-index-url":   {},
+	"--cache-dir":         {},
+	"--config-file":       {},
+	"--resolution":        {},
+	"--prerelease":        {},
 }
 
 // PipxFlagsWithValues lists pipx flags whose next argv token is the value.
@@ -88,13 +88,13 @@ var UvxFlagsWithValues = argv.FlagsWithValues{
 // run foo`) and per-verb flags after the verb. The same table covers both
 // because the parser uses it on each side of the verb split.
 var PipxFlagsWithValues = argv.FlagsWithValues{
-	"--python":   {},
-	"--pip-args": {},
-	"--spec":     {},
+	"--python":    {},
+	"--pip-args":  {},
+	"--spec":      {},
 	"--index-url": {},
-	"--suffix":   {},
-	"--editable": {},
-	"-e":         {},
+	"--suffix":    {},
+	"--editable":  {},
+	"-e":          {},
 }
 
 // PipxSpecFlags: `pipx run --spec evil-pkg some-cmd` fetches evil-pkg and

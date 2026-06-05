@@ -123,6 +123,42 @@ func TestProjectPreflight(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestEnvRecursionRisk_Go(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want packagemanager.EnvRecursionRiskLevel
+	}{
+		{"go run", []string{"run", "./cmd/foo"}, packagemanager.RecursionRiskLow},
+		{"go build", []string{"build", "./..."}, packagemanager.RecursionRiskLow},
+		{"go test", []string{"test", "./..."}, packagemanager.RecursionRiskLow},
+		{"go vet", []string{"vet", "./..."}, packagemanager.RecursionRiskLow},
+		{"go get modern", []string{"get", "./..."}, packagemanager.RecursionRiskLow},
+		{"go mod tidy", []string{"mod", "tidy"}, packagemanager.RecursionRiskLow},
+		{"go mod download", []string{"mod", "download"}, packagemanager.RecursionRiskLow},
+		{"go work sync", []string{"work", "sync"}, packagemanager.RecursionRiskLow},
+		{"go list", []string{"list", "./..."}, packagemanager.RecursionRiskLow},
+		{"go bug", []string{"bug"}, packagemanager.RecursionRiskLow},
+		{"go install", []string{"install", "pkg@latest"}, packagemanager.RecursionRiskHigh},
+		{"go install local", []string{"install", "./cmd/foo"}, packagemanager.RecursionRiskHigh},
+		{"go generate", []string{"generate", "./..."}, packagemanager.RecursionRiskHigh},
+		{"go tool", []string{"tool", "dist", "list"}, packagemanager.RecursionRiskHigh},
+		{"unknown verb", []string{"someNewVerb", "arg"}, packagemanager.RecursionRiskUnknown},
+		{"no verb", []string{}, packagemanager.RecursionRiskLow},
+		{"-C dir run", []string{"-C", "/tmp", "run", "./x"}, packagemanager.RecursionRiskLow},
+		{"-C dir install", []string{"-C", "/tmp", "install", "pkg@v1"}, packagemanager.RecursionRiskHigh},
+		{"-ldflags then install", []string{"-ldflags=-X main.x=run", "install", "./..."}, packagemanager.RecursionRiskHigh},
+	}
+
+	m := golang.New()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := m.EnvRecursionRisk(tc.args)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
 func requireContains(t *testing.T, installs []packagemanager.Install, name, version string, localPath, opaque bool) {
 	t.Helper()
 	for _, ins := range installs {

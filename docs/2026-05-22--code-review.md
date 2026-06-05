@@ -83,6 +83,14 @@ Layer 3 as standalone.
 `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD` from the env passed to
 `syscall.Exec`.
 
+**Follow-up note (2026-06-04)**: the implemented mitigation preserves
+`DYLD_INSERT_LIBRARIES`/`LD_PRELOAD` and strips `VETO_PATH` to break the
+recursion loop. The strip is now verb-aware for Go: `go run`, `go
+build`, `go test`, and other explicitly low-recursion-risk verbs preserve
+`VETO_PATH` so Layer 3 remains armed in descendant processes, while `go
+install`, `go generate`, `go tool`, unknown Go verbs, and PMs without an
+`EnvRecursionPolicy` continue to strip by default.
+
 ## High — real bugs that degrade enforcement
 
 **H1. Interposer `VETO_BYPASS` is presence-checked; Go side requires

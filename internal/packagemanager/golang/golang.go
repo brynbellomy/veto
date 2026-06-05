@@ -52,6 +52,7 @@ type Manager struct{}
 
 var _ packagemanager.PackageManager = (*Manager)(nil)
 var _ packagemanager.ProjectPreflighter = (*Manager)(nil)
+var _ packagemanager.EnvRecursionPolicy = (*Manager)(nil)
 
 // New builds a Go manager.
 func New() *Manager { return &Manager{} }
@@ -167,6 +168,29 @@ func (Manager) ProjectPreflight(args []string) (packagemanager.ProjectPreflightP
 		return packagemanager.ProjectPreflightPlan{ManifestRefs: goModuleRefs(baseDir, modFile)}, true
 	default:
 		return packagemanager.ProjectPreflightPlan{}, false
+	}
+}
+
+// EnvRecursionRisk implements packagemanager.EnvRecursionPolicy.
+//
+// Argv parsing reuses flagsWithValues so flags like `-C dir` or
+// `-ldflags=...` don't fool the verb classifier.
+func (Manager) EnvRecursionRisk(args []string) packagemanager.EnvRecursionRiskLevel {
+	verb, _, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
+	if !ok {
+		// `go` with no verb prints help. It does not re-enter veto.
+		return packagemanager.RecursionRiskLow
+	}
+	switch verb {
+	case "run", "build", "test", "vet", "get", "list", "fmt", "doc",
+		"env", "version", "fix", "clean", "telemetry", "bug", "mod", "work":
+		// mod/work are intentionally allowed by parent verb: every documented
+		// subverb is a metadata op, so treating subverbs as low avoids noise.
+		return packagemanager.RecursionRiskLow
+	case "install", "generate", "tool":
+		return packagemanager.RecursionRiskHigh
+	default:
+		return packagemanager.RecursionRiskUnknown
 	}
 }
 

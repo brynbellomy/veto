@@ -104,6 +104,41 @@ func TestSanitizedEnvEmpty(t *testing.T) {
 	require.Empty(t, sanitizedEnv([]string{}))
 }
 
+func TestSanitizedEnvFor_PreservesVETO_PATH_OnGoRun(t *testing.T) {
+	env := []string{
+		"VETO_PATH=/opt/veto/bin/veto",
+		"DYLD_INSERT_LIBRARIES=/opt/veto/lib/libveto.dylib",
+		"PATH=/usr/bin",
+	}
+	got := sanitizedEnvFor("go", []string{"run", "./cmd/foo"}, env)
+	require.Contains(t, got, "VETO_PATH=/opt/veto/bin/veto",
+		"VETO_PATH must survive `go run` so Layer 3 stays armed in descendants")
+}
+
+func TestSanitizedEnvFor_StripsVETO_PATH_OnGoInstall(t *testing.T) {
+	env := []string{
+		"VETO_PATH=/opt/veto/bin/veto",
+		"DYLD_INSERT_LIBRARIES=/opt/veto/lib/libveto.dylib",
+		"PATH=/usr/bin",
+	}
+	got := sanitizedEnvFor("go", []string{"install", "pkg@latest"}, env)
+	require.NotContains(t, got, "VETO_PATH=/opt/veto/bin/veto",
+		"VETO_PATH must be stripped for `go install` to prevent recursion")
+}
+
+func TestSanitizedEnvFor_StripsForUnknownVerb(t *testing.T) {
+	env := []string{"VETO_PATH=/opt/veto/bin/veto"}
+	got := sanitizedEnvFor("go", []string{"some-future-verb"}, env)
+	require.NotContains(t, got, "VETO_PATH=/opt/veto/bin/veto",
+		"unknown verbs must default to strip (default-deny)")
+}
+
+func TestSanitizedEnvFor_StripsForPMWithoutPolicy(t *testing.T) {
+	env := []string{"VETO_PATH=/opt/veto/bin/veto"}
+	got := sanitizedEnvFor("npm", []string{"install", "foo"}, env)
+	require.NotContains(t, got, "VETO_PATH=/opt/veto/bin/veto")
+}
+
 func TestSeedResolverWorkdir(t *testing.T) {
 	projectDir := t.TempDir()
 	workdir := t.TempDir()
