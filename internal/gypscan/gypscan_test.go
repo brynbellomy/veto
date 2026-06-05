@@ -294,6 +294,57 @@ func TestInspectFlagsActionInIncludedContents(t *testing.T) {
 	}
 }
 
+func TestInspectFlagsCommandExpansionInExecutionKeys(t *testing.T) {
+	cases := map[string]string{
+		"libraries":    `"libraries": ["<!(node scripts/emit-library.js)"]`,
+		"cflags":       `"cflags": ["<!(node scripts/emit-cflag.js)"]`,
+		"cflags_c":     `"cflags_c": ["<!(node scripts/emit-cflag.js)"]`,
+		"cflags_cc":    `"cflags_cc": ["<!(node scripts/emit-cflag.js)"]`,
+		"ldflags":      `"ldflags": ["<!(node scripts/emit-ldflag.js)"]`,
+		"include_dirs": `"include_dirs": ["<!(node scripts/emit-include-dir.js)"]`,
+		"library_dirs": `"library_dirs": ["<!(node scripts/emit-library-dir.js)"]`,
+	}
+	for name, field := range cases {
+		t.Run(name, func(t *testing.T) {
+			gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    ` + field + `
+  }]
+}`
+			v := gypscan.Inspect(cleanNativeInput(gyp))
+			require.True(t, v.Flagged())
+			require.Equal(t, gypscan.SeverityCritical, v.Severity)
+			require.True(t, hasSignal(v, "gyp-exec-key-command"), "got %v", codes(v))
+		})
+	}
+}
+
+func TestInspectAllowsLegitExecKeyPrintExpansions(t *testing.T) {
+	cases := map[string]string{
+		"node print include": `"include_dirs": ["<!@(node -p \"require('node-addon-api').include\")"]`,
+		"node eval include":  `"include_dirs": ["<!(node -e \"console.log(require('node-addon-api').include)\")"]`,
+		"pkg config libs":    `"libraries": ["<!(pkg-config --libs libpng)"]`,
+	}
+	for name, field := range cases {
+		t.Run(name, func(t *testing.T) {
+			gyp := `{
+  "targets": [{
+    "target_name": "addon",
+    "type": "loadable_module",
+    "sources": ["addon.cc"],
+    ` + field + `
+  }]
+}`
+			v := gypscan.Inspect(cleanNativeInput(gyp))
+			require.False(t, v.Flagged(), "legit print expansion flagged: %v", codes(v))
+			require.Equal(t, gypscan.SeverityNone, v.Severity)
+		})
+	}
+}
+
 func TestInspectCleanIncludedContentsAreClean(t *testing.T) {
 	v := gypscan.Inspect(gypscan.Input{
 		GypContent:       []byte(legitAddonGyp),

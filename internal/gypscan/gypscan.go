@@ -245,6 +245,13 @@ func scanCriticalSignals(content string, fromInclude bool) []Signal {
 			Excerpt: excerpt,
 		})
 	}
+	if loc := commandExpansionInExecKeys(normalized); loc >= 0 {
+		signals = append(signals, Signal{
+			Code:    "gyp-exec-key-command",
+			Detail:  criticalDetail(fromInclude, "runs a non-allowlisted command expansion inside an execution-sensitive build key (`libraries`, `cflags`, `ldflags`, `include_dirs`, or related flags) — node-gyp evaluates these at configure time, so quiet package-local interpreter invocations still execute at install time."),
+			Excerpt: excerptAround(content, loc),
+		})
+	}
 	return signals
 }
 
@@ -300,6 +307,12 @@ var sourcesArrayRe = regexp.MustCompile(`["'](sources|inputs|outputs)["']\s*:\s*
 // actionArrayRe matches a GYP `action` key followed by its argv array. Both
 // `actions[].action` and `rules[].action` use this same key shape.
 var actionArrayRe = regexp.MustCompile(`["']action["']\s*:\s*\[([^\]]*)\]`)
+
+// execKeyArrayRe matches GYP arrays whose values are evaluated during
+// configure/build setup rather than treated as inert source filenames.
+var execKeyArrayRe = regexp.MustCompile(`["'](libraries|cflags|cflags_c|cflags_cc|ldflags|include_dirs|library_dirs)["']\s*:\s*\[([^\]]*)\]`)
+
+var localJSPathRe = regexp.MustCompile(`(?i)(^|[\s"'(=])(?:\.{1,2}/|[A-Za-z0-9_.-]+/)[^\s"')]+\.(?:[cm]?js)\b|(^|[\s"'(=])[^/\s"')]+\.(?:[cm]?js)\b`)
 
 var actionCommandInterpreters = map[string]struct{}{
 	"bash":       {},
@@ -378,6 +391,34 @@ func commandActionArray(content string) (int, string) {
 	return -1, ""
 }
 
+// commandExpansionInExecKeys returns the index of a risky command expansion
+// inside execution-sensitive GYP keys. The allowlist is limited to common
+// print-only header/path lookups such as node-addon-api includes and
+// pkg-config queries; package-local interpreter scripts remain Critical even
+// when they contain no shell metacharacters.
+func commandExpansionInExecKeys(content string) int {
+	for _, m := range execKeyArrayRe.FindAllStringSubmatchIndex(content, -1) {
+		bodyStart, bodyEnd := m[4], m[5]
+		if bodyStart < 0 {
+			continue
+		}
+		body := content[bodyStart:bodyEnd]
+		for _, expansion := range expansionBodyRe.FindAllStringSubmatchIndex(body, -1) {
+			expansionStart := expansion[0]
+			expansionBodyStart, expansionBodyEnd := expansion[2], expansion[3]
+			if expansionBodyStart < 0 {
+				continue
+			}
+			expansionBody := body[expansionBodyStart:expansionBodyEnd]
+			if allowedExecKeyExpansion(expansionBody) {
+				continue
+			}
+			return bodyStart + expansionStart
+		}
+	}
+	return -1
+}
+
 type gypStringLiteral struct {
 	value string
 	start int
@@ -435,6 +476,59 @@ func commandBaseName(cmd string) string {
 	cmd = strings.ToLower(cmd)
 	cmd = strings.TrimSuffix(cmd, ".exe")
 	return cmd
+}
+
+func allowedExecKeyExpansion(body string) bool {
+	body = strings.TrimSpace(body)
+	if body == "" || payloadShellRe.MatchString(body) {
+		return false
+	}
+	switch commandBaseName(body) {
+	case "node", "nodejs":
+		return allowedNodePrintExpansion(body)
+	case "pkg-config":
+		return true
+	case "python", "python2", "python3":
+		return allowedPythonPrintExpansion(body)
+	default:
+		return false
+	}
+}
+
+func allowedNodePrintExpansion(body string) bool {
+	if localJSPathRe.MatchString(body) {
+		return false
+	}
+	if hasCommandToken(body, "-p", "--print") {
+		return true
+	}
+	if !hasCommandToken(body, "-e", "--eval") {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "console.log") &&
+		(strings.Contains(lower, "node-addon-api") || strings.Contains(lower, ".include"))
+}
+
+func allowedPythonPrintExpansion(body string) bool {
+	if localJSPathRe.MatchString(body) || !hasCommandToken(body, "-c") {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "print(") || strings.Contains(lower, "sys.stdout.write")
+}
+
+func hasCommandToken(body string, tokens ...string) bool {
+	fields := strings.Fields(body)
+	for _, field := range fields {
+		field = strings.Trim(field, `"'`)
+		for _, token := range tokens {
+			if field == token || strings.HasPrefix(field, token+"=") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // expansionBodyRe captures the body of a GYP command expansion
