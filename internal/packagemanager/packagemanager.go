@@ -223,6 +223,55 @@ type ProjectPreflighter interface {
 	ProjectPreflight(args []string) (ProjectPreflightPlan, bool)
 }
 
+// OpaqueRemoteResolver is an optional capability for package managers that can
+// turn an opaque git spec (which the gate otherwise refuses unconditionally)
+// into a scannable registry dependency set, by cloning the repository and
+// re-running the resolver — without compiling the crate or executing any
+// project code. Package managers that do not implement it keep the
+// unconditional opaque refusal.
+//
+// The two methods are pure (argv in, data out). The CLI orchestrator performs
+// all filesystem and process I/O, consistent with the PackageManager contract.
+type OpaqueRemoteResolver interface {
+	// OpaqueRemoteResolve returns a plan for cloning + resolving the opaque git
+	// spec in args, or (zero, false) when args name no resolvable git spec.
+	OpaqueRemoteResolve(args []string) (OpaqueRemoteResolvePlan, bool)
+
+	// PinResolvedRevision rewrites argv so the real install targets exactly
+	// `revision` — the commit the clone-scan vetted. It removes any conflicting
+	// ref selector (e.g. cargo's --branch/--tag/--rev) and appends the pin.
+	// Pure; no I/O. Idempotent against an already-pinned revision.
+	PinResolvedRevision(args []string, revision string) []string
+}
+
+// OpaqueRemoteResolvePlan is pure data describing how to turn one opaque git
+// spec into a scannable lockfile. The CLI orchestrator executes it: it clones
+// GitURL, checks out Ref, runs ResolveArgs against the real package-manager
+// binary inside the clone, then expands ManifestRefs (relative to the clone
+// dir) to discover the resolved dependency tree.
+type OpaqueRemoteResolvePlan struct {
+	// GitURL is the remote to clone.
+	GitURL string
+
+	// Ref is the tag, branch, or revision to check out. Empty means the
+	// remote's default branch HEAD.
+	Ref string
+
+	// RefIsRevision is true when Ref is a commit-ish that cannot be reached by
+	// a shallow --branch clone. The orchestrator full-clones and `git checkout`s
+	// it; otherwise it shallow-clones (with --branch Ref when Ref is set).
+	RefIsRevision bool
+
+	// ResolveArgs runs against the REAL package-manager binary inside the clone
+	// dir to (re)generate or validate the lockfile. Must not compile or execute
+	// project code (e.g. cargo's `generate-lockfile` / `fetch --locked`).
+	ResolveArgs []string
+
+	// ManifestRefs are the lockfiles to expand after ResolveArgs, with paths
+	// relative to the clone dir.
+	ManifestRefs []ManifestRef
+}
+
 // EnvRecursionPolicy is an optional capability for package managers whose
 // verbs differ in whether their child process could re-enter the veto gate via
 // the interposer. PMs that don't implement this interface get the conservative
