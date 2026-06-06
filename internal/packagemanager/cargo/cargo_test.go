@@ -123,3 +123,55 @@ func requireContains(t *testing.T, installs []packagemanager.Install, name, vers
 	}
 	t.Fatalf("expected %s@%s local=%t opaque=%t in:\n%v", name, version, localPath, opaque, installs)
 }
+
+func TestOpaqueRemoteResolve(t *testing.T) {
+	m := cargo.New()
+
+	t.Run("install --git produces a generate-lockfile plan", func(t *testing.T) {
+		plan, ok := m.OpaqueRemoteResolve([]string{"install", "my-crate", "--git", "https://github.com/example/my-crate"})
+		require.True(t, ok)
+		require.Equal(t, "https://github.com/example/my-crate", plan.GitURL)
+		require.Empty(t, plan.Ref)
+		require.False(t, plan.RefIsRevision)
+		require.Equal(t, []string{"generate-lockfile", "--manifest-path", "Cargo.toml"}, plan.ResolveArgs)
+		require.Equal(t, []packagemanager.ManifestRef{
+			{Path: "Cargo.lock", Kind: packagemanager.ManifestKindCargoLock},
+		}, plan.ManifestRefs)
+	})
+
+	t.Run("add --git with --branch is a non-revision ref", func(t *testing.T) {
+		plan, ok := m.OpaqueRemoteResolve([]string{"add", "my-crate", "--git", "https://x/y", "--branch", "main"})
+		require.True(t, ok)
+		require.Equal(t, "main", plan.Ref)
+		require.False(t, plan.RefIsRevision)
+	})
+
+	t.Run("--tag is a non-revision ref", func(t *testing.T) {
+		plan, ok := m.OpaqueRemoteResolve([]string{"install", "--git", "https://x/y", "--tag", "v1.2.3"})
+		require.True(t, ok)
+		require.Equal(t, "v1.2.3", plan.Ref)
+		require.False(t, plan.RefIsRevision)
+	})
+
+	t.Run("--rev is a revision ref", func(t *testing.T) {
+		plan, ok := m.OpaqueRemoteResolve([]string{"install", "--git", "https://x/y", "--rev", "abc123"})
+		require.True(t, ok)
+		require.Equal(t, "abc123", plan.Ref)
+		require.True(t, plan.RefIsRevision)
+	})
+
+	t.Run("--locked validates the committed lock instead of regenerating", func(t *testing.T) {
+		plan, ok := m.OpaqueRemoteResolve([]string{"install", "--git", "https://x/y", "--locked"})
+		require.True(t, ok)
+		require.Equal(t, []string{"fetch", "--locked", "--manifest-path", "Cargo.toml"}, plan.ResolveArgs)
+	})
+
+	t.Run("non-git and non-install/add return false", func(t *testing.T) {
+		_, ok := m.OpaqueRemoteResolve([]string{"install", "ripgrep"})
+		require.False(t, ok)
+		_, ok = m.OpaqueRemoteResolve([]string{"add", "serde"})
+		require.False(t, ok)
+		_, ok = m.OpaqueRemoteResolve([]string{"build", "--git", "https://x/y"})
+		require.False(t, ok)
+	})
+}

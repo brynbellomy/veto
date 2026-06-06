@@ -113,6 +113,66 @@ func (Manager) ProjectPreflight(args []string) (packagemanager.ProjectPreflightP
 	}
 }
 
+// OpaqueRemoteResolve implements packagemanager.OpaqueRemoteResolver for
+// `cargo install --git` and `cargo add --git`. It returns a plan to clone the
+// git crate and regenerate (or, under --locked/--frozen/--offline, validate)
+// its lockfile so the resolved crates.io dependencies can be gated. Other
+// verbs and non-git specs return false and keep the default opaque refusal.
+func (Manager) OpaqueRemoteResolve(args []string) (packagemanager.OpaqueRemoteResolvePlan, bool) {
+	verb, rest, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
+	if !ok || (verb != "install" && verb != "add") {
+		return packagemanager.OpaqueRemoteResolvePlan{}, false
+	}
+	gitURL, ok := firstFlagValue(rest, "--git")
+	if !ok || gitURL == "" {
+		return packagemanager.OpaqueRemoteResolvePlan{}, false
+	}
+
+	plan := packagemanager.OpaqueRemoteResolvePlan{
+		GitURL: gitURL,
+		ManifestRefs: []packagemanager.ManifestRef{
+			{Path: "Cargo.lock", Kind: packagemanager.ManifestKindCargoLock},
+		},
+	}
+
+	// cargo accepts at most one of --rev/--tag/--branch; --rev is the only one
+	// that is not reachable by a shallow --branch clone.
+	if rev, ok := firstFlagValue(rest, "--rev"); ok && rev != "" {
+		plan.Ref, plan.RefIsRevision = rev, true
+	} else if tag, ok := firstFlagValue(rest, "--tag"); ok && tag != "" {
+		plan.Ref = tag
+	} else if branch, ok := firstFlagValue(rest, "--branch"); ok && branch != "" {
+		plan.Ref = branch
+	}
+
+	// Mirror cargo's own resolution: by default `cargo install --git` ignores a
+	// committed Cargo.lock and re-resolves to the latest semver-compatible
+	// versions. Under --locked/--frozen/--offline cargo honors the committed
+	// lock, so we validate it (fetch --locked errors on a stale lock) rather
+	// than blindly trusting it.
+	if hasLockedFlag(rest) {
+		plan.ResolveArgs = []string{"fetch", "--locked", "--manifest-path", "Cargo.toml"}
+	} else {
+		plan.ResolveArgs = []string{"generate-lockfile", "--manifest-path", "Cargo.toml"}
+	}
+	return plan, true
+}
+
+// hasLockedFlag reports whether argv requests cargo's committed-lockfile mode.
+// Scanning stops at the POSIX "--" separator.
+func hasLockedFlag(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		switch a {
+		case "--locked", "--frozen", "--offline":
+			return true
+		}
+	}
+	return false
+}
+
 func parseAdd(rest []string) []packagemanager.Install {
 	specs := argv.CollectPositionalsWithTable(rest, flagsWithValues)
 	out := make([]packagemanager.Install, 0, len(specs)+1)
