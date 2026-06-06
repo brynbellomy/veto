@@ -144,6 +144,11 @@ func TestAnalyze(t *testing.T) {
 		{"cargo clippy", "cargo clippy", "cargo"},
 		{"cargo version is informational", "cargo version", ""},
 		{"cargo metadata is informational", "cargo metadata", ""},
+
+		{"cargo +toolchain install", "cargo +nightly install ripgrep", "cargo"},
+		{"cargo +toolchain build", "cargo +stable build", "cargo"},
+		{"cargo +toolchain add", "cargo +1.75 add serde", "cargo"},
+		{"cargo +toolchain version stays informational", "cargo +nightly version", ""},
 	}
 
 	for _, tc := range cases {

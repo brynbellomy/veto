@@ -204,4 +204,59 @@ func TestPinResolvedRevision(t *testing.T) {
 		out := m.PinResolvedRevision([]string{"install", "--git", "https://x/y", "--features", "a", "--", "passthrough"}, sha)
 		require.Equal(t, []string{"install", "--git", "https://x/y", "--features", "a", "--rev", sha, "--", "passthrough"}, out)
 	})
+
+	t.Run("preserves a leading +toolchain override", func(t *testing.T) {
+		out := m.PinResolvedRevision([]string{"+nightly", "install", "--git", "https://x/y", "--branch", "main"}, sha)
+		require.Equal(t, []string{"+nightly", "install", "--git", "https://x/y", "--rev", sha}, out)
+	})
+}
+
+// TestToolchainOverride covers `cargo +<toolchain> <verb>` invocations, where
+// rustup's toolchain override (e.g. `+nightly`) is the first argument. It is
+// not a flag, so without explicit handling the parser reads it as the verb and
+// the command slips through ungated.
+func TestToolchainOverride(t *testing.T) {
+	m := cargo.New()
+
+	t.Run("install --git is still detected as opaque", func(t *testing.T) {
+		out := m.ParseInstalls([]string{"+nightly", "install", "my-crate", "--git", "https://github.com/example/my-crate"})
+		requireContains(t, out, "my-crate", "", false, true)
+		require.Len(t, out, 1)
+	})
+
+	t.Run("add crate spec is still gated", func(t *testing.T) {
+		out := m.ParseInstalls([]string{"+stable", "add", "serde@1.0.228"})
+		requireContains(t, out, "serde", "1.0.228", false, false)
+		require.Len(t, out, 1)
+	})
+
+	t.Run("manifest refs are still emitted for add", func(t *testing.T) {
+		refs := m.ManifestRefs([]string{"+1.75", "add", "serde"})
+		require.Equal(t, []packagemanager.ManifestRef{
+			{Path: "Cargo.toml", Kind: packagemanager.ManifestKindCargoToml},
+			{Path: "Cargo.lock", Kind: packagemanager.ManifestKindCargoLock},
+		}, refs)
+	})
+
+	t.Run("project preflight still fires for build", func(t *testing.T) {
+		plan, ok := m.ProjectPreflight([]string{"+nightly", "build"})
+		require.True(t, ok)
+		require.Equal(t, []packagemanager.ManifestRef{
+			{Path: "Cargo.toml", Kind: packagemanager.ManifestKindCargoToml},
+			{Path: "Cargo.lock", Kind: packagemanager.ManifestKindCargoLock},
+		}, plan.ManifestRefs)
+	})
+
+	t.Run("opaque resolve threads the toolchain into the resolve command", func(t *testing.T) {
+		plan, ok := m.OpaqueRemoteResolve([]string{"+nightly", "install", "--git", "https://x/y"})
+		require.True(t, ok)
+		require.Equal(t, "https://x/y", plan.GitURL)
+		require.Equal(t, []string{"+nightly", "generate-lockfile", "--manifest-path", "Cargo.toml"}, plan.ResolveArgs)
+	})
+
+	t.Run("non-toolchain leading token is untouched", func(t *testing.T) {
+		// A normal install must not be mistaken for a toolchain override.
+		out := m.ParseInstalls([]string{"install", "ripgrep@14.1.1"})
+		requireContains(t, out, "ripgrep", "14.1.1", false, false)
+	})
 }

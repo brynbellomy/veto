@@ -69,6 +69,7 @@ func (Manager) Ecosystem() intel.Ecosystem { return intel.EcosystemCrates }
 
 // ParseInstalls implements packagemanager.PackageManager.
 func (Manager) ParseInstalls(args []string) []packagemanager.Install {
+	_, args = splitToolchain(args)
 	verb, rest, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
 	if !ok {
 		return nil
@@ -87,6 +88,7 @@ func (Manager) ParseInstalls(args []string) []packagemanager.Install {
 
 // ManifestRefs implements packagemanager.PackageManager.
 func (Manager) ManifestRefs(args []string) []packagemanager.ManifestRef {
+	_, args = splitToolchain(args)
 	verb, _, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
 	if !ok {
 		return nil
@@ -102,6 +104,7 @@ func (Manager) ManifestRefs(args []string) []packagemanager.ManifestRef {
 // ProjectPreflight implements packagemanager.ProjectPreflighter for Cargo
 // build/test/run commands that execute local project code.
 func (Manager) ProjectPreflight(args []string) (packagemanager.ProjectPreflightPlan, bool) {
+	_, args = splitToolchain(args)
 	verb, _, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
 	if !ok {
 		return packagemanager.ProjectPreflightPlan{}, false
@@ -120,6 +123,7 @@ func (Manager) ProjectPreflight(args []string) (packagemanager.ProjectPreflightP
 // its lockfile so the resolved crates.io dependencies can be gated. Other
 // verbs and non-git specs return false and keep the default opaque refusal.
 func (Manager) OpaqueRemoteResolve(args []string) (packagemanager.OpaqueRemoteResolvePlan, bool) {
+	toolchain, args := splitToolchain(args)
 	verb, rest, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
 	if !ok || (verb != "install" && verb != "add") {
 		return packagemanager.OpaqueRemoteResolvePlan{}, false
@@ -150,13 +154,32 @@ func (Manager) OpaqueRemoteResolve(args []string) (packagemanager.OpaqueRemoteRe
 	// committed Cargo.lock and re-resolves to the latest semver-compatible
 	// versions. Under --locked/--frozen/--offline cargo honors the committed
 	// lock, so we validate it (fetch --locked errors on a stale lock) rather
-	// than blindly trusting it.
-	if hasLockedFlag(rest) {
-		plan.ResolveArgs = []string{"fetch", "--locked", "--manifest-path", "Cargo.toml"}
-	} else {
-		plan.ResolveArgs = []string{"generate-lockfile", "--manifest-path", "Cargo.toml"}
+	// than blindly trusting it. A `+toolchain` override is preserved so the
+	// resolve runs under the same toolchain the user invoked.
+	resolve := make([]string, 0, 5)
+	if toolchain != "" {
+		resolve = append(resolve, toolchain)
 	}
+	if hasLockedFlag(rest) {
+		resolve = append(resolve, "fetch", "--locked", "--manifest-path", "Cargo.toml")
+	} else {
+		resolve = append(resolve, "generate-lockfile", "--manifest-path", "Cargo.toml")
+	}
+	plan.ResolveArgs = resolve
 	return plan, true
+}
+
+// splitToolchain peels a leading rustup toolchain override off args. rustup
+// honors `cargo +<toolchain> <verb> …` (e.g. `+nightly`, `+stable`, `+1.75`)
+// only when the `+`-prefixed token is the very first argument, so we strip it
+// only in that position. Returns the override token (with its leading `+`, or
+// "" when absent) and the remaining args. Without this the override is read as
+// the verb and the whole command slips through ungated.
+func splitToolchain(args []string) (toolchain string, rest []string) {
+	if len(args) > 0 && strings.HasPrefix(args[0], "+") {
+		return args[0], args[1:]
+	}
+	return "", args
 }
 
 // hasLockedFlag reports whether argv requests cargo's committed-lockfile mode.

@@ -558,7 +558,15 @@ func isRisky(tokens []string) (string, bool) {
 		return riskyGo(tokens)
 	}
 	if b == "cargo" {
-		return riskyByVerb(tokens, b, dangerousVerbs[b], cargoFlagsWithValues)
+		// rustup honors a `+<toolchain>` override (`cargo +nightly install …`)
+		// only as the first argument. It is not a flag, so drop it before verb
+		// classification — otherwise the override is read as the verb and a
+		// dangerous command (e.g. `cargo +nightly install`) slips through ungated.
+		toks := tokens
+		if len(tokens) > 1 && strings.HasPrefix(tokens[1], "+") {
+			toks = append([]string{tokens[0]}, tokens[2:]...)
+		}
+		return riskyByVerb(toks, b, dangerousVerbs[b], cargoFlagsWithValues)
 	}
 	if _, exec := execPMs[b]; exec {
 		var rest []string
