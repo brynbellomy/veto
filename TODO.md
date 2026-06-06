@@ -49,6 +49,17 @@ current user-facing behavior.
   `cargomanifest` registry classifier (non-crates-io `registry = ...`
   should be OpaqueRemote, mirroring cargolock); and `[workspace]`
   members expansion for monorepo Cargo.toml roots.
+- SHIPPED: `cargo install --git` / `cargo add --git` clone-and-scan
+  (`cmd/veto/opaquegit.go` + `cargo.OpaqueRemoteResolver`). Clones to a temp
+  dir, regenerates the lockfile (mirrors cargo's resolution; honors
+  --locked/--frozen/--offline), gates the transitive crates.io deps, and pins
+  the install to the exact scanned commit. Remaining edges:
+  - Registry-version TOCTOU: the git commit is pinned, but cargo re-resolves
+    crates.io transitive versions at install time. Window is small (immutable
+    crates.io versions, name-keyed intel); full closure needs feeding our
+    generated lockfile into the real install. Deferred.
+  - No content scan of the cloned tree (malicious build.rs / proc-macros) —
+    the Rust analog of the gypscan detector. Separate follow-up.
 - binding.gyp worm (phantom-gyp/Miasma) mitigation — SHIPPED across three
   layers: `internal/gypscan` (pure detector), `internal/gypscan/tarball`
   (in-memory .tgz inspector), `internal/scan/gyp` (existing-exposure walker),

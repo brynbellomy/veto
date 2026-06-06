@@ -268,6 +268,16 @@ parent `go.mod`, `Cargo.toml`, and workspace `Cargo.lock`/`Cargo.toml`
 files when the command runs from a nested directory; explicit path flags
 still take precedence.
 
+For `cargo install --git <url>` and `cargo add --git <url>`, veto no longer
+refuses outright. It clones the repository into a temporary directory,
+regenerates the lockfile to mirror cargo's own resolution (honoring
+`--locked`/`--frozen`/`--offline`), gates every resolved crates.io dependency,
+and — if clean — pins the real install to the exact commit it scanned before
+letting cargo proceed. The git source code itself (the root crate and any
+nested git dependencies) is accepted as the code you explicitly chose to
+install; its registry supply chain is what gets vetted. Any clone or resolve
+failure fails closed.
+
 **binding.gyp worm detection (phantom-gyp / Miasma).** The June 2026
 `binding.gyp` campaign defeats every name-and-version defense at once: it
 republishes ~trusted packages under stolen maintainer tokens (so the name
@@ -450,6 +460,10 @@ outright with a `[veto-policy]` source marker so they're
 distinguishable from a malware-feed-driven block. Filesystem-path
 specs (`./pkg`, `/abs/path`) still pass through — they don't pull
 remote code on their own.
+
+Exception: `cargo install/add --git` specs are not refused on sight — they
+are cloned and scanned (see the Go and Cargo gating section above). All other
+opaque specs (tarball URLs, `user/repo` shorthand) remain refused.
 
 ## mise PATH ordering
 
