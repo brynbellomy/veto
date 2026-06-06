@@ -56,6 +56,7 @@ type Manager struct{}
 
 var _ packagemanager.PackageManager = (*Manager)(nil)
 var _ packagemanager.ProjectPreflighter = (*Manager)(nil)
+var _ packagemanager.OpaqueRemoteResolver = (*Manager)(nil)
 
 // New builds a Cargo manager.
 func New() *Manager { return &Manager{} }
@@ -171,6 +172,54 @@ func hasLockedFlag(args []string) bool {
 		}
 	}
 	return false
+}
+
+// gitRefSelectorFlags are the mutually-exclusive cargo git ref selectors that
+// PinResolvedRevision strips before pinning an exact commit.
+var gitRefSelectorFlags = map[string]struct{}{
+	"--branch": {},
+	"--tag":    {},
+	"--rev":    {},
+}
+
+// PinResolvedRevision implements packagemanager.OpaqueRemoteResolver. It rewrites
+// argv so the real `cargo install`/`cargo add` targets exactly `revision`: any
+// --branch/--tag/--rev selector is removed (cargo rejects more than one) and
+// `--rev <revision>` is appended. Tokens after a POSIX "--" are preserved and
+// the pin is inserted before them.
+func (Manager) PinResolvedRevision(args []string, revision string) []string {
+	out := make([]string, 0, len(args)+2)
+	var tail []string
+	i := 0
+	for i < len(args) {
+		tok := args[i]
+		if tok == "--" {
+			tail = args[i:]
+			break
+		}
+		if name, _, isEq := strings.Cut(tok, "="); isEq {
+			if _, drop := gitRefSelectorFlags[name]; drop {
+				i++
+				continue
+			}
+			out = append(out, tok)
+			i++
+			continue
+		}
+		if _, drop := gitRefSelectorFlags[tok]; drop {
+			if i+1 < len(args) {
+				i += 2 // skip the flag and its value
+			} else {
+				i++
+			}
+			continue
+		}
+		out = append(out, tok)
+		i++
+	}
+	out = append(out, "--rev", revision)
+	out = append(out, tail...)
+	return out
 }
 
 func parseAdd(rest []string) []packagemanager.Install {

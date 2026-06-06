@@ -175,3 +175,33 @@ func TestOpaqueRemoteResolve(t *testing.T) {
 		require.False(t, ok)
 	})
 }
+
+func TestPinResolvedRevision(t *testing.T) {
+	m := cargo.New()
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+
+	t.Run("appends --rev when no ref selector present", func(t *testing.T) {
+		out := m.PinResolvedRevision([]string{"install", "--git", "https://x/y"}, sha)
+		require.Equal(t, []string{"install", "--git", "https://x/y", "--rev", sha}, out)
+	})
+
+	t.Run("drops a --branch space-form selector", func(t *testing.T) {
+		out := m.PinResolvedRevision([]string{"install", "--git", "https://x/y", "--branch", "main"}, sha)
+		require.Equal(t, []string{"install", "--git", "https://x/y", "--rev", sha}, out)
+	})
+
+	t.Run("drops a --tag=value form selector", func(t *testing.T) {
+		out := m.PinResolvedRevision([]string{"add", "c", "--git", "https://x/y", "--tag=v1"}, sha)
+		require.Equal(t, []string{"add", "c", "--git", "https://x/y", "--rev", sha}, out)
+	})
+
+	t.Run("is idempotent against an existing --rev", func(t *testing.T) {
+		out := m.PinResolvedRevision([]string{"install", "--git", "https://x/y", "--rev", "short"}, sha)
+		require.Equal(t, []string{"install", "--git", "https://x/y", "--rev", sha}, out)
+	})
+
+	t.Run("preserves unrelated flags and inserts --rev before a -- terminator", func(t *testing.T) {
+		out := m.PinResolvedRevision([]string{"install", "--git", "https://x/y", "--features", "a", "--", "passthrough"}, sha)
+		require.Equal(t, []string{"install", "--git", "https://x/y", "--features", "a", "--rev", sha, "--", "passthrough"}, out)
+	})
+}
