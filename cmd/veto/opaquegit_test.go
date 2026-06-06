@@ -5,9 +5,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
 	"github.com/brynbellomy/veto/internal/intel"
@@ -69,4 +71,81 @@ func TestCloneAndCaptureCommit(t *testing.T) {
 
 	_, statErr := os.Stat(filepath.Join(src, "Cargo.toml"))
 	require.NoError(t, statErr, "cloned working tree should contain Cargo.toml")
+}
+
+// writeStubCargo writes a fake `cargo` executable that, for any args, writes a
+// fixed Cargo.lock into its working directory (the clone dir). Returns the
+// stub's path. Skips on Windows (shell-script stub).
+func writeStubCargo(t *testing.T, lockBody string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("stub cargo uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cargo")
+	script := "#!/bin/sh\ncat > Cargo.lock <<'LOCK'\n" + lockBody + "\nLOCK\n"
+	require.NoError(t, os.WriteFile(path, []byte(script), 0o755))
+	return path
+}
+
+const stubLock = `[[package]]
+name = "rootcrate"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.200"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "evilgit"
+version = "0.0.1"
+source = "git+https://example.com/evil#deadbeef"`
+
+func TestResolveOpaqueGitInstalls(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, sha := newTestCrateRepo(t)
+
+	deps := opaqueGitDeps{
+		gitPath:   "git",
+		cargoPath: writeStubCargo(t, stubLock),
+		expander:  newCompoundExpander(),
+	}
+	plan := packagemanager.OpaqueRemoteResolvePlan{
+		GitURL:       repo,
+		ResolveArgs:  []string{"generate-lockfile"},
+		ManifestRefs: []packagemanager.ManifestRef{{Path: "Cargo.lock", Kind: packagemanager.ManifestKindCargoLock}},
+	}
+
+	installs, gotSHA, err := resolveOpaqueGitInstalls(context.Background(), zerolog.Nop(), deps, plan)
+	require.NoError(t, err)
+	require.Equal(t, sha, gotSHA)
+	require.Len(t, installs, 1, "only the registry dep survives the filter")
+	require.Equal(t, "serde", installs[0].Ref.Name)
+	require.Equal(t, "1.0.200", installs[0].Ref.Version)
+}
+
+func TestResolveOpaqueGitInstallsFailsClosedOnResolveError(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("stub cargo uses a POSIX shell script")
+	}
+	repo, _ := newTestCrateRepo(t)
+
+	stubDir := t.TempDir()
+	stub := filepath.Join(stubDir, "cargo")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755))
+
+	deps := opaqueGitDeps{gitPath: "git", cargoPath: stub, expander: newCompoundExpander()}
+	plan := packagemanager.OpaqueRemoteResolvePlan{
+		GitURL:       repo,
+		ResolveArgs:  []string{"generate-lockfile"},
+		ManifestRefs: []packagemanager.ManifestRef{{Path: "Cargo.lock", Kind: packagemanager.ManifestKindCargoLock}},
+	}
+	_, _, err := resolveOpaqueGitInstalls(context.Background(), zerolog.Nop(), deps, plan)
+	require.Error(t, err)
 }
