@@ -35,8 +35,16 @@ endif
 build:
 	go build -trimpath -ldflags="-s -w" -o $(BIN) $(PKG)
 
+# Run the suite without veto's own runtime interposer loaded. Several tests
+# t.Setenv("VETO_PATH") to verify env-stripping; with the interposer dylib
+# loaded in the test process (a preload-enabled shell, e.g. after
+# `veto install-preload`), it reads that VETO_PATH via getenv and hijacks the
+# tests' fake package-manager execs (exit 0 -> veto re-entry -> exit 70),
+# which otherwise breaks `make install`'s test gate. The interposer's own
+# e2e tests build their preloaded child env explicitly, so clearing the
+# ambient preload here is safe.
 test: $(INTERPOSER_HEADER)
-	go test -race ./...
+	DYLD_INSERT_LIBRARIES= LD_PRELOAD= go test -race ./...
 
 vet:
 	go vet ./...
