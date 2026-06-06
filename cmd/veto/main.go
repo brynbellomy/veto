@@ -366,6 +366,15 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 		}
 	}
 
+	gitResolution, err := applyOpaqueGitResolution(context.Background(), logger, cfg, pm, pmArgs, installs, expander)
+	if err != nil {
+		logger.Error().Err(err).Str("pm", pmName).Msg("opaque git resolve failed; aborting install fail-closed")
+		printAbort(os.Stderr, gate.Decision{Outcome: gate.OutcomeAbort, Errors: []error{err}})
+		return exitInternal
+	}
+	installs = gitResolution.Installs
+	pmArgs = gitResolution.ExecArgs
+
 	g := gate.New(store, policy, logger)
 	decision := g.Evaluate(installs, manifestRefs...)
 	switch decision.Outcome {
@@ -378,6 +387,11 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 	case gate.OutcomePassThrough:
 		return execPMOrPythonM(cfg, pmName, pmArgs)
 	case gate.OutcomeAllow:
+		if gitResolution.Applied {
+			fmt.Fprintf(os.Stderr,
+				"veto: cargo git source accepted at commit %s; scanned %d registry deps (clean).\n",
+				gitResolution.Commit, gitResolution.Scanned)
+		}
 		// Continue into the optional resolver pre-scan below.
 	default:
 		logger.Error().Str("outcome", string(decision.Outcome)).Msg("unknown gate outcome")
