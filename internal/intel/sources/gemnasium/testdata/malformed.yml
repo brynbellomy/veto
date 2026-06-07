@@ -1,0 +1,4 @@
+identifier: "CVE-BROKEN
+package_slug: npm/broken
+affected_range: ">=1.0.0
+  this: is not valid yaml: [unterminated

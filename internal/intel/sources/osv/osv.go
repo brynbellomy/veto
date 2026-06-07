@@ -4,9 +4,11 @@
 //
 //	https://osv-vulnerabilities.storage.googleapis.com/<ecosystem>/all.zip
 //
-// OSV mixes regular vulnerabilities with malware advisories. We filter to
-// entries whose ID starts with "MAL-" (OSV's malware namespace) via
-// osvschema.IsMalware.
+// OSV mixes regular vulnerabilities with malware advisories. By default we
+// filter to entries whose ID starts with "MAL-" (OSV's malware namespace)
+// via osvschema.IsMalware. Set Options.IncludeVulnerabilities to also emit
+// ordinary CVE/GHSA advisories (everything still-active) alongside the
+// malware findings.
 //
 // OSV aggregates upstreams including OpenSSF's malicious-packages, so
 // running both yields duplicate findings — that's intentional belt-and-
@@ -64,14 +66,23 @@ type Options struct {
 
 	// Logger receives structured log events.
 	Logger zerolog.Logger
+
+	// IncludeVulnerabilities widens the source beyond OSV's MAL-* malware
+	// namespace: when true, every still-active advisory (CVE/GHSA/RustSec/…
+	// that OSV.dev aggregates) is also emitted via
+	// osvschema.VulnerabilityReports. When false (the default) the source
+	// behaves exactly as before — malware-only, MAL-* filtered. The flag is
+	// fixed for the lifetime of a Source instance.
+	IncludeVulnerabilities bool
 }
 
 // Source is the OSV implementation of intel.Source.
 type Source struct {
-	baseURL  string
-	cacheDir string
-	client   *http.Client
-	logger   zerolog.Logger
+	baseURL     string
+	cacheDir    string
+	client      *http.Client
+	logger      zerolog.Logger
+	includeVuln bool
 
 	mu     sync.Mutex
 	cached map[intel.Ecosystem]ecosystemEntry
@@ -107,11 +118,12 @@ func New(opts Options) (*Source, error) {
 	}
 
 	return &Source{
-		baseURL:  baseURL,
-		cacheDir: opts.CacheDir,
-		client:   client,
-		logger:   opts.Logger.With().Str("component", "intel.osv").Logger(),
-		cached:   make(map[intel.Ecosystem]ecosystemEntry),
+		baseURL:     baseURL,
+		cacheDir:    opts.CacheDir,
+		client:      client,
+		logger:      opts.Logger.With().Str("component", "intel.osv").Logger(),
+		includeVuln: opts.IncludeVulnerabilities,
+		cached:      make(map[intel.Ecosystem]ecosystemEntry),
 	}, nil
 }
 
@@ -152,7 +164,7 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 		// Or fall back to on-disk zip if present (re-parse).
 		if _, statErr := os.Stat(zipPath); statErr == nil {
 			s.logger.Warn().Err(err).Str("ecosystem", string(eco)).Msg("osv unreachable, re-parsing cached zip")
-			reports, parseErr := parseZip(zipPath, s.logger)
+			reports, parseErr := parseZip(zipPath, s.includeVuln, s.logger)
 			if parseErr != nil {
 				return nil, errors.With(parseErr, "parse cached zip after network failure")
 			}
@@ -170,7 +182,7 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 		if entry, ok := s.cached[eco]; ok && entry.etag == string(prevEtag) {
 			return entry.reports, nil
 		}
-		reports, err := parseZip(zipPath, s.logger)
+		reports, err := parseZip(zipPath, s.includeVuln, s.logger)
 		if err != nil {
 			return nil, errors.With(err, "parse cached zip on 304")
 		}
@@ -214,7 +226,7 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 		// the previous etag in place (or no etag at all), and the next
 		// refresh will re-download the body rather than re-parse the same
 		// broken zip from disk.
-		reports, err := parseZip(zipPath, s.logger)
+		reports, err := parseZip(zipPath, s.includeVuln, s.logger)
 		if err != nil {
 			return nil, errors.With(err, "parse fresh zip")
 		}
@@ -232,7 +244,22 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 	}
 }
 
-func parseZip(path string, logger zerolog.Logger) ([]intel.MalwareReport, error) {
+// parseZip walks every advisory JSON in the on-disk zip and emits reports.
+//
+// When includeVuln is false it emits only MAL-* malware findings (the
+// historical behavior). When true it additionally emits every still-active
+// advisory via osvschema.VulnerabilityReports — ordinary CVE/GHSA/RustSec
+// entries that OSV.dev aggregates. The MAL-* path is unchanged in both
+// modes; includeVuln only widens, never narrows.
+//
+// Cache note: includeVuln is fixed per Source instance, so the in-memory
+// `cached` map (parsed reports keyed by ecosystem) never mixes modes within
+// one instance. The on-disk zip holds raw upstream bytes — no parse-mode
+// state — so a cold-memory re-parse off disk (304 / network-fallback paths)
+// always reflects the live instance's includeVuln via this argument. Two
+// Source instances with different includeVuln safely share a CacheDir: each
+// re-derives its own reports from the shared raw zip.
+func parseZip(path string, includeVuln bool, logger zerolog.Logger) ([]intel.MalwareReport, error) {
 	zr, err := zip.OpenReader(path)
 	if err != nil {
 		return nil, errors.With(err, "open zip")
@@ -275,10 +302,18 @@ func parseZip(path string, logger zerolog.Logger) ([]intel.MalwareReport, error)
 			logger.Debug().Err(err).Str("entry", f.Name).Msg("skip unparseable")
 			continue
 		}
-		if !osvschema.IsMalware(adv) {
+		if osvschema.IsMalware(adv) {
+			// MAL-* path — unchanged in both modes.
+			reports = append(reports, osvschema.Reports(adv, sourceID)...)
 			continue
 		}
-		reports = append(reports, osvschema.Reports(adv, sourceID)...)
+		// Non-MAL-* advisory. Default mode discards it; the widened mode
+		// emits it as an ordinary vulnerability. The IsMalware short-circuit
+		// above keeps the two emission paths disjoint, so a widened fetch
+		// never double-counts a MAL-* entry.
+		if includeVuln {
+			reports = append(reports, osvschema.VulnerabilityReports(adv, sourceID)...)
+		}
 	}
 	return reports, nil
 }

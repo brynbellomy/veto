@@ -1,0 +1,12 @@
+identifier: "CVE-2020-28483"
+identifiers:
+- "CVE-2020-28483"
+- "GHSA-h395-qcrw-5vmq"
+package_slug: "go/github.com/gin-gonic/gin"
+title: "Gin Web Framework vulnerable to IP spoofing"
+description: "Gin before 1.7.0 allows IP spoofing via the X-Forwarded-For header."
+date: "2024-01-01"
+pubdate: "2021-05-26"
+affected_range: "<v1.7.0"
+fixed_versions:
+- "v1.7.0"
