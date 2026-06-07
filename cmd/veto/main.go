@@ -31,10 +31,14 @@ import (
 	"github.com/brynbellomy/veto/internal/gate"
 	"github.com/brynbellomy/veto/internal/intel"
 	"github.com/brynbellomy/veto/internal/intel/sources/aikido"
+	"github.com/brynbellomy/veto/internal/intel/sources/datadog"
+	"github.com/brynbellomy/veto/internal/intel/sources/gemnasium"
 	"github.com/brynbellomy/veto/internal/intel/sources/ghsa"
+	"github.com/brynbellomy/veto/internal/intel/sources/govulndb"
 	"github.com/brynbellomy/veto/internal/intel/sources/openssf"
 	"github.com/brynbellomy/veto/internal/intel/sources/osv"
 	"github.com/brynbellomy/veto/internal/intel/sources/pypa"
+	"github.com/brynbellomy/veto/internal/intel/sources/rustsec"
 	"github.com/brynbellomy/veto/internal/packagemanager"
 	"github.com/brynbellomy/veto/internal/packagemanager/bun"
 	"github.com/brynbellomy/veto/internal/packagemanager/cargo"
@@ -1219,7 +1223,7 @@ func loadConfig() (config, error) {
 	v.SetEnvPrefix("VETO")
 	v.AutomaticEnv()
 	v.SetDefault("cache_dir", defaultCacheDir())
-	v.SetDefault("sources", []string{"aikido", "openssf", "osv", "pypa"})
+	v.SetDefault("sources", []string{"aikido", "datadog", "openssf", "osv", "pypa"})
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
 	v.AddConfigPath(filepath.Join(defaultCacheDir(), ".."))
@@ -1288,6 +1292,26 @@ func buildSource(logger zerolog.Logger, cfg config, id string) (intel.Source, er
 	case "pypa":
 		return pypa.New(pypa.Options{
 			CacheDir: filepath.Join(cfg.CacheDir, "pypa"),
+			Logger:   logger,
+		})
+	case "datadog":
+		return datadog.New(datadog.Options{
+			CacheDir: filepath.Join(cfg.CacheDir, "datadog"),
+			Logger:   logger,
+		})
+	case "rustsec":
+		return rustsec.New(rustsec.Options{
+			CacheDir: filepath.Join(cfg.CacheDir, "rustsec"),
+			Logger:   logger,
+		})
+	case "govulndb":
+		return govulndb.New(govulndb.Options{
+			CacheDir: filepath.Join(cfg.CacheDir, "govulndb"),
+			Logger:   logger,
+		})
+	case "gemnasium":
+		return gemnasium.New(gemnasium.Options{
+			CacheDir: filepath.Join(cfg.CacheDir, "gemnasium"),
 			Logger:   logger,
 		})
 	default:

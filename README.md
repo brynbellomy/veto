@@ -170,11 +170,15 @@ intel/range.go     ← VersionRange + per-ecosystem InRange comparator
                      (semver via Masterminds/semver for npm/Go/crates.io;
                      PEP 440 comparator for PyPI bounded ranges)
 intel/sources/
-  aikido/          ← https://malware-list.aikido.dev (implemented)
-  openssf/         ← github.com/ossf/malicious-packages (implemented)
-  osv/             ← osv.dev MAL-* advisories (implemented)
-  pypa/            ← github.com/pypa/advisory-database (PyPI; implemented)
+  aikido/          ← https://malware-list.aikido.dev (malware; default)
+  datadog/         ← github.com/DataDog/malicious-software-packages-dataset (malware; default)
+  openssf/         ← github.com/ossf/malicious-packages (malware; default)
+  osv/             ← osv.dev MAL-* advisories; opt-in CVE widening (default)
+  pypa/            ← github.com/pypa/advisory-database (PyPI; default)
   ghsa/            ← github.com/github/advisory-database (opt-in CVE/GHSA)
+  rustsec/         ← github.com/rustsec/advisory-db (crates.io CVE; opt-in)
+  govulndb/        ← vuln.go.dev (Go module CVE; opt-in)
+  gemnasium/       ← gitlab.com/gitlab-org/advisories-community (multi-eco CVE; opt-in)
   internal/fsutil/ ← shared atomic-write helper (source-internal)
 
 packagemanager/    ← parent: PackageManager interface, Install
@@ -445,7 +449,7 @@ configuration rather than package-intel matches.
 | Variable | Default | Purpose |
 |---|---|---|
 | `VETO_CACHE_DIR` | `$XDG_CACHE_HOME/veto` | where intel snapshots live |
-| `VETO_SOURCES` | `aikido,openssf,osv,pypa` | comma-separated source IDs to enable; add `ghsa` to opt into broad GitHub Advisory Database CVE/GHSA blocking |
+| `VETO_SOURCES` | `aikido,datadog,openssf,osv,pypa` | comma-separated source IDs to enable. Defaults are malware feeds. Opt-in CVE/vulnerability feeds: `ghsa` (GitHub Advisory DB), `rustsec` (crates.io), `govulndb` (Go modules), `gemnasium` (GitLab, multi-ecosystem) |
 | `VETO_LOG` | (info) | set `debug` for verbose logging |
 | `VETO_PATH` | (set by install-preload) | consumed by the Layer 3 interposer |
 | `VETO_GYP_TARBALL_SCAN` | (on) | install-time binding.gyp worm tarball inspection. `0`/`off`/`false` disables; `full` also fetches every resolved transitive (slower) |
