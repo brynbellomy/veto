@@ -39,6 +39,7 @@ import (
 	"github.com/brynbellomy/veto/internal/intel/sources/osv"
 	"github.com/brynbellomy/veto/internal/intel/sources/pypa"
 	"github.com/brynbellomy/veto/internal/intel/sources/rustsec"
+	"github.com/brynbellomy/veto/internal/ioc"
 	"github.com/brynbellomy/veto/internal/packagemanager"
 	"github.com/brynbellomy/veto/internal/packagemanager/bun"
 	"github.com/brynbellomy/veto/internal/packagemanager/cargo"
@@ -662,7 +663,22 @@ func runSync(logger zerolog.Logger, cfg config) int {
 		fmt.Fprintln(os.Stderr, "Check that your sources are configured correctly and reachable: `veto status`.")
 		return exitInternal
 	}
+	// Refresh the host-level IOC store alongside intel so `veto sync`
+	// populates both. With no feeds configured this is the Nop store and the
+	// refresh is a no-op; once Wave-4 feeds are enabled it pulls their
+	// indicators on the same schedule. IOC refresh failures are logged but do
+	// not fail the sync — the intel gate (the load-bearing refusal path) has
+	// already succeeded, and IOC hash-matching is a supplementary scan-time
+	// signal, not a gate input.
+	iocStore := buildIOCStore(logger, cfg)
+	if err := iocStore.Refresh(ctx); err != nil {
+		logger.Warn().Err(err).Msg("ioc refresh failed; continuing")
+	}
+
 	fmt.Printf("veto: synced sources %v (%d reports)\n", store.SourceIDs(), store.ReportCount())
+	if ids := iocStore.SourceIDs(); len(ids) > 0 {
+		fmt.Printf("veto: synced ioc feeds %v (%d indicators)\n", ids, iocStore.IndicatorCount())
+	}
 	return exitOK
 }
 
@@ -1214,8 +1230,9 @@ func isExecutableRegularOrSymlink(p string) bool {
 }
 
 type config struct {
-	CacheDir string
-	Sources  []string // enabled source IDs
+	CacheDir   string
+	Sources    []string // enabled intel source IDs
+	IOCSources []string // enabled IOC feed IDs (host-level indicator feeds)
 }
 
 func loadConfig() (config, error) {
@@ -1224,14 +1241,19 @@ func loadConfig() (config, error) {
 	v.AutomaticEnv()
 	v.SetDefault("cache_dir", defaultCacheDir())
 	v.SetDefault("sources", []string{"aikido", "datadog", "openssf", "osv", "pypa"})
+	// IOC feeds (abuse.ch, MISP, ...) are all opt-in and land in Wave 4. The
+	// default is empty so the IOC subsystem costs nothing until a feed is
+	// explicitly enabled via ioc_sources / VETO_IOC_SOURCES.
+	v.SetDefault("ioc_sources", []string{})
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
 	v.AddConfigPath(filepath.Join(defaultCacheDir(), ".."))
 	_ = v.ReadInConfig() // optional config file
 
 	cfg := config{
-		CacheDir: v.GetString("cache_dir"),
-		Sources:  v.GetStringSlice("sources"),
+		CacheDir:   v.GetString("cache_dir"),
+		Sources:    v.GetStringSlice("sources"),
+		IOCSources: v.GetStringSlice("ioc_sources"),
 	}
 	if cfg.CacheDir == "" {
 		return cfg, errors.New("cache_dir resolved empty")
@@ -1316,6 +1338,50 @@ func buildSource(logger zerolog.Logger, cfg config, id string) (intel.Source, er
 		})
 	default:
 		return nil, errors.WithNew("unknown source").Set("id", id)
+	}
+}
+
+// buildIOCStore constructs the host-level IOC store from the configured feeds.
+// With no feeds enabled (the shipping default — ioc_sources is empty), it
+// returns ioc.NopStore{}: a zero-cost store that matches nothing and reports
+// zero indicators, so the cache hash-scan stays disabled. Unknown feed IDs log
+// a warning and are skipped, mirroring buildStore.
+//
+// Wave-4 seam: when sources/abusech, sources/misp, etc. land, adding a feed is
+// a three-line change — a case in buildIOCSource, its import at the top of this
+// file, and (optionally) an entry in the ioc_sources default slice in
+// loadConfig.
+func buildIOCStore(logger zerolog.Logger, cfg config) ioc.Store {
+	var sources []ioc.Source
+	for _, id := range cfg.IOCSources {
+		src, err := buildIOCSource(logger, cfg, id)
+		if err != nil {
+			logger.Warn().Err(err).Str("ioc_source", id).Msg("skip ioc source")
+			continue
+		}
+		sources = append(sources, src)
+	}
+	if len(sources) == 0 {
+		// No feeds configured: the Nop store is the correct zero-cost default
+		// rather than an error, because IOC feeds are opt-in and the cache
+		// scanner is built to no-op when no indicators are present.
+		return ioc.NopStore{}
+	}
+	return ioc.NewStore(logger, sources...)
+}
+
+// buildIOCSource resolves one IOC feed ID to a concrete ioc.Source. It has no
+// cases yet: this foundation ships the contract, not the feeds. Wave 4 adds one
+// case per feed here (e.g. `case "abusech": return abusech.New(...)`).
+func buildIOCSource(logger zerolog.Logger, cfg config, id string) (ioc.Source, error) {
+	switch id {
+	// Wave 4 registers feeds here, e.g.:
+	//   case "abusech":
+	//       return abusech.New(abusech.Options{CacheDir: filepath.Join(cfg.CacheDir, "abusech"), Logger: logger})
+	//   case "misp":
+	//       return misp.New(misp.Options{CacheDir: filepath.Join(cfg.CacheDir, "misp"), Logger: logger})
+	default:
+		return nil, errors.WithNew("unknown ioc source").Set("id", id)
 	}
 }
 
@@ -1510,6 +1576,9 @@ Environment:
   VETO_CACHE_DIR     override cache location (default: $XDG_CACHE_HOME/veto)
   VETO_SOURCES       comma-separated source IDs (default: aikido,openssf,osv,pypa)
                        optional broad vulnerability feed: ghsa
+  VETO_IOC_SOURCES   comma-separated host-level IOC feed IDs (default: none).
+                       When set, cache artifacts are matched against
+                       known-malicious file hashes during veto scan.
   VETO_LOG           set to "debug" for verbose logging
   VETO_PATH          set by install-preload; consumed by the interposer
 `)

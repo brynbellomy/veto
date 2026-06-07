@@ -2,6 +2,8 @@ package cache_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/brynbellomy/veto/internal/intel"
+	"github.com/brynbellomy/veto/internal/ioc"
 	"github.com/brynbellomy/veto/internal/scan"
 	"github.com/brynbellomy/veto/internal/scan/cache"
 )
@@ -214,6 +217,123 @@ func TestPlanPurgeDoesNotDeleteIocOnlyResidue(t *testing.T) {
 	require.Empty(t, actions)
 	_, err := os.Stat(pkgDir)
 	require.NoError(t, err)
+}
+
+func TestScannerFindsIOCHashMatchInCargoCrate(t *testing.T) {
+	root := t.TempDir()
+	crate := filepath.Join(root, "cache", "index.crates.io-6f17d22bba15001f", "innocent-name-1.0.0.crate")
+	require.NoError(t, os.MkdirAll(filepath.Dir(crate), 0o755))
+	body := []byte("malicious crate bytes")
+	require.NoError(t, os.WriteFile(crate, body, 0o644))
+	digest := sha256Hex(body)
+
+	iocStore := buildIOCStore(t, ioc.Indicator{
+		Type: ioc.IndicatorSHA256, Value: digest, SourceID: "abusech", ThreatLabel: "BadCrate",
+	})
+
+	result := cache.New(cache.Options{
+		RootEntries: []cache.Root{cache.CargoRegistryRoot(root)},
+		Store:       buildStore(t),
+		IOCStore:    iocStore,
+	}).Scan(context.Background())
+
+	require.Empty(t, result.Errors)
+	require.Len(t, result.Findings, 1)
+	f := result.Findings[0]
+	require.Equal(t, scan.SurfaceCache, f.Surface)
+	require.Equal(t, scan.SeverityHigh, f.Severity)
+	require.Equal(t, "cache artifact matches known-malicious file hash", f.Title)
+	require.Equal(t, crate, f.Path)
+	require.Equal(t, "abusech", evidenceValue(t, f, "ioc_sources"))
+	require.Equal(t, "BadCrate", evidenceValue(t, f, "threat_label"))
+	require.Equal(t, digest[:12], evidenceValue(t, f, "sha256_prefix"))
+	require.Equal(t, crate, f.PurgePath)
+}
+
+func TestScannerHashesGoModuleZipUnderDownloadCache(t *testing.T) {
+	root := t.TempDir()
+	zip := filepath.Join(root, "cache", "download", "example.com", "evil", "pkg", "@v", "v0.4.0.zip")
+	require.NoError(t, os.MkdirAll(filepath.Dir(zip), 0o755))
+	body := []byte("go module zip bytes")
+	require.NoError(t, os.WriteFile(zip, body, 0o644))
+	digest := sha256Hex(body)
+
+	iocStore := buildIOCStore(t, ioc.Indicator{Type: ioc.IndicatorSHA256, Value: digest, SourceID: "abusech"})
+
+	result := cache.New(cache.Options{
+		RootEntries: []cache.Root{cache.GoRoot(root)},
+		Store:       buildStore(t),
+		IOCStore:    iocStore,
+	}).Scan(context.Background())
+
+	require.Empty(t, result.Errors)
+	// One finding from the existing Go-download name+version path (no intel
+	// match here, so none) plus the IOC hash finding. The store has no intel
+	// report for this module, so only the IOC hash finding is present.
+	require.Len(t, result.Findings, 1)
+	require.Equal(t, "cache artifact matches known-malicious file hash", result.Findings[0].Title)
+}
+
+func TestScannerNoHashingWhenIOCStoreEmpty(t *testing.T) {
+	root := t.TempDir()
+	crate := filepath.Join(root, "cache", "index.crates.io-6f17d22bba15001f", "innocent-name-1.0.0.crate")
+	require.NoError(t, os.MkdirAll(filepath.Dir(crate), 0o755))
+	require.NoError(t, os.WriteFile(crate, []byte("some crate"), 0o644))
+
+	// Default (nil IOCStore -> NopStore): no SHA256 indicators, so no hashing.
+	result := cache.New(cache.Options{
+		RootEntries: []cache.Root{cache.CargoRegistryRoot(root)},
+		Store:       buildStore(t),
+	}).Scan(context.Background())
+
+	require.Empty(t, result.Errors)
+	require.Empty(t, result.Findings, "no IOC hash indicators means no hash findings")
+	// The crate is named innocent-name-1.0.0, which still gets the normal
+	// name+version metadata read (FilesScanned counts it once), but it is NOT
+	// hashed (which would have incremented FilesScanned a second time).
+	require.Equal(t, 1, result.FilesScanned)
+}
+
+func TestScannerEmptyIOCStoreDoesNotHashEvenWithDomainIndicators(t *testing.T) {
+	root := t.TempDir()
+	crate := filepath.Join(root, "cache", "index.crates.io-6f17d22bba15001f", "innocent-name-1.0.0.crate")
+	require.NoError(t, os.MkdirAll(filepath.Dir(crate), 0o755))
+	body := []byte("crate body that would match if hashed")
+	require.NoError(t, os.WriteFile(crate, body, 0o644))
+
+	// IOC store has a DOMAIN indicator but zero SHA256 indicators. Hashing must
+	// stay disabled: the gate is on SHA256 count specifically.
+	iocStore := buildIOCStore(t, ioc.Indicator{Type: ioc.IndicatorDomain, Value: "evil.example", SourceID: "abusech"})
+
+	result := cache.New(cache.Options{
+		RootEntries: []cache.Root{cache.CargoRegistryRoot(root)},
+		Store:       buildStore(t),
+		IOCStore:    iocStore,
+	}).Scan(context.Background())
+
+	require.Empty(t, result.Errors)
+	require.Empty(t, result.Findings)
+	require.Equal(t, 1, result.FilesScanned, "domain-only IOC store must not trigger hashing")
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+type fakeIOCSource struct{ indicators []ioc.Indicator }
+
+func (fakeIOCSource) ID() string { return "abusech" }
+
+func (f fakeIOCSource) Fetch(_ context.Context) ([]ioc.Indicator, error) {
+	return f.indicators, nil
+}
+
+func buildIOCStore(t *testing.T, indicators ...ioc.Indicator) ioc.Store {
+	t.Helper()
+	store := ioc.NewStore(zerolog.Nop(), fakeIOCSource{indicators: indicators})
+	require.NoError(t, store.Refresh(context.Background()))
+	return store
 }
 
 type fakeSource struct{ reports []intel.MalwareReport }

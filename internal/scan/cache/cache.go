@@ -4,8 +4,11 @@ package cache
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,8 +18,15 @@ import (
 	"github.com/pelletier/go-toml/v2"
 
 	"github.com/brynbellomy/veto/internal/intel"
+	"github.com/brynbellomy/veto/internal/ioc"
 	"github.com/brynbellomy/veto/internal/scan"
 )
+
+// maxHashFileSize caps the bytes read when hashing a cache artifact for IOC
+// lookup. Distributable archives are tens of MiB at most; a file larger than
+// this ceiling is not a normal package tarball and is skipped rather than
+// streamed in full, bounding the scan's worst-case I/O.
+const maxHashFileSize = 256 << 20 // 256 MiB
 
 type rootKind string
 
@@ -52,23 +62,34 @@ type Options struct {
 	Roots       []string
 	RootEntries []Root
 	Store       intel.Store
+	// IOCStore answers known-malicious file-hash lookups for cache artifacts.
+	// Optional: when nil it defaults to ioc.NopStore{}, which reports zero
+	// SHA256 indicators and so suppresses all file hashing.
+	IOCStore ioc.Store
 }
 
 // Scanner scans package-manager cache roots for package metadata.
 type Scanner struct {
-	roots []Root
-	store intel.Store
+	roots    []Root
+	store    intel.Store
+	iocStore ioc.Store
 }
 
 var _ scan.Scanner = (*Scanner)(nil)
 
-// New builds a cache scanner.
+// New builds a cache scanner. A nil IOCStore defaults to ioc.NopStore{} so
+// call sites never nil-check it; a Nop (or empty) IOC store reports zero
+// SHA256 indicators and the scanner opens no files for hashing.
 func New(opts Options) *Scanner {
 	roots := append([]Root{}, opts.RootEntries...)
 	for _, root := range opts.Roots {
 		roots = append(roots, GenericRoot(root))
 	}
-	return &Scanner{roots: roots, store: opts.Store}
+	iocStore := opts.IOCStore
+	if iocStore == nil {
+		iocStore = ioc.NopStore{}
+	}
+	return &Scanner{roots: roots, store: opts.Store, iocStore: iocStore}
 }
 
 // DefaultRoots returns known package-manager cache roots for the current user.
@@ -127,6 +148,12 @@ func (s *Scanner) Scan(ctx context.Context) scan.Result {
 		result.Errors = append(result.Errors, errors.New("cache scanner requires store"))
 		return result
 	}
+	// Decide ONCE whether to hash distributable archives. The IOC hash-scan is
+	// cost-free when no SHA256 indicators are configured (the shipping
+	// default): if the store reports zero, hashEnabled stays false and no
+	// cache file is ever opened or hashed during the walk. Reading the count
+	// once here keeps the hot path from re-querying the store per file.
+	hashEnabled := s.iocStore.IndicatorCountByType(ioc.IndicatorSHA256) > 0
 	seen := map[string]struct{}{}
 	for _, rootEntry := range s.roots {
 		if err := ctx.Err(); err != nil {
@@ -189,6 +216,20 @@ func (s *Scanner) Scan(ctx context.Context) scan.Result {
 			result.Findings = append(result.Findings, findings...)
 			if err != nil {
 				result.Errors = append(result.Errors, err)
+			}
+			// IOC hash-scan: only for package distributable archives, and only
+			// when SHA256 indicators are configured. hashEnabled is false in
+			// the default (Nop / empty IOC store), so this branch opens no
+			// files at all.
+			if hashEnabled && isArchivePath(cleanRoot, rootEntry.kind, path) {
+				hashFindings, hashed, hashErr := s.scanArchiveHash(cleanRoot, path)
+				if hashed {
+					result.FilesScanned++
+				}
+				result.Findings = append(result.Findings, hashFindings...)
+				if hashErr != nil {
+					result.Errors = append(result.Errors, hashErr)
+				}
 			}
 			return nil
 		}); err != nil {
@@ -561,6 +602,103 @@ func shouldPruneDir(name string) bool {
 
 func findingID(kind, path, name string) string {
 	return fmt.Sprintf("cache:%s:%s:%s", kind, path, name)
+}
+
+// isArchivePath reports whether path is a package distributable archive whose
+// raw bytes are worth hashing for an IOC file-hash lookup. The set is the
+// shippable artifacts a package manager downloads and caches verbatim:
+//
+//   - .tgz / .tar.gz : npm/pnpm/yarn/bun package tarballs
+//   - .whl           : Python wheels
+//   - .crate         : Cargo registry crates
+//   - Go module .zip under cache/download : the Go module cache's downloaded
+//     archives (a bare .zip elsewhere is not a module distributable, so it is
+//     not hashed)
+//
+// Loose source files, manifests, and metadata are excluded — their identity is
+// already covered by the name+version intel lookup; only the byte-identical
+// distributable is meaningful against a file-hash IOC feed.
+func isArchivePath(root string, kind rootKind, path string) bool {
+	lower := strings.ToLower(path)
+	switch {
+	case strings.HasSuffix(lower, ".tgz"),
+		strings.HasSuffix(lower, ".tar.gz"),
+		strings.HasSuffix(lower, ".whl"),
+		strings.HasSuffix(lower, ".crate"):
+		return true
+	case kind == rootKindGo && strings.HasSuffix(lower, ".zip"):
+		// Restrict to the Go module download cache layout
+		// (cache/download/<module>/@v/<version>.zip) so we don't hash
+		// arbitrary zips a Go project happens to vendor.
+		parts, ok := relParts(root, path)
+		return ok && len(parts) >= 2 && parts[0] == "cache" && parts[1] == "download"
+	default:
+		return false
+	}
+}
+
+// scanArchiveHash streams an archive's bytes through SHA-256 and looks the
+// digest up in the IOC store. Returns any match as a high-severity finding,
+// whether the file was hashed (for FilesScanned accounting), and a non-fatal
+// error. Files larger than maxHashFileSize are skipped without hashing so a
+// pathological artifact can't blow the scan's I/O budget.
+func (s *Scanner) scanArchiveHash(root, path string) ([]scan.Finding, bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false, errors.With(err, "stat cache archive for hash").Set("path", path)
+	}
+	if info.Size() > maxHashFileSize {
+		return nil, false, nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, errors.With(err, "open cache archive for hash").Set("path", path)
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	// Bound the copy to the ceiling even if the file grew between stat and
+	// read, so a racing writer can't make us stream unbounded bytes.
+	if _, err := io.Copy(hasher, io.LimitReader(file, maxHashFileSize)); err != nil {
+		return nil, false, errors.With(err, "hash cache archive").Set("path", path)
+	}
+	digest := hex.EncodeToString(hasher.Sum(nil))
+
+	verdict := s.iocStore.Lookup(ioc.IndicatorSHA256, digest)
+	if !verdict.Matched() {
+		return nil, true, nil
+	}
+
+	finding := scan.Finding{
+		ID:       findingID("ioc-hash", path, digest),
+		Surface:  scan.SurfaceCache,
+		Severity: scan.SeverityHigh,
+		Path:     path,
+		Title:    "cache artifact matches known-malicious file hash",
+		Evidence: []scan.Evidence{
+			{Label: "cache_root", Value: root},
+			{Label: "ioc_sources", Value: strings.Join(verdict.Sources(), ",")},
+			{Label: "threat_label", Value: firstThreatLabel(verdict)},
+			{Label: "sha256_prefix", Value: digest[:12]},
+		},
+		Remediation: "Treat this cached artifact as compromised: do not install it, and purge the cache entry. Investigate how it entered the cache.",
+		PurgePath:   path,
+	}
+	return []scan.Finding{finding}, true, nil
+}
+
+// firstThreatLabel returns the first non-empty ThreatLabel among a verdict's
+// matches, for display in finding evidence. Threat labels are free-form and
+// display-only; this picks one representative label without implying it is the
+// match key.
+func firstThreatLabel(verdict ioc.Verdict) string {
+	for _, m := range verdict.Matches {
+		if m.ThreatLabel != "" {
+			return m.ThreatLabel
+		}
+	}
+	return ""
 }
 
 // PlanPurge turns confirmed cache findings into purge actions. Only findings

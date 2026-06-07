@@ -157,7 +157,17 @@ func runScanWithOpts(logger zerolog.Logger, cfg config, opts scanOpts) int {
 	cacheRootEntries := cache.DefaultRootEntries(home)
 	cacheRoots := cachePaths(cacheRootEntries)
 	if opts.caches {
-		results = append(results, cache.New(cache.Options{RootEntries: cacheRootEntries, Store: store}).Scan(ctx))
+		// Build and refresh the host-level IOC store so cache artifacts can be
+		// matched against known-malicious file hashes. With no feeds configured
+		// (the default) this is ioc.NopStore{}, the refresh is a no-op, and the
+		// cache scanner skips hashing entirely. IOC refresh failures are
+		// non-fatal: hash-matching supplements the intel name+version lookup
+		// rather than gating, so a degraded IOC feed must not abort the scan.
+		iocStore := buildIOCStore(logger, cfg)
+		if err := iocStore.Refresh(ctx); err != nil {
+			logger.Warn().Err(err).Msg("ioc refresh failed during scan; continuing without hash-matching")
+		}
+		results = append(results, cache.New(cache.Options{RootEntries: cacheRootEntries, Store: store, IOCStore: iocStore}).Scan(ctx))
 	}
 	if opts.agentSurface {
 		results = append(results, agentsurface.New(agentsurface.Options{Home: home, ProjectRoots: roots}).Scan(ctx))
