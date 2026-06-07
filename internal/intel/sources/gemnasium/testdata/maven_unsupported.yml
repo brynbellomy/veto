@@ -1,0 +1,11 @@
+identifier: "CVE-2099-9999"
+identifiers:
+- "CVE-2099-9999"
+package_slug: "maven/org.example/widget"
+title: "Synthetic Maven advisory veto does not gate"
+description: "Maven is not in veto's covered ecosystem set; this advisory must produce no reports."
+date: "2099-01-01"
+pubdate: "2099-01-01"
+affected_range: "[1.0,2.0)"
+fixed_versions:
+- "2.0"

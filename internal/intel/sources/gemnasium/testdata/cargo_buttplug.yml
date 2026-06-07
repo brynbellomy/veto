@@ -1,0 +1,12 @@
+identifier: "CVE-2020-36218"
+identifiers:
+- "CVE-2020-36218"
+- "GHSA-r7rv-2rph-hvhj"
+package_slug: "cargo/buttplug"
+title: "Data race in buttplug"
+description: "ButtplugFutureStateShared does not properly consider (!Send|!Sync) objects, leading to a data race."
+date: "2023-06-01"
+pubdate: "2021-01-26"
+affected_range: ">=0.5.0,<1.0.4"
+fixed_versions:
+- "1.0.4"

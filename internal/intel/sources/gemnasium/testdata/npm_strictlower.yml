@@ -1,0 +1,12 @@
+identifier: "GMS-2099-1"
+identifiers:
+- "GMS-2099-1"
+package_slug: "npm/example-strict"
+title: "Synthetic advisory exercising a strict > lower bound"
+description: "intel.VersionRange has no exclusive lower bound, so this alternative must be dropped, not guessed."
+date: "2099-01-01"
+pubdate: "2099-01-01"
+affected_range: ">1.0.0,<2.0.0||>=3.0.0,<3.5.0"
+fixed_versions:
+- "2.0.0"
+- "3.5.0"

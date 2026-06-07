@@ -1,0 +1,17 @@
+identifier: "CVE-2019-10744"
+identifiers:
+- "CVE-2019-10744"
+- "GHSA-jf85-cpcp-j695"
+package_slug: "npm/lodash"
+title: "Prototype Pollution in lodash"
+description: "Versions of lodash before 4.17.12 are vulnerable to Prototype Pollution."
+date: "2025-08-12"
+pubdate: "2019-07-10"
+affected_range: "<4.17.12"
+fixed_versions:
+- "4.17.12"
+affected_versions: "All versions before 4.17.12"
+cvss_v3: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H"
+uuid: "4774cd67-936f-419e-8533-ae5cfe7db9f9"
+cwe_ids:
+- "CWE-1321"
