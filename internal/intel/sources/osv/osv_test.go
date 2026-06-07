@@ -352,6 +352,124 @@ func TestFetchParseFailureDropsEtag(t *testing.T) {
 	require.Equal(t, int32(2), hits.Load(), "exactly two upstream hits expected")
 }
 
+// TestFetchVulnerabilitiesGatedByOption pins the new IncludeVulnerabilities
+// behavior: a non-MAL-* (CVE) advisory must surface ONLY when the option is
+// set, while the MAL-* malware advisory in the same feed surfaces in both
+// modes. The two emission paths must stay disjoint — the malware entry is
+// never double-counted under the widened mode.
+func TestFetchVulnerabilitiesGatedByOption(t *testing.T) {
+	t.Parallel()
+
+	// One feed carrying both a MAL-* malware entry and an ordinary CVE.
+	payload := makeMixedOSVZip(t,
+		osvEntry{id: "MAL-2026-7", pkg: "evil-pkg", eco: "npm", versions: []string{"1.0.0"}},
+		osvEntry{id: "CVE-2026-0001", pkg: "leaky-pkg", eco: "npm", versions: []string{"2.0.0"}},
+	)
+
+	newSource := func(t *testing.T, includeVuln bool) *osv.Source {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(payload)
+		}))
+		t.Cleanup(srv.Close)
+
+		src, err := osv.New(osv.Options{
+			BaseURL:                srv.URL,
+			CacheDir:               t.TempDir(),
+			Logger:                 zerolog.Nop(),
+			IncludeVulnerabilities: includeVuln,
+		})
+		require.NoError(t, err)
+		return src
+	}
+
+	t.Run("default omits CVEs", func(t *testing.T) {
+		t.Parallel()
+		src := newSource(t, false)
+
+		reports, err := src.Fetch(context.Background(), intel.EcosystemNPM)
+		require.NoError(t, err)
+		require.Len(t, reports, 1, "malware-only mode must emit just the MAL-* entry")
+		require.Equal(t, "evil-pkg", reports[0].Name)
+		require.Equal(t, "MAL-2026-7", reports[0].AdvisoryID)
+	})
+
+	t.Run("opt-in surfaces CVEs alongside malware", func(t *testing.T) {
+		t.Parallel()
+		src := newSource(t, true)
+
+		reports, err := src.Fetch(context.Background(), intel.EcosystemNPM)
+		require.NoError(t, err)
+		require.Len(t, reports, 2, "widened mode must emit both the MAL-* and the CVE entry, with no double-count")
+
+		byID := make(map[string]intel.MalwareReport, len(reports))
+		for _, r := range reports {
+			byID[r.AdvisoryID] = r
+		}
+		mal, ok := byID["MAL-2026-7"]
+		require.True(t, ok, "malware entry must still surface in widened mode")
+		require.Equal(t, "evil-pkg", mal.Name)
+
+		cve, ok := byID["CVE-2026-0001"]
+		require.True(t, ok, "CVE must surface only when IncludeVulnerabilities is set")
+		require.Equal(t, "leaky-pkg", cve.Name)
+		require.Equal(t, "2.0.0", cve.Version)
+		require.Equal(t, "osv", cve.SourceID)
+	})
+}
+
+// osvEntry describes one advisory to embed in a multi-entry test zip.
+type osvEntry struct {
+	id       string
+	pkg      string
+	eco      string
+	versions []string
+}
+
+// makeMixedOSVZip builds an in-memory zip with one JSON document per entry.
+// Used to prove the malware/vulnerability emission paths stay disjoint within
+// a single feed.
+func makeMixedOSVZip(t *testing.T, entries ...osvEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+
+	for _, e := range entries {
+		f, err := zw.Create(e.id + ".json")
+		require.NoError(t, err)
+		_, err = f.Write(osvAdvisoryJSON(e.id, e.pkg, e.eco, e.versions))
+		require.NoError(t, err)
+	}
+	require.NoError(t, zw.Close())
+	return buf.Bytes()
+}
+
+// osvAdvisoryJSON renders one OSV-shaped advisory document. The summary is
+// derived from the id so MAL-* and CVE entries are visually distinct in
+// failure output.
+func osvAdvisoryJSON(id, pkg, eco string, versions []string) []byte {
+	var versionsJSON bytes.Buffer
+	versionsJSON.WriteString("[")
+	for i, v := range versions {
+		if i > 0 {
+			versionsJSON.WriteString(",")
+		}
+		versionsJSON.WriteString(`"` + v + `"`)
+	}
+	versionsJSON.WriteString("]")
+
+	return []byte(`{
+  "id": "` + id + `",
+  "summary": "advisory ` + id + `",
+  "affected": [
+    {
+      "package": {"ecosystem": "` + eco + `", "name": "` + pkg + `"},
+      "versions": ` + versionsJSON.String() + `
+    }
+  ]
+}`)
+}
+
 // makeOSVZip builds an in-memory zip containing one OSV-shaped JSON
 // advisory with the given fields. Sufficient for IsMalware to fire
 // when the id starts with MAL-.
