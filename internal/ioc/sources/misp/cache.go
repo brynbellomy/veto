@@ -6,9 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/brynbellomy/go-utils/errors"
-
 	"github.com/brynbellomy/veto/internal/ioc"
+	"github.com/brynbellomy/veto/internal/ioc/sources/internal/fsutil"
 )
 
 // cachedEvent is the on-disk extraction for one event: the manifest timestamp
@@ -55,7 +54,7 @@ func (s *Source) writeEventCache(uuid string, ts int64, indicators []ioc.Indicat
 		s.logger.Debug().Err(err).Str("event", uuid).Msg("marshal event cache")
 		return
 	}
-	if err := writeAtomic(s.eventCachePath(uuid), payload); err != nil {
+	if err := fsutil.WriteAtomic(s.eventCachePath(uuid), payload); err != nil {
 		s.logger.Debug().Err(err).Str("event", uuid).Msg("write event cache")
 	}
 }
@@ -71,31 +70,4 @@ func sanitizeUUID(uuid string) string {
 			return '_'
 		}
 	}, uuid)
-}
-
-// writeAtomic writes payload to dst via a sibling temp file and rename, so a
-// crash mid-write leaves either the old file or the new one, never a truncated
-// one. The intel sources share an fsutil helper for this, but that package is
-// import-restricted to internal/intel/sources/...; the ioc tree carries its own
-// copy here.
-func writeAtomic(dst string, payload []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-")
-	if err != nil {
-		return errors.With(err, "create temp")
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(payload); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return errors.With(err, "write temp")
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return errors.With(err, "close temp")
-	}
-	if err := os.Rename(tmpPath, dst); err != nil {
-		os.Remove(tmpPath)
-		return errors.With(err, "rename temp")
-	}
-	return nil
 }

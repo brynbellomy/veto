@@ -181,6 +181,12 @@ intel/sources/
   gemnasium/       ← gitlab.com/gitlab-org/advisories-community (multi-eco CVE; opt-in)
   internal/fsutil/ ← shared atomic-write helper (source-internal)
 
+ioc/               ← parent: host-level IOC Source/Store/Indicator + RuleScanner (YARA seam, deferred)
+  sources/
+    abusech/       ← abuse.ch MalwareBazaar/Feodo/URLhaus/ThreatFox (opt-in; VETO_ABUSECH_AUTH_KEY)
+    misp/          ← CIRCL OSINT MISP feed (opt-in)
+    internal/fsutil/ ← shared atomic-write helper (source-internal)
+
 packagemanager/    ← parent: PackageManager interface, Install
 packagemanager/
   npm/ pnpm/ yarn/ bun/       ← jsspec-backed
@@ -450,6 +456,8 @@ configuration rather than package-intel matches.
 |---|---|---|
 | `VETO_CACHE_DIR` | `$XDG_CACHE_HOME/veto` | where intel snapshots live |
 | `VETO_SOURCES` | `aikido,datadog,openssf,osv,pypa` | comma-separated source IDs to enable. Defaults are malware feeds. Opt-in CVE/vulnerability feeds: `ghsa` (GitHub Advisory DB), `rustsec` (crates.io), `govulndb` (Go modules), `gemnasium` (GitLab, multi-ecosystem) |
+| `VETO_IOC_SOURCES` | (empty) | comma-separated host-level IOC feed IDs (opt-in): `abusech` (file hashes / C2 IPs / URLs), `misp` (CIRCL OSINT). When a feed supplies file-hash indicators, the cache scanner additionally SHA256-matches cached package archives against them |
+| `VETO_ABUSECH_AUTH_KEY` | (unset) | free abuse.ch Auth-Key (https://auth.abuse.ch/) required by the `abusech` IOC feed; without it the feed logs once and no-ops |
 | `VETO_LOG` | (info) | set `debug` for verbose logging |
 | `VETO_PATH` | (set by install-preload) | consumed by the Layer 3 interposer |
 | `VETO_GYP_TARBALL_SCAN` | (on) | install-time binding.gyp worm tarball inspection. `0`/`off`/`false` disables; `full` also fetches every resolved transitive (slower) |

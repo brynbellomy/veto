@@ -182,8 +182,8 @@ func TestFetchHappyPath(t *testing.T) {
 	require.Equal(t, "Cobalt Strike", tf.ThreatLabel)
 	require.Equal(t, "https://threatfox.abuse.ch/ioc/1500001/", tf.Reference)
 	require.Equal(t, time.Date(2026, 6, 7, 9, 15, 0, 0, time.UTC), tf.PublishedAt)
-	require.Contains(t, idx, "domain|bad-domain.example.org")           // lowercased
-	require.Contains(t, idx, "url|http://phish.example.net/login")      // host lowercased, frag stripped
+	require.Contains(t, idx, "domain|bad-domain.example.org")      // lowercased
+	require.Contains(t, idx, "url|http://phish.example.net/login") // host lowercased, frag stripped
 	require.Contains(t, idx,
 		"sha256|ddeeff00112233445566778899aabbccddeeff00112233445566778899aabbcc") // lowercased
 	// The md5_hash ioc_type is not in ThreatFox's supported mapping → dropped.

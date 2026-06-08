@@ -36,6 +36,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/brynbellomy/veto/internal/ioc"
+	"github.com/brynbellomy/veto/internal/ioc/sources/internal/fsutil"
 )
 
 const (
@@ -318,7 +319,7 @@ func (s *Source) fetchPayloadBounded(
 			Set("limit_bytes", maxFeedBytes, "subfeed", feed, "url", url)
 	}
 
-	if err := writeAtomic(payloadPath, payload); err != nil {
+	if err := fsutil.WriteAtomic(payloadPath, payload); err != nil {
 		return nil, nil, errors.With(err, "cache payload").Set("subfeed", feed)
 	}
 	// Stage the etag in a `.pending` sibling. The returned commit closure
@@ -326,7 +327,7 @@ func (s *Source) fetchPayloadBounded(
 	// transient malformed payload could persist an etag pointing at unparseable
 	// bytes and 304-loop forever.
 	if etag := resp.Header.Get("ETag"); etag != "" {
-		if err := writeAtomic(etagPath+".pending", []byte(etag)); err != nil {
+		if err := fsutil.WriteAtomic(etagPath+".pending", []byte(etag)); err != nil {
 			s.logger.Warn().Str("subfeed", feed).Err(err).Msg("write etag.pending")
 		}
 	}

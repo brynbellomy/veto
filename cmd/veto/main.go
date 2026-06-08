@@ -40,6 +40,8 @@ import (
 	"github.com/brynbellomy/veto/internal/intel/sources/pypa"
 	"github.com/brynbellomy/veto/internal/intel/sources/rustsec"
 	"github.com/brynbellomy/veto/internal/ioc"
+	"github.com/brynbellomy/veto/internal/ioc/sources/abusech"
+	"github.com/brynbellomy/veto/internal/ioc/sources/misp"
 	"github.com/brynbellomy/veto/internal/packagemanager"
 	"github.com/brynbellomy/veto/internal/packagemanager/bun"
 	"github.com/brynbellomy/veto/internal/packagemanager/cargo"
@@ -1370,16 +1372,22 @@ func buildIOCStore(logger zerolog.Logger, cfg config) ioc.Store {
 	return ioc.NewStore(logger, sources...)
 }
 
-// buildIOCSource resolves one IOC feed ID to a concrete ioc.Source. It has no
-// cases yet: this foundation ships the contract, not the feeds. Wave 4 adds one
-// case per feed here (e.g. `case "abusech": return abusech.New(...)`).
+// buildIOCSource resolves one IOC feed ID to a concrete ioc.Source. Adding a
+// feed is a three-line change: a case here, its import at the top of the file,
+// and (optionally) an entry in the ioc_sources default slice in loadConfig.
 func buildIOCSource(logger zerolog.Logger, cfg config, id string) (ioc.Source, error) {
 	switch id {
-	// Wave 4 registers feeds here, e.g.:
-	//   case "abusech":
-	//       return abusech.New(abusech.Options{CacheDir: filepath.Join(cfg.CacheDir, "abusech"), Logger: logger})
-	//   case "misp":
-	//       return misp.New(misp.Options{CacheDir: filepath.Join(cfg.CacheDir, "misp"), Logger: logger})
+	case "abusech":
+		return abusech.New(abusech.Options{
+			CacheDir: filepath.Join(cfg.CacheDir, "abusech"),
+			AuthKey:  os.Getenv("VETO_ABUSECH_AUTH_KEY"),
+			Logger:   logger,
+		})
+	case "misp":
+		return misp.New(misp.Options{
+			CacheDir: filepath.Join(cfg.CacheDir, "misp"),
+			Logger:   logger,
+		})
 	default:
 		return nil, errors.WithNew("unknown ioc source").Set("id", id)
 	}
