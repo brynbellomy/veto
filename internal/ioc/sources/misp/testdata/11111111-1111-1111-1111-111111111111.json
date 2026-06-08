@@ -1,0 +1,101 @@
+{
+  "Event": {
+    "uuid": "11111111-1111-1111-1111-111111111111",
+    "info": "Multi-type sample event",
+    "date": "2021-04-14",
+    "timestamp": "1618430692",
+    "published": true,
+    "Orgc": { "name": "TestOrg", "uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" },
+    "Attribute": [
+      {
+        "type": "sha256",
+        "category": "Payload delivery",
+        "value": "ABC123ABC123ABC123ABC123ABC123ABC123ABC123ABC123ABC123ABC123ABCD",
+        "comment": "mixed-case hash must lowercase",
+        "timestamp": "1618430000",
+        "to_ids": true,
+        "uuid": "a1"
+      },
+      {
+        "type": "sha1",
+        "category": "Payload delivery",
+        "value": "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709",
+        "comment": "",
+        "timestamp": "1618430001",
+        "uuid": "a2"
+      },
+      {
+        "type": "md5",
+        "category": "Payload delivery",
+        "value": "d41d8cd98f00b204e9800998ecf8427e",
+        "comment": "",
+        "timestamp": "1618430002",
+        "uuid": "a3"
+      },
+      {
+        "type": "domain",
+        "category": "Network activity",
+        "value": "Evil.Example.COM.",
+        "comment": "trailing dot + mixed case must normalize",
+        "timestamp": "1618430003",
+        "uuid": "a4"
+      },
+      {
+        "type": "hostname",
+        "category": "Network activity",
+        "value": "host.bad.example",
+        "comment": "",
+        "timestamp": "1618430004",
+        "uuid": "a5"
+      },
+      {
+        "type": "ip-src",
+        "category": "Network activity",
+        "value": "203.0.113.7",
+        "comment": "",
+        "timestamp": "1618430005",
+        "uuid": "a6"
+      },
+      {
+        "type": "ip-dst",
+        "category": "Network activity",
+        "value": "198.51.100.22",
+        "comment": "",
+        "timestamp": "1618430006",
+        "uuid": "a7"
+      },
+      {
+        "type": "ip-dst",
+        "category": "Network activity",
+        "value": "2001:db8::1",
+        "comment": "IPv6 must be skipped",
+        "timestamp": "1618430007",
+        "uuid": "a8"
+      },
+      {
+        "type": "ip-src",
+        "category": "Network activity",
+        "value": "10.0.0.0/8",
+        "comment": "CIDR must be skipped",
+        "timestamp": "1618430008",
+        "uuid": "a9"
+      },
+      {
+        "type": "url",
+        "category": "Network activity",
+        "value": "HTTP://Bad.Example.COM/Path/To?q=1",
+        "comment": "scheme+host lowercase, path preserved",
+        "timestamp": "1618430009",
+        "uuid": "a10"
+      },
+      {
+        "type": "link",
+        "category": "External analysis",
+        "value": "https://blog.example.com/report",
+        "comment": "unmapped type must be skipped",
+        "timestamp": "1618430010",
+        "uuid": "a11"
+      }
+    ]
+  }
+}

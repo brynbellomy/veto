@@ -1,0 +1,50 @@
+{
+  "Event": {
+    "uuid": "22222222-2222-2222-2222-222222222222",
+    "info": "Composite-hash and object event",
+    "date": "2022-01-02",
+    "timestamp": "1641081600",
+    "Orgc": { "name": "TestOrg", "uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" },
+    "Attribute": [
+      {
+        "type": "filename|md5",
+        "category": "Payload delivery",
+        "value": "evil.exe|5D41402ABC4B2A76B9719D911017C592",
+        "comment": "composite: keep hash half, lowercase",
+        "timestamp": "1641081100",
+        "uuid": "b1"
+      },
+      {
+        "type": "filename|sha256",
+        "category": "Payload delivery",
+        "value": "dropper.bin|E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        "comment": "",
+        "timestamp": "1641081200",
+        "uuid": "b2"
+      }
+    ],
+    "Object": [
+      {
+        "name": "file",
+        "Attribute": [
+          {
+            "type": "sha1",
+            "category": "Payload delivery",
+            "value": "356A192B7913B04C54574D18C28D46E6395428AB",
+            "comment": "nested object attribute",
+            "timestamp": "1641081300",
+            "uuid": "b3"
+          },
+          {
+            "type": "domain",
+            "category": "Network activity",
+            "value": "nested.example.org",
+            "comment": "",
+            "timestamp": "1641081400",
+            "uuid": "b4"
+          }
+        ]
+      }
+    ]
+  }
+}
