@@ -1,0 +1,8 @@
+# URLhaus database dump (recent URLs, trimmed fixture)
+# Provided by abuse.ch under CC0.
+#
+# id, dateadded, url, url_status, last_online, threat, tags, urlhaus_link, reporter
+#
+"3210001","2026-06-07 11:00:00","http://EVIL.example.com/Malware/Payload.exe#frag","online","2026-06-07 11:30:00","malware_download","exe,emotet","https://urlhaus.abuse.ch/url/3210001/","anon"
+"3210002","2026-06-07 10:45:00","https://bad.test/path?id=42","online","2026-06-07 10:50:00","malware_download","elf","https://urlhaus.abuse.ch/url/3210002/","researcher"
+"3210003","2026-06-07 10:00:00","not a url at all","offline","","malware_download","","https://urlhaus.abuse.ch/url/3210003/","anon"

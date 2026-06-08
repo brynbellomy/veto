@@ -1,0 +1,55 @@
+{
+  "query_status": "ok",
+  "data": [
+    {
+      "id": "1500001",
+      "ioc": "192.0.2.55:443",
+      "ioc_type": "ip:port",
+      "threat_type": "botnet_cc",
+      "malware": "win.cobalt_strike",
+      "malware_printable": "Cobalt Strike",
+      "first_seen": "2026-06-07 09:15:00 UTC",
+      "reference": "https://threatfox.abuse.ch/ioc/1500001/"
+    },
+    {
+      "id": "1500002",
+      "ioc": "Bad-Domain.Example.ORG",
+      "ioc_type": "domain",
+      "threat_type": "botnet_cc",
+      "malware": "win.qakbot",
+      "malware_printable": "QakBot",
+      "first_seen": "2026-06-07 08:00:00 UTC",
+      "reference": "https://threatfox.abuse.ch/ioc/1500002/"
+    },
+    {
+      "id": "1500003",
+      "ioc": "http://Phish.example.net/login#x",
+      "ioc_type": "url",
+      "threat_type": "payload_delivery",
+      "malware": "unknown",
+      "malware_printable": "Unknown malware",
+      "first_seen": "2026-06-07 07:30:00 UTC",
+      "reference": "https://threatfox.abuse.ch/ioc/1500003/"
+    },
+    {
+      "id": "1500004",
+      "ioc": "DDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899AABBCC",
+      "ioc_type": "sha256_hash",
+      "threat_type": "payload",
+      "malware": "win.icedid",
+      "malware_printable": "IcedID",
+      "first_seen": "2026-06-07 06:00:00 UTC",
+      "reference": "https://threatfox.abuse.ch/ioc/1500004/"
+    },
+    {
+      "id": "1500005",
+      "ioc": "deadbeef",
+      "ioc_type": "md5_hash",
+      "threat_type": "payload",
+      "malware": "win.other",
+      "malware_printable": "Other",
+      "first_seen": "2026-06-07 05:00:00 UTC",
+      "reference": "https://threatfox.abuse.ch/ioc/1500005/"
+    }
+  ]
+}

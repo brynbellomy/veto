@@ -1,0 +1,33 @@
+[
+  {
+    "ip_address": "203.0.113.10",
+    "port": 443,
+    "status": "online",
+    "hostname": null,
+    "as_number": 64500,
+    "as_name": "EXAMPLE-AS",
+    "country": "US",
+    "first_seen_utc": "2026-06-01 08:30:00",
+    "last_online": "2026-06-07",
+    "malware": "Emotet"
+  },
+  {
+    "ip_address": "198.51.100.5",
+    "port": 8080,
+    "status": "online",
+    "hostname": null,
+    "as_number": 64501,
+    "as_name": "TEST-AS",
+    "country": "DE",
+    "first_seen_utc": "2026-06-05 12:00:00",
+    "last_online": "2026-06-07",
+    "malware": "QakBot"
+  },
+  {
+    "ip_address": "not-an-ip",
+    "port": 0,
+    "status": "offline",
+    "first_seen_utc": "2026-06-04 00:00:00",
+    "malware": "Garbage"
+  }
+]
