@@ -75,6 +75,41 @@ version = "2.0.7"
 	requireContains(t, out, "urllib3", "2.0.7")
 }
 
+// TestExpand_UvLockSourceTable covers uv.lock's real `source` table, where
+// `editable` and `virtual` are PATH STRINGS (e.g. `source = { editable = "." }`),
+// not booleans. Workspace/editable entries are skipped; registry packages are
+// emitted. Regression for the bool-typed struct that made go-toml abort the
+// entire file with "cannot decode TOML string into ... of type bool", which
+// silently dropped every package in any uv.lock containing a workspace root.
+func TestExpand_UvLockSourceTable(t *testing.T) {
+	const body = `version = 1
+
+[[package]]
+name = "my-project"
+version = "0.1.0"
+source = { editable = "." }
+
+[[package]]
+name = "my-lib"
+version = "0.2.0"
+source = { virtual = "packages/lib" }
+
+[[package]]
+name = "requests"
+version = "2.31.0"
+source = { registry = "https://pypi.org/simple" }
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "uv.lock")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+
+	out, err := pylock.New().Expand(packagemanager.ManifestRef{Path: path, Kind: packagemanager.ManifestKindUvLock})
+	require.NoError(t, err)
+	requireContains(t, out, "requests", "2.31.0")
+	requireNotContains(t, out, "my-project")
+	requireNotContains(t, out, "my-lib")
+}
+
 // TestExpand_MissingFile_ReturnsNilNil: PMs emit lock refs speculatively,
 // so missing files must not error.
 func TestExpand_MissingFile_ReturnsNilNil(t *testing.T) {
@@ -110,4 +145,13 @@ func requireContains(t *testing.T, installs []packagemanager.Install, name, vers
 		}
 	}
 	t.Fatalf("expected %s==%s in:\n%v", name, version, installs)
+}
+
+func requireNotContains(t *testing.T, installs []packagemanager.Install, name string) {
+	t.Helper()
+	for _, ins := range installs {
+		if ins.Ref.Name == name {
+			t.Fatalf("did not expect %s in:\n%v", name, installs)
+		}
+	}
 }
