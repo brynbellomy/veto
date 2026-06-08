@@ -691,6 +691,11 @@ func runStatus(logger zerolog.Logger, cfg config) int {
 		return exitInternal
 	}
 	fmt.Printf("veto: configured sources: %v\n", store.SourceIDs())
+	if len(cfg.IOCSources) == 0 {
+		fmt.Println("veto: configured IOC feeds: none")
+	} else {
+		fmt.Printf("veto: configured IOC feeds: %v\n", cfg.IOCSources)
+	}
 	fmt.Printf("veto: cache dir: %s\n", cfg.CacheDir)
 	return exitOK
 }
@@ -1582,11 +1587,14 @@ Go/Cargo live gating:
 
 Environment:
   VETO_CACHE_DIR     override cache location (default: $XDG_CACHE_HOME/veto)
-  VETO_SOURCES       comma-separated source IDs (default: aikido,openssf,osv,pypa)
-                       optional broad vulnerability feed: ghsa
+  VETO_SOURCES       comma-separated source IDs (default: aikido,datadog,openssf,osv,pypa)
+                       optional vulnerability feeds: ghsa, rustsec, govulndb, gemnasium
   VETO_IOC_SOURCES   comma-separated host-level IOC feed IDs (default: none).
-                       When set, cache artifacts are matched against
-                       known-malicious file hashes during veto scan.
+                       Available: abusech, misp. When set, cache artifacts are
+                       matched against known-malicious file hashes during veto scan.
+  VETO_ABUSECH_AUTH_KEY
+                     free abuse.ch Auth-Key (https://auth.abuse.ch/) required by the
+                     abusech IOC feed; without it the feed logs once and no-ops
   VETO_LOG           set to "debug" for verbose logging
   VETO_PATH          set by install-preload; consumed by the interposer
 `)

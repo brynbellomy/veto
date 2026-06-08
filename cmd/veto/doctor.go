@@ -71,6 +71,7 @@ func runDoctor(logger zerolog.Logger, cfg config, args []string) int {
 	results = append(results, checkWrappers(cfg)...)
 	intelResults := checkIntel(logger, cfg)
 	results = append(results, intelResults...)
+	results = append(results, checkIOC(logger, cfg))
 
 	printResults(os.Stdout, results)
 	printVersionManagerFooters(os.Stdout, results)
@@ -764,7 +765,7 @@ func checkIntel(logger zerolog.Logger, cfg config) []checkResult {
 			status:   statusFail,
 			label:    "intel store",
 			detail:   "build store: " + err.Error(),
-			howToFix: "Check VETO_SOURCES is valid (default: aikido,openssf,osv,pypa; optional: ghsa).",
+			howToFix: "Check VETO_SOURCES is valid (default: aikido,datadog,openssf,osv,pypa; optional CVE feeds: ghsa, rustsec, govulndb, gemnasium).",
 		})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -818,6 +819,38 @@ func checkIntel(logger zerolog.Logger, cfg config) []checkResult {
 		}
 	}
 	return out
+}
+
+// checkIOC validates the host-level IOC layer. With no ioc_sources configured
+// (the default) the layer is inert, so we emit a single informational PASS and
+// touch no network. When feeds are configured we refresh and report the
+// indicator count. A refresh failure is WARN, not FAIL: IOC matching is a
+// supplementary scan-time signal, not part of the install gate, so a degraded
+// feed must not make doctor (or a gate) treat the install path as untrusted.
+func checkIOC(logger zerolog.Logger, cfg config) checkResult {
+	if len(cfg.IOCSources) == 0 {
+		return checkResult{
+			status: statusPass,
+			label:  "ioc feeds",
+			detail: "none configured (host-level IOC scanning off)",
+		}
+	}
+	store := buildIOCStore(logger, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := store.Refresh(ctx); err != nil {
+		return checkResult{
+			status:   statusWarn,
+			label:    "ioc refresh",
+			detail:   err.Error(),
+			howToFix: "Check VETO_IOC_SOURCES and any required key (e.g. VETO_ABUSECH_AUTH_KEY); try `veto sync`.",
+		}
+	}
+	return checkResult{
+		status: statusPass,
+		label:  "ioc feeds",
+		detail: fmt.Sprintf("%d indicators across %v", store.IndicatorCount(), store.SourceIDs()),
+	}
 }
 
 // newestCacheMtime walks cfg.CacheDir and returns the newest non-dir file
