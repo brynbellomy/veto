@@ -298,4 +298,3 @@ func severityRank(s Severity) int {
 		return 0
 	}
 }
-
