@@ -64,6 +64,24 @@ const (
 	exitUsage    = 64
 	exitRefused  = 1
 	exitInternal = 70
+	// exitInstallAllLayerFail fires when a user-scoped install-all layer
+	// (shims / shell rc / Claude hook / preload interposer / intel sync /
+	// doctor) returns non-zero. It distinguishes "the parts the current
+	// user owns broke" from a wrappers-only failure so integrator scripts
+	// can route remediation accordingly.
+	exitInstallAllLayerFail = 10
+	// exitInstallAllNeedsRoot fires when install-all finished every
+	// user-scoped layer cleanly but the wrappers step skipped one or more
+	// candidate paths because the candidate dir is not writable by the
+	// current (non-root) user. Caller can retry the wrappers step under
+	// sudo without re-running the user-scoped layers. Distinct from a
+	// genuine wrappers failure (30).
+	exitInstallAllNeedsRoot = 20
+	// exitInstallAllWrappersFail fires when the wrappers step had write
+	// access (or we are already root) and still hit a real failure —
+	// rename/symlink error, partial-state collision, etc. This is the
+	// "something is actually wrong" code; elevation will not fix it.
+	exitInstallAllWrappersFail = 30
 	// syncTimeout bounds a full refresh across all sources. OpenSSF alone can
 	// take ~10s on first sync (35 MB tarball + 454k entries); allow generous
 	// headroom so the first-time experience isn't surprising. Subsequent
@@ -1499,11 +1517,22 @@ Layer 4 — real-binary wrappers (catches absolute-path invocations):
   veto uninstall-wrappers   reverse every wrapper recorded in state
 
 Install everything:
-  veto install-all [--lib PATH] [--shell-rc PATH|auto] [--force] [--skip-interposer]
+  veto install-all [--lib PATH] [--shell-rc PATH|auto] [--force]
+                   [--skip-interposer] [--skip-wrappers]
                                install shims, shell integration, Claude hook,
                                preload interposer, wrappers, sync intel, then doctor.
                                If --lib is omitted, builds libveto_interpose
-                               with `+"`make interposer`"+` when run from the repo.
+                               from the C source embedded in the veto binary
+                               (requires `+"`cc`"+` on PATH; override via `+"`CC=...`"+`).
+                               Works from any CWD; no veto source tree needed.
+                               --skip-wrappers omits the Layer 4 wrappers step
+                               entirely (useful when wrappers are installed
+                               separately under sudo).
+                               Exit codes:
+                                  0  success
+                                 10  a user-scoped layer failed
+                                 20  wrappers need elevation (rerun under sudo)
+                                 30  wrappers attempted and genuinely failed
 
 Supported package managers:
   npm, pnpm, yarn, bun, pip, pip3, uv, poetry, pdm, go, cargo,
