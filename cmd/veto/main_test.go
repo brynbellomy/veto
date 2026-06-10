@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -593,6 +594,44 @@ func storeWithFakeReports(t *testing.T, reports []intel.MalwareReport) intel.Sto
 
 type fakeSource struct {
 	reports []intel.MalwareReport
+}
+
+func TestPMErrorSummary(t *testing.T) {
+	npmGlobal := strings.Join([]string{
+		`npm warn Unknown user config "min-release-age". This will stop working in the next major version of npm.`,
+		"npm error code ESHRINKWRAPGLOBAL",
+		"npm error cannot generate lockfile for global packages",
+		"npm error A complete log of this run can be found in: /Users/x/.npm/_logs/foo-debug-0.log",
+	}, "\n")
+
+	summary := pmErrorSummary(npmGlobal)
+	require.Contains(t, summary, "ESHRINKWRAPGLOBAL")
+	require.Contains(t, summary, "cannot generate lockfile for global packages")
+	require.NotContains(t, summary, "complete log of this run")
+
+	require.Equal(t, "", pmErrorSummary(""))
+	require.Equal(t, "", pmErrorSummary("everything is fine\nresolved 12 packages"))
+}
+
+func TestRunResolverPreScanSurfacesPMError(t *testing.T) {
+	fakeBin := t.TempDir()
+	npmPath := filepath.Join(fakeBin, "npm")
+	script := "#!/bin/sh\n" +
+		"echo 'npm error code ESHRINKWRAPGLOBAL' 1>&2\n" +
+		"echo 'npm error cannot generate lockfile for global packages' 1>&2\n" +
+		"exit 1\n"
+	require.NoError(t, os.WriteFile(npmPath, []byte(script), 0o755))
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := runResolverPreScan(zerolog.Nop(), config{CacheDir: t.TempDir()}, "npm", packagemanager.ResolverPreScanPlan{
+		Args: []string{"install", "-g", "clean-direct", "--package-lock-only", "--ignore-scripts"},
+		ManifestRefs: []packagemanager.ManifestRef{
+			{Path: "package-lock.json", Kind: packagemanager.ManifestKindPackageLockJSON},
+		},
+	}, jslock.New())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "resolver pre-scan command failed")
+	require.Contains(t, err.Error(), "ESHRINKWRAPGLOBAL")
 }
 
 func (s fakeSource) ID() string { return "test-feed" }

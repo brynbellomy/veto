@@ -301,6 +301,34 @@ func TestResolverPreScan(t *testing.T) {
 		_, ok := m.ResolverPreScan([]string{"run", "build"})
 		require.False(t, ok)
 	})
+
+	t.Run("global installs cannot generate a lockfile (ESHRINKWRAPGLOBAL)", func(t *testing.T) {
+		// npm refuses --package-lock-only for global packages, so the
+		// resolver pre-scan is impossible; veto must skip it and fall back
+		// to direct-spec intel + binding.gyp tarball gating.
+		for _, args := range [][]string{
+			{"install", "-g", "@openai/codex@latest"},
+			{"install", "--global", "@openai/codex@latest"},
+			{"install", "--global=true", "@openai/codex@latest"},
+			{"install", "--location=global", "@openai/codex@latest"},
+			{"install", "--location", "global", "@openai/codex@latest"},
+			{"i", "-g", "typescript"},
+		} {
+			_, ok := m.ResolverPreScan(args)
+			require.False(t, ok, "args: %v", args)
+		}
+	})
+
+	t.Run("non-global location and disabled global still pre-scan", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"install", "--location=user", "pkg"},
+			{"install", "--no-global", "pkg"},
+			{"install", "--global=false", "pkg"},
+		} {
+			_, ok := m.ResolverPreScan(args)
+			require.True(t, ok, "args: %v", args)
+		}
+	})
 }
 
 func requireKind(t *testing.T, refs []packagemanager.ManifestRef, kind packagemanager.ManifestKind) {

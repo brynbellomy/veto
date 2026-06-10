@@ -152,6 +152,9 @@ func (Manager) ResolverPreScan(args []string) (packagemanager.ResolverPreScanPla
 	if len(directInstalls) == 0 || hasUnsafeResolverPreScanSpec(directInstalls) {
 		return packagemanager.ResolverPreScanPlan{}, false
 	}
+	if hasGlobalInstall(args) {
+		return packagemanager.ResolverPreScanPlan{}, false
+	}
 	return packagemanager.ResolverPreScanPlan{
 		Args: appendResolverFlags(args,
 			"--package-lock=true",
@@ -173,6 +176,26 @@ func (Manager) ResolverPreScan(args []string) (packagemanager.ResolverPreScanPla
 		},
 		DirectInstalls: directInstalls,
 	}, true
+}
+
+// hasGlobalInstall reports whether argv requests a global install. npm cannot
+// generate a lockfile for global packages (it errors with ESHRINKWRAPGLOBAL),
+// so the --package-lock-only resolver pre-scan is impossible. veto skips the
+// pre-scan for these and falls back to direct-spec intel + binding.gyp tarball
+// gating. Disable forms (--no-global, --global=false, --location=user) must NOT
+// match.
+func hasGlobalInstall(args []string) bool {
+	for i, a := range args {
+		switch a {
+		case "-g", "--global", "--global=true", "--location=global":
+			return true
+		case "--location":
+			if i+1 < len(args) && args[i+1] == "global" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasUnsafeResolverPreScanSpec(installs []packagemanager.Install) bool {
