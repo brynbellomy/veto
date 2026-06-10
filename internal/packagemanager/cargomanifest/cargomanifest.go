@@ -23,6 +23,7 @@ import (
 
 	"github.com/brynbellomy/veto/internal/intel"
 	"github.com/brynbellomy/veto/internal/packagemanager"
+	"github.com/brynbellomy/veto/internal/packagemanager/wsglob"
 )
 
 // Expander handles Cargo.toml files. Stateless and safe for concurrent use.
@@ -126,7 +127,7 @@ func cargoWorkspaceMembers(rootDir string, doc map[string]any) ([]string, error)
 
 	excluded := make(map[string]struct{})
 	for _, pat := range stringSlice(workspace["exclude"]) {
-		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		matches, err := wsglob.Match(filepath.Join(rootDir, filepath.FromSlash(pat)))
 		if err != nil {
 			return nil, vetoerrors.With(err, "expand workspace exclude glob").Set("pattern", pat)
 		}
@@ -138,7 +139,7 @@ func cargoWorkspaceMembers(rootDir string, doc map[string]any) ([]string, error)
 	var out []string
 	seenDir := make(map[string]struct{})
 	for _, pat := range members {
-		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		matches, err := wsglob.Match(filepath.Join(rootDir, filepath.FromSlash(pat)))
 		if err != nil {
 			return nil, vetoerrors.With(err, "expand workspace member glob").Set("pattern", pat)
 		}

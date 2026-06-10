@@ -22,6 +22,10 @@ current user-facing behavior.
   member's package.json so a fresh-checkout monorepo no longer misses member
   deps. Members are discovered from the root only (no recursion); negation
   patterns are not interpreted (over-including a member is the safe posture).
+  Remaining: pnpm declares workspaces in `pnpm-workspace.yaml` (and historically
+  as `{"include": [...]}` inside `package.json`). Neither shape is parsed —
+  pnpm's lockfile expander already covers member deps on a populated repo, so
+  the gap is fresh-checkout-only.
 - Phase 1.6 followup: gate `jsspec.tryParseAlias` on
   `isLegalNpmName(name)` so `user/repo@npm:evil@1` is treated as
   github-shorthand (OpaqueRemote) rather than alias-unwrapped to

@@ -47,6 +47,7 @@ import (
 	"github.com/brynbellomy/veto/internal/intel"
 	"github.com/brynbellomy/veto/internal/packagemanager"
 	"github.com/brynbellomy/veto/internal/packagemanager/pyspec"
+	"github.com/brynbellomy/veto/internal/packagemanager/wsglob"
 )
 
 // Expander reads pyproject.toml files and emits the Install records the gate
@@ -284,7 +285,7 @@ func workspaceMemberPyprojects(rootDir string, members, exclude []string) ([]str
 	}
 	excluded := make(map[string]struct{})
 	for _, pat := range exclude {
-		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		matches, err := wsglob.Match(filepath.Join(rootDir, filepath.FromSlash(pat)))
 		if err != nil {
 			return nil, vetoerrors.With(err, "expand workspace exclude glob").Set("pattern", pat)
 		}
@@ -296,7 +297,7 @@ func workspaceMemberPyprojects(rootDir string, members, exclude []string) ([]str
 	var out []string
 	seenDir := make(map[string]struct{})
 	for _, pat := range members {
-		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		matches, err := wsglob.Match(filepath.Join(rootDir, filepath.FromSlash(pat)))
 		if err != nil {
 			return nil, vetoerrors.With(err, "expand workspace member glob").Set("pattern", pat)
 		}

@@ -32,6 +32,7 @@ import (
 	"github.com/brynbellomy/veto/internal/intel"
 	"github.com/brynbellomy/veto/internal/packagemanager"
 	"github.com/brynbellomy/veto/internal/packagemanager/jsspec"
+	"github.com/brynbellomy/veto/internal/packagemanager/wsglob"
 )
 
 // Expander reads package.json files and emits the Install records the gate
@@ -78,7 +79,27 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 		return nil, err
 	}
 
-	installs := collectDeps(pkg)
+	// Dedupe by lower-cased npm name across root + every workspace member —
+	// the gate looks up each unique (ecosystem, name) once, so emitting a
+	// shared dep from both a root and a member package.json (or from two
+	// members) would just produce a duplicate Verdict line for the user.
+	// Mirrors pymanifest's seen-set pattern.
+	seen := make(map[string]struct{}, 32)
+	var installs []packagemanager.Install
+	addInstalls := func(more []packagemanager.Install) {
+		for _, ins := range more {
+			key := strings.ToLower(strings.TrimSpace(ins.Ref.Name))
+			if key == "" {
+				continue
+			}
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			installs = append(installs, ins)
+		}
+	}
+	addInstalls(collectDeps(pkg))
 
 	// npm/yarn/pnpm workspaces: `npm install` at the root installs every
 	// member's deps, so a member-only malicious dep would otherwise be missed
@@ -97,7 +118,7 @@ func (e *Expander) Expand(ref packagemanager.ManifestRef) ([]packagemanager.Inst
 		if !ok {
 			continue
 		}
-		installs = append(installs, collectDeps(mpkg)...)
+		addInstalls(collectDeps(mpkg))
 	}
 	return installs, nil
 }
@@ -149,6 +170,11 @@ func collectDeps(pkg packageJSON) []packagemanager.Install {
 // classic) or an object with a "packages" array (yarn berry). Returns nil for
 // any other shape. Negation patterns (yarn's "!pkg") are not interpreted —
 // over-including a member is the safe posture for a gate.
+//
+// Known gap: pnpm's pnpm-workspace.yaml (and the older inline
+// {"include": [...]} variant in package.json) is not handled here. pnpm installs
+// cover member deps via the lockfile expander on a populated repo, so the
+// fail-open here is fresh-checkout-only — tracked in TODO.md.
 func workspacePatterns(raw json.RawMessage) []string {
 	if len(raw) == 0 {
 		return nil
@@ -178,7 +204,7 @@ func workspaceMemberManifests(rootDir string, patterns []string) ([]string, erro
 	var out []string
 	seen := make(map[string]struct{})
 	for _, pat := range patterns {
-		matches, err := filepath.Glob(filepath.Join(rootDir, filepath.FromSlash(pat)))
+		matches, err := wsglob.Match(filepath.Join(rootDir, filepath.FromSlash(pat)))
 		if err != nil {
 			return nil, vetoerrors.With(err, "expand workspace member glob").Set("pattern", pat)
 		}
