@@ -189,16 +189,43 @@ func (Manager) ManifestRefs(args []string) []packagemanager.ManifestRef {
 	return refs
 }
 
-// ResolverPreScan implements packagemanager.ResolverPreScanner for uv's
-// pip-compatible install shape. uv pip compile can resolve requirements into a
-// pylock.toml file without installing packages. Veto feeds it a synthetic input
-// file for argv-named specs, seeds user requirements/constraints, and forces
-// wheel-only resolution so sdists are not built in the temporary workdir.
+// ResolverPreScan implements packagemanager.ResolverPreScanner. uv pip compile
+// resolves requirements into a pylock.toml file without installing packages,
+// so veto can gate the full transitive tree before the real install runs. Two
+// install shapes get a probe:
+//
+//   - `uv pip install ...`: feed compile a synthetic input file for argv-named
+//     specs plus the user's requirements/constraints.
+//   - `uv add ...` / `uv install ...`: feed compile the project's pyproject.toml
+//     AND a synthetic input for the newly-named specs, so the probe resolves the
+//     post-add constraint union the same way `uv add` will. This closes the
+//     fail-open where the new package's transitive deps were only ever gated
+//     against the now-stale uv.lock (or, with no lockfile, not gated at all).
+//
+// Both shapes force wheel-only resolution so sdists are not built in the
+// temporary workdir, and forward the user's resolver-affecting flags (index
+// URLs, resolution strategy, interpreter) so private-index installs resolve
+// faithfully instead of aborting.
 func (Manager) ResolverPreScan(args []string) (packagemanager.ResolverPreScanPlan, bool) {
 	verb, rest, ok := installVerbAndRest(args)
-	if !ok || verb != "pip-install" {
+	if !ok {
 		return packagemanager.ResolverPreScanPlan{}, false
 	}
+	switch verb {
+	case "pip-install":
+		return pipInstallPreScan(args, rest)
+	case "add", "install":
+		return addPreScan(args, rest)
+	default:
+		// `uv sync` installs the already-locked tree, which the gate covers via
+		// the uv.lock manifest ref — no fresh resolution to probe.
+		return packagemanager.ResolverPreScanPlan{}, false
+	}
+}
+
+// pipInstallPreScan builds the probe for `uv pip install` — pip-compatible
+// argv with optional requirements/constraints files.
+func pipInstallPreScan(args, rest []string) (packagemanager.ResolverPreScanPlan, bool) {
 	directInstalls := Manager{}.ParseInstalls(args)
 	manifestRefs := Manager{}.ManifestRefs(args)
 	if len(directInstalls) == 0 && len(manifestRefs) == 0 {
@@ -214,25 +241,118 @@ func (Manager) ResolverPreScan(args []string) (packagemanager.ResolverPreScanPla
 		compileArgs = append(compileArgs, "veto-uv-requirements.in")
 	}
 	compileArgs = append(compileArgs, compileRequirementArgs(manifestRefs)...)
-	compileArgs = append(compileArgs,
-		"--output-file", "pylock.veto.toml",
-		"--format", "pylock.toml",
-		"--only-binary", ":all:",
-		"--no-progress",
-	)
+	compileArgs = append(compileArgs, forwardResolverFlags(rest)...)
+	compileArgs = append(compileArgs, resolverCompileTail()...)
 	seedFiles := make([]string, 0, len(manifestRefs))
 	for _, ref := range manifestRefs {
 		seedFiles = append(seedFiles, ref.Path)
 	}
 	return packagemanager.ResolverPreScanPlan{
-		Args: compileArgs,
-		ManifestRefs: []packagemanager.ManifestRef{
-			{Path: "pylock.veto.toml", Kind: packagemanager.ManifestKindUvLock},
-		},
+		Args:           compileArgs,
+		ManifestRefs:   []packagemanager.ManifestRef{{Path: "pylock.veto.toml", Kind: packagemanager.ManifestKindUvLock}},
 		SeedFiles:      seedFiles,
 		GeneratedFiles: generatedFiles,
 		DirectInstalls: directInstalls,
 	}, true
+}
+
+// addPreScan builds the probe for `uv add` / `uv install`. It compiles the
+// seeded pyproject.toml together with a synthetic input for the newly-named
+// specs, so the resolved tree reflects what `uv add` will actually install.
+//
+// When the verb names no explicit specs (e.g. bare `uv add` with `-r`, which
+// the gate covers via requirements expansion) the probe is skipped — there is
+// no new spec to resolve.
+func addPreScan(args, rest []string) (packagemanager.ResolverPreScanPlan, bool) {
+	directInstalls := Manager{}.ParseInstalls(args)
+	if len(directInstalls) == 0 {
+		return packagemanager.ResolverPreScanPlan{}, false
+	}
+	if hasUnsafeResolverPreScanSpec(directInstalls) || hasUnsafeResolverPreScanFlag(rest) {
+		return packagemanager.ResolverPreScanPlan{}, false
+	}
+	// pyproject.toml is both a compile input (so compile reads the project's
+	// existing dependencies) and a seed file. `uv pip compile` ignores uv.lock,
+	// so the lockfile is not seeded — faithfulness comes from resolving the
+	// pyproject + new-spec constraint union, not from the existing pins.
+	compileArgs := []string{"pip", "compile", "pyproject.toml", "veto-uv-requirements.in"}
+	compileArgs = append(compileArgs, forwardResolverFlags(rest)...)
+	compileArgs = append(compileArgs, resolverCompileTail()...)
+	return packagemanager.ResolverPreScanPlan{
+		Args:           compileArgs,
+		ManifestRefs:   []packagemanager.ManifestRef{{Path: "pylock.veto.toml", Kind: packagemanager.ManifestKindUvLock}},
+		SeedFiles:      []string{"pyproject.toml"},
+		GeneratedFiles: map[string][]byte{"veto-uv-requirements.in": []byte(directRequirementsInput(directInstalls))},
+		DirectInstalls: directInstalls,
+	}, true
+}
+
+// resolverCompileTail is the fixed suffix every uv pip compile probe ends with:
+// emit a pylock.toml, force wheel-only resolution so no sdist build runs, and
+// silence progress output.
+func resolverCompileTail() []string {
+	return []string{
+		"--output-file", "pylock.veto.toml",
+		"--format", "pylock.toml",
+		"--only-binary", ":all:",
+		"--no-progress",
+	}
+}
+
+// forwardResolverFlagSet is the allowlist of user flags whose values change
+// which artifact the resolver selects. Forwarding them keeps the probe's view
+// of the index, resolution strategy, and interpreter identical to the real
+// install. Flags outside this set are deliberately dropped: -r/-c/--with/
+// --package/--extra/--group are handled elsewhere, and unknown tunables must
+// not leak into the synthetic compile command.
+var forwardResolverFlagSet = argv.FlagsWithValues{
+	"--index":            {},
+	"--default-index":    {},
+	"--index-url":        {},
+	"-i":                 {},
+	"--extra-index-url":  {},
+	"--find-links":       {},
+	"-f":                 {},
+	"--index-strategy":   {},
+	"--keyring-provider": {},
+	"--prerelease":       {},
+	"--resolution":       {},
+	"--python":           {},
+	"-p":                 {},
+}
+
+// forwardResolverFlags returns the allowlisted resolver flags from rest, in
+// argv order, ready to splice into a compile command. Both `--flag value` and
+// `--flag=value` forms are preserved; POSIX "--" terminates scanning.
+func forwardResolverFlags(rest []string) []string {
+	out := make([]string, 0, 8)
+	i := 0
+	for i < len(rest) {
+		tok := rest[i]
+		if tok == "--" {
+			break
+		}
+		if !argv.IsFlag(tok) {
+			i++
+			continue
+		}
+		if eq := strings.IndexByte(tok, '='); eq > 0 {
+			if _, ok := forwardResolverFlagSet[tok[:eq]]; ok {
+				out = append(out, tok)
+			}
+			i++
+			continue
+		}
+		if _, takesValue := flagsWithValues[tok]; takesValue && i+1 < len(rest) {
+			if _, ok := forwardResolverFlagSet[tok]; ok {
+				out = append(out, tok, rest[i+1])
+			}
+			i += 2
+			continue
+		}
+		i++
+	}
+	return out
 }
 
 func compileRequirementArgs(refs []packagemanager.ManifestRef) []string {

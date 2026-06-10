@@ -232,8 +232,83 @@ func TestResolverPreScan(t *testing.T) {
 		require.Empty(t, plan.GeneratedFiles)
 	})
 
-	t.Run("project uv verbs are not pre-scanned by this path", func(t *testing.T) {
-		_, ok := m.ResolverPreScan([]string{"add", "clean-direct"})
+	t.Run("uv pip install forwards user index flags into the compile probe", func(t *testing.T) {
+		plan, ok := m.ResolverPreScan([]string{"pip", "install", "--index-url", "https://example.com", "clean-direct"})
+		require.True(t, ok)
+		require.Equal(t, []string{
+			"pip", "compile",
+			"veto-uv-requirements.in",
+			"--index-url", "https://example.com",
+			"--output-file", "pylock.veto.toml",
+			"--format", "pylock.toml",
+			"--only-binary", ":all:",
+			"--no-progress",
+		}, plan.Args)
+	})
+
+	t.Run("uv add compiles the pyproject union with synthesized requirements", func(t *testing.T) {
+		plan, ok := m.ResolverPreScan([]string{"add", "clean-direct"})
+		require.True(t, ok)
+		require.Equal(t, []string{
+			"pip", "compile",
+			"pyproject.toml",
+			"veto-uv-requirements.in",
+			"--output-file", "pylock.veto.toml",
+			"--format", "pylock.toml",
+			"--only-binary", ":all:",
+			"--no-progress",
+		}, plan.Args)
+		require.Equal(t, []packagemanager.ManifestRef{{Path: "pylock.veto.toml", Kind: packagemanager.ManifestKindUvLock}}, plan.ManifestRefs)
+		require.Equal(t, []string{"pyproject.toml"}, plan.SeedFiles)
+		require.Equal(t, map[string][]byte{"veto-uv-requirements.in": []byte("clean-direct\n")}, plan.GeneratedFiles)
+		require.Equal(t, []packagemanager.Install{{Ref: intel.PackageRef{Ecosystem: intel.EcosystemPyPI, Name: "clean-direct"}, RawSpec: "clean-direct"}}, plan.DirectInstalls)
+	})
+
+	t.Run("uv add forwards user index flags into the compile probe", func(t *testing.T) {
+		plan, ok := m.ResolverPreScan([]string{"add", "--index-url", "https://example.com", "clean-direct"})
+		require.True(t, ok)
+		require.Equal(t, []string{
+			"pip", "compile",
+			"pyproject.toml",
+			"veto-uv-requirements.in",
+			"--index-url", "https://example.com",
+			"--output-file", "pylock.veto.toml",
+			"--format", "pylock.toml",
+			"--only-binary", ":all:",
+			"--no-progress",
+		}, plan.Args)
+		require.Equal(t, []packagemanager.Install{{Ref: intel.PackageRef{Ecosystem: intel.EcosystemPyPI, Name: "clean-direct"}, RawSpec: "clean-direct"}}, plan.DirectInstalls)
+	})
+
+	t.Run("uv install resolves the same way as uv add", func(t *testing.T) {
+		plan, ok := m.ResolverPreScan([]string{"install", "clean-direct"})
+		require.True(t, ok)
+		require.Equal(t, []string{"pyproject.toml"}, plan.SeedFiles)
+		require.Equal(t, map[string][]byte{"veto-uv-requirements.in": []byte("clean-direct\n")}, plan.GeneratedFiles)
+	})
+
+	t.Run("uv sync is not pre-scanned (installs the already-locked tree)", func(t *testing.T) {
+		_, ok := m.ResolverPreScan([]string{"sync"})
+		require.False(t, ok)
+	})
+
+	t.Run("uv add with no explicit specs is not pre-scanned", func(t *testing.T) {
+		_, ok := m.ResolverPreScan([]string{"add"})
+		require.False(t, ok)
+	})
+
+	t.Run("uv add of a local path is not pre-scanned", func(t *testing.T) {
+		_, ok := m.ResolverPreScan([]string{"add", "./local-pkg"})
+		require.False(t, ok)
+	})
+
+	t.Run("uv add of an opaque remote is not pre-scanned", func(t *testing.T) {
+		_, ok := m.ResolverPreScan([]string{"add", "https://example.com/pkg.whl"})
+		require.False(t, ok)
+	})
+
+	t.Run("uv add with a user no-binary flag is not pre-scanned", func(t *testing.T) {
+		_, ok := m.ResolverPreScan([]string{"add", "--no-binary", ":all:", "clean-direct"})
 		require.False(t, ok)
 	})
 

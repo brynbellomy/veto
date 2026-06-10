@@ -225,3 +225,78 @@ func TestExpandEmptyDeps(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, installs)
 }
+
+// TestExpandPackageJSONWorkspaceMembers ensures that when the root package.json
+// declares workspaces, each member's deps are gated too. `npm install` at the
+// root installs every workspace member's deps, so a member-only malicious dep
+// on a fresh checkout (no lockfile) is otherwise a direct-dependency fail-open.
+// Both the array form and the {"packages": [...]} object form are supported,
+// and a member whose version redirects to git is flagged OpaqueRemote.
+func TestExpandPackageJSONWorkspaceMembers(t *testing.T) {
+	expandRoot := func(t *testing.T, root string) map[string]packagemanager.Install {
+		t.Helper()
+		exp := jsmanifest.New()
+		installs, err := exp.Expand(packagemanager.ManifestRef{
+			Path: filepath.Join(root, "package.json"),
+			Kind: packagemanager.ManifestKindPackageJSON,
+		})
+		require.NoError(t, err)
+		byName := make(map[string]packagemanager.Install, len(installs))
+		for _, ins := range installs {
+			byName[ins.Ref.Name] = ins
+		}
+		return byName
+	}
+
+	writeFile := func(t *testing.T, root, rel, contents string) {
+		t.Helper()
+		full := filepath.Join(root, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+		require.NoError(t, os.WriteFile(full, []byte(contents), 0o644))
+	}
+
+	members := func(t *testing.T, root string) {
+		t.Helper()
+		writeFile(t, root, "packages/foo/package.json", `{
+  "dependencies": {"foo-evil": "1.0.0"},
+  "devDependencies": {"foo-dev-evil": "^2"}
+}`)
+		writeFile(t, root, "packages/bar/package.json", `{
+  "dependencies": {"bar-evil": "git+https://evil.example/bar.git"}
+}`)
+		// A glob match without a package.json must be skipped gracefully.
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "packages/notapkg"), 0o755))
+	}
+
+	assertMembers := func(t *testing.T, byName map[string]packagemanager.Install) {
+		t.Helper()
+		require.Contains(t, byName, "root-dep")
+		require.Contains(t, byName, "foo-evil")
+		require.Equal(t, "1.0.0", byName["foo-evil"].Ref.Version)
+		require.Contains(t, byName, "foo-dev-evil")
+		require.Contains(t, byName, "bar-evil")
+		require.True(t, byName["bar-evil"].OpaqueRemote, "member git: dep must flag OpaqueRemote")
+	}
+
+	t.Run("array form", func(t *testing.T) {
+		root := t.TempDir()
+		writeFile(t, root, "package.json", `{
+  "name": "root",
+  "dependencies": {"root-dep": "^1"},
+  "workspaces": ["packages/*"]
+}`)
+		members(t, root)
+		assertMembers(t, expandRoot(t, root))
+	})
+
+	t.Run("object form", func(t *testing.T) {
+		root := t.TempDir()
+		writeFile(t, root, "package.json", `{
+  "name": "root",
+  "dependencies": {"root-dep": "^1"},
+  "workspaces": {"packages": ["packages/*"]}
+}`)
+		members(t, root)
+		assertMembers(t, expandRoot(t, root))
+	})
+}

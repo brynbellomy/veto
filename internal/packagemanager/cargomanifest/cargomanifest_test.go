@@ -104,3 +104,70 @@ func requireNotContains(t *testing.T, installs []packagemanager.Install, name st
 		}
 	}
 }
+
+// TestExpandCargoWorkspaceMembers ensures that when the root Cargo.toml declares
+// a [workspace] members list, each member crate's dependencies are gated too.
+// `cargo build` at a workspace root compiles every member, so a member-only
+// malicious dep on a fresh checkout (no Cargo.lock) is otherwise a
+// direct-dependency fail-open for Rust monorepos. The `exclude` list is
+// respected and a matched dir without a Cargo.toml is skipped.
+func TestExpandCargoWorkspaceMembers(t *testing.T) {
+	root := t.TempDir()
+
+	writeFile := func(rel, contents string) {
+		full := filepath.Join(root, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+		require.NoError(t, os.WriteFile(full, []byte(contents), 0o644))
+	}
+
+	writeFile("Cargo.toml", `
+[workspace]
+members = ["crates/*"]
+exclude = ["crates/legacy"]
+
+[workspace.dependencies]
+shared-evil = "1.0.0"
+`)
+	writeFile("crates/foo/Cargo.toml", `
+[package]
+name = "foo"
+
+[dependencies]
+foo-evil = "1.0.0"
+
+[build-dependencies]
+foo-build-evil = "=2.0.0"
+`)
+	writeFile("crates/bar/Cargo.toml", `
+[package]
+name = "bar"
+
+[dependencies]
+bar-git = { git = "https://evil.example/bar.git" }
+`)
+	writeFile("crates/legacy/Cargo.toml", `
+[package]
+name = "legacy"
+
+[dependencies]
+legacy-evil = "1.0.0"
+`)
+	// A glob match with no Cargo.toml must be skipped gracefully.
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "crates/notacrate"), 0o755))
+
+	exp := cargomanifest.New()
+	installs, err := exp.Expand(packagemanager.ManifestRef{
+		Path: filepath.Join(root, "Cargo.toml"),
+		Kind: packagemanager.ManifestKindCargoToml,
+	})
+	require.NoError(t, err)
+
+	// Workspace-shared dep (root [workspace.dependencies]); caret "1.0.0" → empty.
+	requireContains(t, installs, "shared-evil", "", false, false)
+	// Member deps across sections.
+	requireContains(t, installs, "foo-evil", "", false, false)
+	requireContains(t, installs, "foo-build-evil", "2.0.0", false, false)
+	requireContains(t, installs, "bar-git", "", false, true)
+	// Excluded member must not be walked.
+	requireNotContains(t, installs, "legacy-evil")
+}

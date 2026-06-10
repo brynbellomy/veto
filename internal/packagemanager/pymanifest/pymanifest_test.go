@@ -91,6 +91,218 @@ ruff = "0.4.4"
 	require.Equal(t, "0.4.4", byName["ruff"].Ref.Version)
 }
 
+// TestExpandPyProjectUvPdmAndDependencyGroups covers the dependency tables
+// that uv and pdm install from but pymanifest previously ignored: PEP 735
+// [dependency-groups], uv's legacy [tool.uv] dev-dependencies, and
+// [tool.pdm.dev-dependencies]. On a fresh checkout with no lockfile, a package
+// declared only in one of these sections would otherwise sail through
+// `uv sync` / `pdm install` ungated — a direct-dependency fail-open.
+func TestExpandPyProjectUvPdmAndDependencyGroups(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pyproject.toml")
+
+	contents := `
+[project]
+name = "demo"
+dependencies = ["requests"]
+
+[dependency-groups]
+dev = ["pytest>=7", "groups-evil==1.2.3", {include-group = "extra"}]
+extra = ["sphinx>=7"]
+
+[tool.uv]
+dev-dependencies = ["ruff==0.4.4", "uv-evil"]
+
+[tool.pdm.dev-dependencies]
+test = ["mypy>=1.0", "pdm-evil==9.9.9"]
+lint = ["flake8"]
+`
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o644))
+
+	exp := pymanifest.New()
+	installs, err := exp.Expand(packagemanager.ManifestRef{
+		Path: path,
+		Kind: packagemanager.ManifestKindPyProject,
+	})
+	require.NoError(t, err)
+
+	byName := make(map[string]packagemanager.Install, len(installs))
+	for _, ins := range installs {
+		require.Equal(t, intel.EcosystemPyPI, ins.Ref.Ecosystem)
+		require.NotEmpty(t, ins.Ref.Name, "include-group reference must not create a nameless install")
+		byName[ins.Ref.Name] = ins
+	}
+
+	// PEP 735 [dependency-groups]
+	require.Contains(t, byName, "pytest")
+	require.Contains(t, byName, "groups-evil")
+	require.Equal(t, "1.2.3", byName["groups-evil"].Ref.Version)
+	require.Contains(t, byName, "sphinx", "include-group reference still resolves the included group")
+
+	// uv legacy [tool.uv] dev-dependencies
+	require.Contains(t, byName, "ruff")
+	require.Equal(t, "0.4.4", byName["ruff"].Ref.Version)
+	require.Contains(t, byName, "uv-evil")
+
+	// [tool.pdm.dev-dependencies], all groups merged
+	require.Contains(t, byName, "mypy")
+	require.Contains(t, byName, "pdm-evil")
+	require.Equal(t, "9.9.9", byName["pdm-evil"].Ref.Version)
+	require.Contains(t, byName, "flake8")
+}
+
+// TestExpandPyProjectUvSourcesFlagRedirectedDeps ensures a dependency that
+// [tool.uv.sources] redirects to a git/url source is flagged OpaqueRemote, and
+// a path/workspace redirect is flagged LocalPath. Without this, uv fetches
+// arbitrary remote code for a dep that looks clean by name — laundering past
+// the gate's unconditional opaque-remote refusal. Over-gating multi-source
+// (marker-gated) deps to OpaqueRemote is the safe posture: veto can't evaluate
+// markers, so if any platform fetches remote code, refuse.
+func TestExpandPyProjectUvSourcesFlagRedirectedDeps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pyproject.toml")
+
+	contents := `
+[project]
+name = "demo"
+dependencies = [
+  "git-redirect",
+  "url-redirect",
+  "path-redirect",
+  "ws-redirect",
+  "index-redirect",
+  "multi-redirect",
+  "plain",
+]
+
+[dependency-groups]
+dev = ["dev-git-redirect"]
+
+[tool.uv.sources]
+git-redirect = { git = "https://evil.example/repo.git" }
+url-redirect = { url = "https://evil.example/pkg.whl" }
+path-redirect = { path = "../sibling" }
+ws-redirect = { workspace = true }
+index-redirect = { index = "my-index" }
+multi-redirect = [
+  { git = "https://evil.example/win.git", marker = "sys_platform == 'win32'" },
+  { index = "pypi" },
+]
+dev-git-redirect = { git = "https://evil.example/dev.git" }
+`
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o644))
+
+	exp := pymanifest.New()
+	installs, err := exp.Expand(packagemanager.ManifestRef{
+		Path: path,
+		Kind: packagemanager.ManifestKindPyProject,
+	})
+	require.NoError(t, err)
+
+	byName := make(map[string]packagemanager.Install, len(installs))
+	for _, ins := range installs {
+		byName[ins.Ref.Name] = ins
+	}
+
+	// git / url redirects → OpaqueRemote so the gate refuses the remote fetch.
+	require.True(t, byName["git-redirect"].OpaqueRemote, "git source must flag OpaqueRemote")
+	require.False(t, byName["git-redirect"].LocalPath)
+	require.True(t, byName["url-redirect"].OpaqueRemote, "url source must flag OpaqueRemote")
+
+	// path / workspace redirects → LocalPath (local code the user controls).
+	require.True(t, byName["path-redirect"].LocalPath, "path source must flag LocalPath")
+	require.False(t, byName["path-redirect"].OpaqueRemote)
+	require.True(t, byName["ws-redirect"].LocalPath, "workspace source must flag LocalPath")
+
+	// A named alternate index is still resolved from a registry by name — no flag.
+	require.False(t, byName["index-redirect"].OpaqueRemote)
+	require.False(t, byName["index-redirect"].LocalPath)
+
+	// Multi-source (marker-gated) with a git variant → over-gate to OpaqueRemote.
+	require.True(t, byName["multi-redirect"].OpaqueRemote, "multi-source with a git variant must flag OpaqueRemote")
+
+	// A dep with no source override keeps its clean record.
+	require.False(t, byName["plain"].OpaqueRemote)
+	require.False(t, byName["plain"].LocalPath)
+
+	// Source overrides apply across sections, not just [project] dependencies.
+	require.True(t, byName["dev-git-redirect"].OpaqueRemote, "source override must apply to dependency-groups deps too")
+}
+
+// TestExpandPyProjectUvWorkspaceMembers ensures that when the root pyproject
+// declares a [tool.uv.workspace], the deps of every (non-excluded) member are
+// gated too. `uv sync` at the root installs all member deps, so a member-only
+// malicious dep on a fresh checkout (no lockfile) is otherwise a
+// direct-dependency fail-open. Member [tool.uv.sources] redirects and
+// [dependency-groups] are honored; the `exclude` list is respected; a matched
+// directory without a pyproject.toml is skipped without error.
+func TestExpandPyProjectUvWorkspaceMembers(t *testing.T) {
+	root := t.TempDir()
+
+	writeFile := func(rel, contents string) {
+		full := filepath.Join(root, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+		require.NoError(t, os.WriteFile(full, []byte(contents), 0o644))
+	}
+
+	writeFile("pyproject.toml", `
+[project]
+name = "root"
+dependencies = ["root-dep"]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+exclude = ["packages/legacy"]
+`)
+	writeFile("packages/foo/pyproject.toml", `
+[project]
+name = "foo"
+dependencies = ["foo-evil==1.0.0"]
+
+[dependency-groups]
+dev = ["foo-dev-evil"]
+`)
+	writeFile("packages/bar/pyproject.toml", `
+[project]
+name = "bar"
+dependencies = ["bar-evil"]
+
+[tool.uv.sources]
+bar-evil = { git = "https://evil.example/bar.git" }
+`)
+	writeFile("packages/legacy/pyproject.toml", `
+[project]
+name = "legacy"
+dependencies = ["legacy-dep"]
+`)
+	// A glob match with no pyproject.toml must be skipped gracefully.
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "packages/notapkg"), 0o755))
+
+	exp := pymanifest.New()
+	installs, err := exp.Expand(packagemanager.ManifestRef{
+		Path: filepath.Join(root, "pyproject.toml"),
+		Kind: packagemanager.ManifestKindPyProject,
+	})
+	require.NoError(t, err)
+
+	byName := make(map[string]packagemanager.Install, len(installs))
+	for _, ins := range installs {
+		byName[ins.Ref.Name] = ins
+	}
+
+	require.Contains(t, byName, "root-dep")
+
+	// Member deps, dependency-groups, and source redirects are all gated.
+	require.Contains(t, byName, "foo-evil")
+	require.Equal(t, "1.0.0", byName["foo-evil"].Ref.Version)
+	require.Contains(t, byName, "foo-dev-evil")
+	require.Contains(t, byName, "bar-evil")
+	require.True(t, byName["bar-evil"].OpaqueRemote, "member [tool.uv.sources] git redirect must flag OpaqueRemote")
+
+	// Excluded members are not walked.
+	require.NotContains(t, byName, "legacy-dep", "excluded workspace member must not be gated")
+}
+
 func TestExpandMissingFileReturnsEmpty(t *testing.T) {
 	exp := pymanifest.New()
 	installs, err := exp.Expand(packagemanager.ManifestRef{

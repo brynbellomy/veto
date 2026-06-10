@@ -17,38 +17,59 @@ current user-facing behavior.
   `--package=<spec>` flag is honored and trailing positionals after
   the spec are not over-gated. Today these verbs go through
   `jsspec.ParseInstallArgs` which treats every positional as a spec.
-- Phase 1.6.5 partial: jsmanifest does NOT yet walk `workspaces`
-  glob patterns recursively. The lockfile expanders pick up
-  workspace-member deps in practice (the resolver writes them
-  through), but the manifest path on a fresh-checkout monorepo
-  misses them.
+- Phase 1.6.5 (done): jsmanifest now walks `package.json` `workspaces` (both
+  the array form and the `{ "packages": [...] }` object form), reading each
+  member's package.json so a fresh-checkout monorepo no longer misses member
+  deps. Members are discovered from the root only (no recursion); negation
+  patterns are not interpreted (over-including a member is the safe posture).
+  Remaining: pnpm declares workspaces in `pnpm-workspace.yaml` (and historically
+  as `{"include": [...]}` inside `package.json`). Neither shape is parsed —
+  pnpm's lockfile expander already covers member deps on a populated repo, so
+  the gap is fresh-checkout-only.
 - Phase 1.6 followup: gate `jsspec.tryParseAlias` on
   `isLegalNpmName(name)` so `user/repo@npm:evil@1` is treated as
   github-shorthand (OpaqueRemote) rather than alias-unwrapped to
   `evil`. Minor precedence quirk; no known exploit path in argv.
-- Phase 1.7.3 deferred: pip and uv resolver prescans should forward
-  user-supplied `--index-url`, `--extra-index-url`, `--find-links`,
-  `--keyring-provider`, `--override`, `--prerelease`, `--resolution`,
-  `--python` flags so private-index installs prescan correctly, and
-  should strip `--no-deps` / `--no-build-isolation` so the dry-run
-  sees the full transitive set the real install will pull. Today
-  the prescan synthesizes a fixed argv and silently misses these.
-- Phase 1.7.4 deferred: `uv add` / `uv install` against a missing or
-  stale lockfile should fall through to ResolverPreScan (synthesize
-  a requirements input, run `uv pip compile`) instead of gating the
-  pre-existing — now incomplete — lockfile. Real fail-OPEN against
-  `uv add <new-malware>`.
-- Phase 1.7.5 partial: pymanifest does NOT yet read
-  `[tool.uv] dependencies / dev-dependencies / workspace.members`
-  or `[tool.pdm.dev-dependencies]`. uv/pdm projects fall back to
-  the lockfile path (covered) but a fresh checkout with no lockfile
-  yet would miss these direct deps.
-- Phase 1.8.2 deferred: cargo coverage still needs `publish` in
+- Phase 1.7.3 (uv side done): the uv `pip compile` prescan now forwards the
+  user's resolver-affecting flags (`--index`, `--default-index`, `--index-url`/
+  `-i`, `--extra-index-url`, `--find-links`/`-f`, `--index-strategy`,
+  `--keyring-provider`, `--prerelease`, `--resolution`, `--python`/`-p`) via
+  `forwardResolverFlags`, so private-index installs prescan instead of aborting.
+  pip's prescan already forwards these because it reuses the original argv. The
+  original `--override` item is uv-only and not yet in the allowlist (add if a
+  real use surfaces). NOTE: the earlier "strip `--no-deps` / `--no-build-isolation`"
+  idea was dropped as a bug — with `--no-deps` the real install pulls NO
+  transitives, so stripping it would over-block deps that never get fetched, and
+  `--no-build-isolation` is inert under the forced `--only-binary=:all:`.
+- Phase 1.7.4 (done for explicit specs): `uv add` / `uv install` now fall
+  through to ResolverPreScan — `addPreScan` compiles the seeded `pyproject.toml`
+  plus a synthetic input for the newly-named specs (`uv pip compile pyproject.toml
+  veto-uv-requirements.in --format pylock.toml --only-binary :all:`), so the new
+  package's transitive tree is gated before the install runs instead of relying
+  on the now-stale (or absent) `uv.lock`. Remaining: `uv add -r requirements.txt`
+  (no positional spec) still falls back to requirements-file expansion without a
+  transitive probe; project-level `uv sync` continues to rely on the locked tree.
+- Phase 1.7.5 (dev-deps + PEP 735 done): pymanifest now walks PEP 735
+  `[dependency-groups]`, uv's legacy `[tool.uv] dev-dependencies`, and
+  `[tool.pdm.dev-dependencies]`, closing the direct-dependency fail-open
+  where a package declared only in those sections sailed through
+  `uv sync` / `pdm install` on a fresh checkout (no lockfile). pymanifest
+  also now reads `[tool.uv.sources]` and flags a declared dep redirected to a
+  git/url source as OpaqueRemote (path/workspace → LocalPath), so a source
+  redirect can't launder a remote-code fetch past the gate's unconditional
+  opaque-remote refusal. pymanifest also walks `[tool.uv.workspace]` members
+  now: each member's pyproject.toml (deps, groups, dev-deps, and its own
+  `[tool.uv.sources]`) is gated because `uv sync` at the root installs every
+  member's deps. `exclude` is honored; glob matches without a pyproject.toml
+  are skipped. (Member-transitive coverage on a fresh checkout still depends on
+  a future `uv sync` resolver prescan — see below.)
+- Phase 1.8.2 partial: `[workspace]` members expansion for monorepo Cargo.toml
+  roots is now done — cargomanifest walks each member crate's Cargo.toml
+  (explicit members only; `exclude` honored). Still remaining: `publish` in
   ParseInstalls (it fetches + builds); `doc`, `package` added to
-  ProjectPreflight (they run build.rs / proc-macros);
+  ProjectPreflight (they run build.rs / proc-macros); and a
   `cargomanifest` registry classifier (non-crates-io `registry = ...`
-  should be OpaqueRemote, mirroring cargolock); and `[workspace]`
-  members expansion for monorepo Cargo.toml roots.
+  should be OpaqueRemote, mirroring cargolock).
 - SHIPPED: `cargo install --git` / `cargo add --git` clone-and-scan
   (`cmd/veto/opaquegit.go` + `cargo.OpaqueRemoteResolver`). Clones to a temp
   dir, regenerates the lockfile (mirrors cargo's resolution; honors
