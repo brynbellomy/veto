@@ -452,6 +452,27 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 			return exitRefused
 		}
 	}
+
+	// Hades / Shai-Hulud .pth startup-hook worm layers. The intel gate
+	// above cannot see this worm — it rides a trusted name and keeps
+	// package metadata clean — so for Python-family installs we apply
+	// the same two content heuristics before letting the real package
+	// manager run.
+	if isPythonFamily(pm.Ecosystem()) {
+		// (a) Wheel prescan: fetch the wheels about to be installed
+		// (Task 8) and inspect each .pth they would drop. Catches a
+		// freshly-resolved/compromised version that is not yet in any
+		// intel feed. Wired below; Task 8 fills the body.
+		if pthWheelPreflight(logger, os.Stderr, cfg, installs, preScanInstalls) {
+			return exitRefused
+		}
+		// (b) Existing-tree scan: site.py loads every .pth at every
+		// `python` startup, so a worm already in the target venv would
+		// detonate before this install completes. Scan it.
+		if runPthPreflightIfPythonFamily(logger, pm, pmArgs) {
+			return exitRefused
+		}
+	}
 	return execPMOrPythonM(cfg, pmName, pmArgs)
 }
 
