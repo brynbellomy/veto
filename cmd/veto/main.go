@@ -768,7 +768,11 @@ func runResolverPreScan(
 	}
 	if err != nil {
 		logger.Debug().Str("pm", pmName).Str("output", truncateForError(string(out), 800)).Msg("resolver pre-scan command output")
-		return nil, errors.With(err, "resolver pre-scan command failed").Set("pm", pmName)
+		werr := errors.With(err, "resolver pre-scan command failed").Set("pm", pmName)
+		if detail := pmErrorSummary(string(out)); detail != "" {
+			werr = errors.With(werr, detail)
+		}
+		return nil, werr
 	}
 
 	var installs []packagemanager.Install
@@ -802,6 +806,33 @@ func runResolverPreScan(
 	}
 	logger.Debug().Str("pm", pmName).Int("installs", len(installs)).Msg("resolver pre-scan produced install records")
 	return installs, nil
+}
+
+// pmErrorSummary distills a package manager's combined output down to the
+// lines that explain a failure, so the fail-closed abort message names the
+// real cause (e.g. npm's ESHRINKWRAPGLOBAL) instead of hiding it behind
+// debug-only logging. Returns "" when no error-shaped lines are present.
+func pmErrorSummary(out string) string {
+	var lines []string
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		lower := strings.ToLower(ln)
+		if !strings.Contains(lower, "error") && !strings.Contains(lower, "err!") {
+			continue
+		}
+		// The log-file pointer is noise, not a cause.
+		if strings.Contains(lower, "complete log of this run") {
+			continue
+		}
+		lines = append(lines, ln)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return truncateForError(strings.Join(lines, "; "), 400)
 }
 
 func unresolvedPreScanInstalls(want, got []packagemanager.Install) []string {
