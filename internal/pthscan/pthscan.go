@@ -14,6 +14,7 @@
 package pthscan
 
 import (
+	"regexp"
 	"strings"
 )
 
@@ -107,9 +108,12 @@ func Inspect(in Input) Verdict {
 	}
 
 	for _, line := range executableLines(content) {
+		if matchesKnownLegit(line.body) {
+			continue
+		}
 		signals = append(signals, Signal{
 			Code:    "pth-executable-line",
-			Detail:  "executable `import …` line in a .pth file — site.py exec()'s these at every interpreter startup.",
+			Detail:  "executable `import …` line in a .pth file with no payload tokens, but not on the known-legit allowlist — site.py exec()'s these at every interpreter startup.",
 			Excerpt: excerpt(line.body),
 		})
 		bump(SeverityMedium)
@@ -163,6 +167,45 @@ func excerpt(line string) string {
 		flat = flat[:maxExcerpt] + "…"
 	}
 	return flat
+}
+
+// knownLegitLines is the anchored allowlist of executable .pth line shapes
+// real Python tooling produces. Each entry is a whole-line regex (after the
+// leading whitespace is stripped); a worm that *also* names __editable__ or
+// _distutils_hack does NOT match because the regex anchors `^` and `$` and
+// covers the entire legitimate body, not a substring.
+var knownLegitLines = []*regexp.Regexp{
+	// setuptools' distutils-precedence shim. Distros ship variants; the
+	// pattern is "import os; <hack-import>".
+	regexp.MustCompile(`^import\s+os\s*;\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*os\.environ\.get\(.+?\)\s*;\s*)?__import__\(\s*['"]_distutils_hack['"]\s*\)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\(\s*\))?\s*$`),
+
+	// PEP 660 editable installs — pip writes __editable___<name>_finder.py
+	// plus a one-line .pth that imports and installs the finder.
+	regexp.MustCompile(`^import\s+__editable___[A-Za-z0-9_]+_finder\s*;\s*__editable___[A-Za-z0-9_]+_finder\.install\(\s*\)\s*$`),
+	regexp.MustCompile(`^from\s+__editable___[A-Za-z0-9_]+(?:_finder)?\s+import\s+[A-Za-z_][A-Za-z0-9_]*\s*$`),
+	regexp.MustCompile(`^import\s+__editable___[A-Za-z0-9_]+_finder\s*;\s*MapPathFinder\.install\(\s*\)\s*$`),
+
+	// Legacy easy-install.pth path-munge.
+	regexp.MustCompile(`^import\s+sys\s*;\s*sys\.__plen\s*=\s*len\(sys\.path\)\s*$`),
+	regexp.MustCompile(`^import\s+sys\s*;\s*sys\.__egginsert\s*=\s*0\s*$`),
+}
+
+// allowlistedFileName reports whether the .pth's base name is one whose
+// known-legit body is allowed by the regex pack above. We don't require this
+// — the body regex is the load-bearing check — but a non-matching body that
+// nevertheless rides one of these well-known names still gets flagged.
+var allowlistedLegitName = regexp.MustCompile(`^(?:distutils-precedence\.pth|__editable__[._-][A-Za-z0-9_.-]+\.pth|easy-install\.pth)$`)
+
+// matchesKnownLegit reports whether trimmed (a single .pth executable line
+// with leading whitespace already removed and no trailing newline) matches
+// any whole-line legit pattern.
+func matchesKnownLegit(trimmed string) bool {
+	for _, re := range knownLegitLines {
+		if re.MatchString(trimmed) {
+			return true
+		}
+	}
+	return false
 }
 
 func severityRank(s Severity) int {
