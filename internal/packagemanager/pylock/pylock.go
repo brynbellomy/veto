@@ -58,13 +58,28 @@ type packageEntry struct {
 }
 
 // packageSource models the per-package source block. uv.lock emits
-// `source.editable = true` for workspace-member entries and
-// `source.virtual = true` for venv-only synthetic entries; gating
-// those against PyPI is a false positive risk (the name might collide
-// with a real malicious package on PyPI). Skip them at parse time.
+// `source.editable = "<dir>"` for workspace-member entries and
+// `source.virtual = "<dir>"` for venv-only synthetic entries (the value
+// is the member's directory path); gating those against PyPI is a false
+// positive risk (the name might collide with a real malicious package
+// on PyPI). Skip them at parse time. Decoded as `any` because other
+// emitters use a boolean flag for the same keys.
 type packageSource struct {
-	Editable bool `toml:"editable"`
-	Virtual  bool `toml:"virtual"`
+	Editable any `toml:"editable"`
+	Virtual  any `toml:"virtual"`
+}
+
+// local reports whether an editable/virtual marker is set, accepting
+// both uv.lock's string-path form and the boolean-flag form.
+func local(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		return true
+	default:
+		return false
+	}
 }
 
 func expand(path string) ([]packagemanager.Install, error) {
@@ -87,7 +102,7 @@ func expand(path string) ([]packagemanager.Install, error) {
 			continue
 		}
 		// Phase 1.7: skip editable/virtual workspace-member entries.
-		if p.Source != nil && (p.Source.Editable || p.Source.Virtual) {
+		if p.Source != nil && (local(p.Source.Editable) || local(p.Source.Virtual)) {
 			continue
 		}
 		out = append(out, packagemanager.Install{

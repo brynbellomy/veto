@@ -75,6 +75,43 @@ version = "2.0.7"
 	requireContains(t, out, "urllib3", "2.0.7")
 }
 
+// TestExpand_EditableAndVirtualEntriesSkipped: uv.lock marks workspace
+// members with `source.editable = "<dir>"` (a path string, not a bool);
+// other emitters use a boolean flag. Both forms must parse and be
+// excluded from gating.
+func TestExpand_EditableAndVirtualEntriesSkipped(t *testing.T) {
+	const body = `version = 1
+
+[[package]]
+name = "my-workspace-pkg"
+version = "1.1.0"
+source = { editable = "." }
+
+[[package]]
+name = "my-virtual-pkg"
+version = "0.1.0"
+source = { virtual = "packages/sub" }
+
+[[package]]
+name = "my-bool-editable-pkg"
+version = "0.2.0"
+source = { editable = true }
+
+[[package]]
+name = "requests"
+version = "2.31.0"
+source = { registry = "https://pypi.org/simple" }
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "uv.lock")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+
+	out, err := pylock.New().Expand(packagemanager.ManifestRef{Path: path, Kind: packagemanager.ManifestKindUvLock})
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	requireContains(t, out, "requests", "2.31.0")
+}
+
 // TestExpand_MissingFile_ReturnsNilNil: PMs emit lock refs speculatively,
 // so missing files must not error.
 func TestExpand_MissingFile_ReturnsNilNil(t *testing.T) {
