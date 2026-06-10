@@ -108,7 +108,7 @@ func (s *Scanner) Scan(ctx context.Context) scan.Result {
 // insideSitePackagesPath reports whether path lies inside a site-packages
 // or dist-packages directory anywhere along its ancestry.
 func insideSitePackagesPath(path string) bool {
-	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+	for seg := range strings.SplitSeq(filepath.ToSlash(path), "/") {
 		if seg == "site-packages" || seg == "dist-packages" {
 			return true
 		}

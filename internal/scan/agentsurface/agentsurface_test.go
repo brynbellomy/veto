@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -85,17 +86,8 @@ func TestScannerSurfacesHadesHostArtifacts(t *testing.T) {
 	for _, f := range res.Findings {
 		titles = append(titles, f.Title)
 	}
-	require.True(t, containsString(titles, "Hades / Shai-Hulud .pth worm host artifact present"),
+	require.True(t, slices.Contains(titles, "Hades / Shai-Hulud .pth worm host artifact present"),
 		"missing Hades host-artifact finding; got %v", titles)
-}
-
-func containsString(s []string, want string) bool {
-	for _, x := range s {
-		if x == want {
-			return true
-		}
-	}
-	return false
 }
 
 func TestScannerFindsHadesWorkflowExfil(t *testing.T) {
@@ -116,7 +108,7 @@ jobs:
 	for _, f := range res.Findings {
 		titles = append(titles, f.Title)
 	}
-	require.True(t, containsString(titles, "GitHub Actions workflow posts secrets to an external webhook (Hades exfil shape)"),
+	require.True(t, slices.Contains(titles, "GitHub Actions workflow posts secrets to an external webhook (Hades exfil shape)"),
 		"missing exfil finding; got %v", titles)
 }
 
@@ -129,7 +121,7 @@ func TestScannerFindsHadesAttackerDirNaming(t *testing.T) {
 	for _, f := range res.Findings {
 		titles = append(titles, f.Title)
 	}
-	require.True(t, containsString(titles, "Project directory name matches Hades / Shai-Hulud attacker naming"))
+	require.True(t, slices.Contains(titles, "Project directory name matches Hades / Shai-Hulud attacker naming"))
 }
 
 func TestScannerFlagsCustomizeInSitePackages(t *testing.T) {
@@ -143,5 +135,5 @@ func TestScannerFlagsCustomizeInSitePackages(t *testing.T) {
 	for _, f := range res.Findings {
 		titles = append(titles, f.Title)
 	}
-	require.True(t, containsString(titles, "Python sitecustomize.py present inside site-packages"))
+	require.True(t, slices.Contains(titles, "Python sitecustomize.py present inside site-packages"))
 }

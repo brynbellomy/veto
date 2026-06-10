@@ -155,11 +155,7 @@ func executableLines(content string) []executableLine {
 		if i < len(content) && content[i] != '\n' {
 			continue
 		}
-		raw := content[start:i]
-		line := raw
-		if strings.HasSuffix(line, "\r") {
-			line = line[:len(line)-1]
-		}
+		line := strings.TrimSuffix(content[start:i], "\r")
 		trimmed := strings.TrimLeft(line, " \t")
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			start = i + 1

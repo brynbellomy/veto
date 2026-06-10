@@ -1,7 +1,6 @@
 package pthscan_test
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -61,12 +60,6 @@ func TestInspectIgnoresLeadingWhitespace(t *testing.T) {
 func TestInspectIgnoresCommentLines(t *testing.T) {
 	v := pthscan.Inspect(pthscan.Input{PthContent: []byte("# import a\n# not executable\n")})
 	require.False(t, v.Flagged())
-}
-
-// Used by later tasks. Centralised here so subsequent tests can rely on it.
-func mustContain(t *testing.T, hay, needle string) {
-	t.Helper()
-	require.True(t, strings.Contains(hay, needle), "expected %q in %q", needle, hay)
 }
 
 func TestInspectAllowsDistutilsPrecedence(t *testing.T) {

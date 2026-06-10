@@ -226,14 +226,8 @@ func snippet(content []byte, re *regexp.Regexp, limit int) string {
 	if loc == nil {
 		return ""
 	}
-	start := loc[0] - limit/4
-	if start < 0 {
-		start = 0
-	}
-	end := start + limit
-	if end > len(content) {
-		end = len(content)
-	}
+	start := max(loc[0]-limit/4, 0)
+	end := min(start+limit, len(content))
 	frag := strings.Join(strings.Fields(string(content[start:end])), " ")
 	if len(frag) > limit {
 		frag = frag[:limit] + "…"

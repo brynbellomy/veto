@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -40,7 +41,7 @@ func TestScannerFindsWormInVenv(t *testing.T) {
 	for _, e := range f.Evidence {
 		ev = append(ev, e.Label)
 	}
-	require.True(t, contains(ev, "pth-payload-network"), "missing network evidence; got %v", ev)
+	require.True(t, slices.Contains(ev, "pth-payload-network"), "missing network evidence; got %v", ev)
 }
 
 func TestScannerIgnoresLegitDistutilsPrecedence(t *testing.T) {
@@ -84,13 +85,4 @@ func TestScannerRespectsContextCancellation(t *testing.T) {
 	cancel()
 	res := pth.New(pth.Options{Roots: []string{root}}).Scan(ctx)
 	require.NotEmpty(t, res.Errors)
-}
-
-func contains(s []string, want string) bool {
-	for _, x := range s {
-		if x == want {
-			return true
-		}
-	}
-	return false
 }
