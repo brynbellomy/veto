@@ -27,7 +27,7 @@ func TestPMNamesHeaderUpToDate(t *testing.T) {
 	pkgDir, err := os.Getwd()
 	require.NoError(t, err)
 	repoRoot := filepath.Clean(filepath.Join(pkgDir, "..", "..", ".."))
-	headerOnDisk := filepath.Join(repoRoot, "internal", "interposer", "pm_names.h")
+	headerOnDisk := filepath.Join(repoRoot, "internal", "interposer", "csrc", "pm_names.h")
 
 	tmpDir := t.TempDir()
 	tmpHeader := filepath.Join(tmpDir, "pm_names.h")
