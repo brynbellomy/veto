@@ -18,6 +18,7 @@ import (
 	"github.com/brynbellomy/veto/internal/scan/cache"
 	"github.com/brynbellomy/veto/internal/scan/gyp"
 	"github.com/brynbellomy/veto/internal/scan/project"
+	"github.com/brynbellomy/veto/internal/scan/pth"
 )
 
 type scanOpts struct {
@@ -153,6 +154,12 @@ func runScanWithOpts(logger zerolog.Logger, cfg config, opts scanOpts) int {
 		// catch installed phantom-gyp / Miasma worms the name+version feeds
 		// cannot see.
 		results = append(results, gyp.New(gyp.Options{Roots: roots}).Scan(ctx))
+		// The pth scanner is a content heuristic for the Hades / Shai-Hulud
+		// PyPI worm. Like the gyp scanner above it runs alongside the project
+		// scanner without needing the intel store: site.py loads .pth files
+		// from site-packages at every interpreter startup, so a worm there
+		// detonates before any intel lookup could see it.
+		results = append(results, pth.New(pth.Options{Roots: roots}).Scan(ctx))
 	}
 	cacheRootEntries := cache.DefaultRootEntries(home)
 	cacheRoots := cachePaths(cacheRootEntries)
