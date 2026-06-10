@@ -111,10 +111,24 @@ func Inspect(in Input) Verdict {
 		if matchesKnownLegit(line.body) {
 			continue
 		}
+		if payload := scanPayloadSignals(line.body); len(payload) > 0 {
+			signals = append(signals, payload...)
+			bump(SeverityCritical)
+			continue
+		}
 		signals = append(signals, Signal{
 			Code:    "pth-executable-line",
 			Detail:  "executable `import …` line in a .pth file with no payload tokens, but not on the known-legit allowlist — site.py exec()'s these at every interpreter startup.",
 			Excerpt: excerpt(line.body),
+		})
+		bump(SeverityMedium)
+	}
+
+	if in.FileName != "" && fileNameSetupRe.MatchString(in.FileName) && !allowlistedLegitName.MatchString(in.FileName) {
+		signals = append(signals, Signal{
+			Code:    "pth-setup-filename",
+			Detail:  ".pth filename matches the Hades `*-setup.pth` worm shape — legitimate Python tooling does not ship `-setup.pth` files; the canonical names are distutils-precedence.pth, __editable__.<name>-<ver>.pth, or per-package <name>.pth without a `-setup` suffix.",
+			Excerpt: in.FileName,
 		})
 		bump(SeverityMedium)
 	}
@@ -167,6 +181,70 @@ func excerpt(line string) string {
 		flat = flat[:maxExcerpt] + "…"
 	}
 	return flat
+}
+
+// payloadGroups partitions the Hades payload vocabulary by the *kind* of
+// risk so the finding's evidence can name which capability the worm used.
+// Group order matters only for diagnostic readability; the first matching
+// group wins per signal so the report points at the most specific lens.
+var payloadGroups = []struct {
+	code  string
+	label string
+	re    *regexp.Regexp
+}{
+	{
+		code:  "pth-payload-network",
+		label: "uses network calls (urllib, requests, socket, http.client, ftplib) — startup-time outbound fetch is the Hades infection pattern.",
+		re:    regexp.MustCompile(`\b(?:urllib(?:\.request)?|urlopen|urlretrieve|requests|socket|http\.client|httplib|ftplib)\b`),
+	},
+	{
+		code:  "pth-payload-spawn",
+		label: "spawns a process (subprocess, os.system/popen, pty.spawn, os.exec*) at interpreter startup.",
+		re:    regexp.MustCompile(`\b(?:subprocess|os\.system|os\.popen|popen|pty\.spawn|os\.exec[a-z]*)\b`),
+	},
+	{
+		code:  "pth-payload-dynamic-exec",
+		label: "evaluates code dynamically (exec/eval/compile/__import__ on a computed string).",
+		re:    regexp.MustCompile(`\b(?:exec\(|eval\(|compile\(|__import__\()`),
+	},
+	{
+		code:  "pth-payload-deobfuscation",
+		label: "decodes or unpacks an embedded blob (base64, marshal, codecs.decode, hex/lzma/zlib) — startup-time decoders are the Hades obfuscation tell.",
+		re:    regexp.MustCompile(`\b(?:b64decode|base64|marshal\.loads|codecs\.decode|bytes\.fromhex|zlib\.decompress|lzma)\b|\.decode\(\s*['"]hex['"]\s*\)|(?:\\x[0-9A-Fa-f]{2}){8,}`),
+	},
+	{
+		code:  "pth-payload-runtime-fetch",
+		label: "names an external runtime / fetcher (bun, bunx, curl, wget, node, deno) — startup-time downloader for a second-stage payload.",
+		re:    regexp.MustCompile(`\b(?:bun|bunx|curl|wget|node|deno)\b`),
+	},
+	{
+		code:  "pth-payload-worm-marker",
+		label: "carries a Hades / Shai-Hulud worm marker string.",
+		re:    regexp.MustCompile(`\.bun_ran\b|_index\.js\b|\bHades\b|shai-hulud|stygian|tartarean`),
+	},
+}
+
+// fileNameSetupRe matches the `*-setup.pth` shape Hades-style wheels drop —
+// a filename signal independent of body content. Real PyPI ecosystems are
+// not known to ship `<name>-setup.pth`; the convention is `distutils-precedence.pth`,
+// `__editable__.<name>-<ver>.pth`, `easy-install.pth`, or per-package names
+// without a `-setup` suffix.
+var fileNameSetupRe = regexp.MustCompile(`(?i)[-_]setup\.pth$`)
+
+// scanPayloadSignals returns the per-group critical signals firing on body
+// (an executable line with its leading whitespace already removed).
+func scanPayloadSignals(body string) []Signal {
+	var out []Signal
+	for _, g := range payloadGroups {
+		if g.re.MatchString(body) {
+			out = append(out, Signal{
+				Code:    g.code,
+				Detail:  g.label,
+				Excerpt: excerpt(body),
+			})
+		}
+	}
+	return out
 }
 
 // knownLegitLines is the anchored allowlist of executable .pth line shapes
