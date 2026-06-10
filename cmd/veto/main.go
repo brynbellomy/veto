@@ -35,6 +35,7 @@ import (
 	"github.com/brynbellomy/veto/internal/intel/sources/gemnasium"
 	"github.com/brynbellomy/veto/internal/intel/sources/ghsa"
 	"github.com/brynbellomy/veto/internal/intel/sources/govulndb"
+	"github.com/brynbellomy/veto/internal/intel/sources/hades"
 	"github.com/brynbellomy/veto/internal/intel/sources/openssf"
 	"github.com/brynbellomy/veto/internal/intel/sources/osv"
 	"github.com/brynbellomy/veto/internal/intel/sources/pypa"
@@ -1268,7 +1269,7 @@ func loadConfig() (config, error) {
 	v.SetEnvPrefix("VETO")
 	v.AutomaticEnv()
 	v.SetDefault("cache_dir", defaultCacheDir())
-	v.SetDefault("sources", []string{"aikido", "datadog", "openssf", "osv", "pypa"})
+	v.SetDefault("sources", []string{"aikido", "datadog", "openssf", "osv", "pypa", "hades"})
 	// IOC feeds (abuse.ch, MISP, ...) are all opt-in and land in Wave 4. The
 	// default is empty so the IOC subsystem costs nothing until a feed is
 	// explicitly enabled via ioc_sources / VETO_IOC_SOURCES.
@@ -1364,6 +1365,8 @@ func buildSource(logger zerolog.Logger, cfg config, id string) (intel.Source, er
 			CacheDir: filepath.Join(cfg.CacheDir, "gemnasium"),
 			Logger:   logger,
 		})
+	case "hades":
+		return hades.New(), nil
 	default:
 		return nil, errors.WithNew("unknown source").Set("id", id)
 	}
