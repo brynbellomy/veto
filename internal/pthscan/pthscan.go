@@ -1,0 +1,180 @@
+// Package pthscan is a content heuristic for the Hades / Shai-Hulud PyPI
+// supply-chain worm (June 2026), the Python branch of the same Miasma
+// lineage gypscan fights on npm. The worm ships its payload as a `*-setup.pth`
+// file inside a wheel; Python's `site` module evaluates every `*.pth` whose
+// first token is `import` at each interpreter startup, so the file detonates
+// on the next `python` invocation in a poisoned environment — every time, not
+// just at install.
+//
+// pthscan reads a single `.pth` file's bytes and classifies it as benign,
+// structurally anomalous, or worm-shaped. It performs no I/O, runs no
+// Python, and never executes the file. Callers (the scan walker, the
+// wheel prescan, the Claude Code hook) own the bytes and turn a Verdict
+// into their own finding/refusal type.
+package pthscan
+
+import (
+	"strings"
+)
+
+// Severity ranks how confident pthscan is that a .pth is malicious.
+type Severity string
+
+const (
+	// SeverityNone: only inert path lines, or an executable line matching
+	// the tightly-anchored known-legit allowlist (distutils-precedence,
+	// PEP 660 __editable__*, legacy easy-install).
+	SeverityNone Severity = "none"
+
+	// SeverityMedium: an executable .pth line that is neither obviously
+	// payload-shaped nor on the allowlist — a structural anomaly worth
+	// surfacing in `veto scan`, not on its own enough to block the
+	// install hot path.
+	SeverityMedium Severity = "medium"
+
+	// SeverityCritical: a confirmed startup-time code-execution payload —
+	// an `import`-line carrying network / spawn / dynamic-exec /
+	// deobfuscation / runtime-fetch / worm-marker tokens. This is the
+	// Hades / Shai-Hulud signature. Do not install; do not run python in
+	// this environment.
+	SeverityCritical Severity = "critical"
+)
+
+// Signal is one matched heuristic.
+type Signal struct {
+	Code    string
+	Detail  string
+	Excerpt string
+}
+
+// Verdict is the result of inspecting one .pth file.
+type Verdict struct {
+	Severity Severity
+	Signals  []Signal
+}
+
+// Flagged reports whether the .pth is suspicious enough to surface or block.
+func (v Verdict) Flagged() bool {
+	return v.Severity == SeverityMedium || v.Severity == SeverityCritical
+}
+
+// Input is everything pthscan needs to classify one .pth.
+type Input struct {
+	// PthContent is the raw bytes of the .pth file. Required.
+	PthContent []byte
+
+	// FileName is the base name (e.g. "evil-setup.pth"). Optional but
+	// recommended: a `*-setup.pth` name is a worm marker on its own.
+	FileName string
+
+	// SiblingFiles is a flat list of base names alongside the .pth in
+	// the same dist. Optional; currently unused but reserved for future
+	// "is this distribution shipping anything else?" heuristics.
+	SiblingFiles []string
+
+	// Truncated indicates the caller hit its size cap and PthContent
+	// holds only a prefix. pthscan treats a truncated .pth as critical
+	// (fail-closed: a worm can hide past the cap).
+	Truncated bool
+}
+
+const maxExcerpt = 200
+
+// Inspect classifies a single .pth file. It never errors: an empty .pth
+// yields SeverityNone (Python ignores blank files), and every positive
+// signal is additive. Inspect is pure and safe for concurrent use.
+func Inspect(in Input) Verdict {
+	if in.Truncated {
+		return Verdict{
+			Severity: SeverityCritical,
+			Signals: []Signal{{
+				Code:   "pth-file-too-large",
+				Detail: ".pth file exceeded the scanner size cap and cannot be fully inspected; treating as unscannable so payloads cannot hide after the read cap.",
+			}},
+		}
+	}
+	content := string(in.PthContent)
+	if strings.TrimSpace(content) == "" {
+		return Verdict{Severity: SeverityNone}
+	}
+
+	var signals []Signal
+	severity := SeverityNone
+	bump := func(s Severity) {
+		if severityRank(s) > severityRank(severity) {
+			severity = s
+		}
+	}
+
+	for _, line := range executableLines(content) {
+		signals = append(signals, Signal{
+			Code:    "pth-executable-line",
+			Detail:  "executable `import …` line in a .pth file — site.py exec()'s these at every interpreter startup.",
+			Excerpt: excerpt(line.body),
+		})
+		bump(SeverityMedium)
+	}
+
+	return Verdict{Severity: severity, Signals: signals}
+}
+
+// executableLine carries an executable .pth line's body (everything after
+// the leading whitespace) plus its 0-based offset in the original content,
+// so excerpt rendering and tests can point at exact bytes.
+type executableLine struct {
+	body   string
+	offset int
+}
+
+// executableLines walks the .pth using Python's site.py rule: a line is
+// executable iff its first non-whitespace token is `import` (case-sensitive,
+// matching CPython). Blank lines and lines whose first non-whitespace
+// character is `#` are inert. All other lines are inert path entries.
+func executableLines(content string) []executableLine {
+	var out []executableLine
+	start := 0
+	for i := 0; i <= len(content); i++ {
+		if i < len(content) && content[i] != '\n' {
+			continue
+		}
+		raw := content[start:i]
+		line := raw
+		if strings.HasSuffix(line, "\r") {
+			line = line[:len(line)-1]
+		}
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			start = i + 1
+			continue
+		}
+		// Python checks for `import` as the first token; tolerate either
+		// `import x` or `import(x)` (the latter is unusual but still parsed).
+		if strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "import(") || trimmed == "import" {
+			out = append(out, executableLine{body: trimmed, offset: start + (len(line) - len(trimmed))})
+		}
+		start = i + 1
+	}
+	return out
+}
+
+func excerpt(line string) string {
+	flat := strings.Join(strings.Fields(line), " ")
+	if len(flat) > maxExcerpt {
+		flat = flat[:maxExcerpt] + "…"
+	}
+	return flat
+}
+
+func severityRank(s Severity) int {
+	switch s {
+	case SeverityCritical:
+		return 3
+	case SeverityMedium:
+		return 2
+	case SeverityNone:
+		return 1
+	default:
+		return 0
+	}
+}
+
