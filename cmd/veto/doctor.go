@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
 )
 
 // status is the per-check outcome. PASS = green; WARN = yellow; FAIL =
@@ -41,6 +43,13 @@ const (
 	statusPass status = iota
 	statusWarn
 	statusFail
+	// statusNotApplicable is a presentation-only fourth value: it renders
+	// as a cyan `[N/A]` marker, never emits a how-to-fix arrow, and is
+	// counted as a "pass" by the summary (it does NOT bump warnings or
+	// failures). Use it for per-PM survey lines where the PM is simply
+	// not installed on this host — the absence of an install is not a
+	// finding, just the answer to "is there anything to wrap here?"
+	statusNotApplicable
 )
 
 // checkResult is one row in the doctor's output table.
@@ -84,6 +93,9 @@ func runDoctor(logger zerolog.Logger, cfg config, args []string) int {
 			failures++
 		case statusWarn:
 			warnings++
+			// statusPass and statusNotApplicable both roll into
+			// "passed" — the latter is presentation-only (a PM not
+			// installed on this host is not a finding).
 		}
 	}
 	fmt.Fprintf(os.Stdout, "\nSummary: %d passed, %d warnings, %d failures\n",
@@ -667,15 +679,42 @@ func checkInterposer() []checkResult {
 	return out
 }
 
-// checkWrappers validates the Layer 4 real-binary wrappers. The state
-// file lists every wrap we've installed; for each one we confirm the
-// path is still a veto symlink and the .veto-original sibling is
-// still present and executable. Drift (brew upgrade replaced our
-// symlink) is FAIL — the path now executes unguarded.
+// checkWrappers validates the Layer 4 real-binary wrappers as a per-PM
+// survey of the actual host, not an all-or-nothing summary line. The
+// flow has three phases:
 //
-// If no state file exists at all we emit a single WARN line, since
-// Layer 4 is opt-in: a user running with just Layers 1-3 is in a valid
-// configuration, just not the strongest one.
+//  1. State drift. Walk every entry in wrappers.json: verify the
+//     symlink is still present, still points at veto, and the
+//     .veto-original sibling still exists. Any drift FAILs the entry
+//     individually; healthy entries also emit a per-PM PASS line so
+//     wraps in custom --dir locations stay visible. Record paths
+//     covered by state for dedup against the host-survey phase.
+//
+//  2. Per-PM host survey. For each PM in pmlist.Wrapped, look for an
+//     install at the well-known absolute-path roots (homebrew prefix,
+//     /usr/local/bin, mise installs, asdf installs, ~/.bun/bin) and
+//     in $PATH (skipping known shim/version-manager dirs so we
+//     don't double-count Layer-2 shims as Layer-4 candidates).
+//     Per location:
+//
+//     - wrapped (symlink → veto + .veto-original sibling): PASS;
+//     - real binary or non-veto symlink:                    WARN;
+//     - no install of this PM on the host:                  N/A
+//     (one N/A line per PM, only when state has no wrap
+//     either — otherwise the PASS from state covers it).
+//
+//  3. Generic Layer-4 WARN. ONLY emitted when state is empty AND
+//     the survey found at least one unwrapped install — i.e. there
+//     is something worth wrapping but nothing wrapped. The example
+//     path/env var in that message is platform-aware (linux:
+//     LD_PRELOAD + /usr/local/bin; darwin-arm64: DYLD + /opt/homebrew/bin;
+//     darwin-amd64: DYLD + /usr/local/bin) so Linux users never see
+//     "/opt/homebrew/bin/npm" misadvice.
+//
+// Removed: the static "Layer 4 not installed" WARN that fired whenever
+// state was empty, regardless of host. That line hardcoded a darwin
+// path in Linux output and gave no signal on hosts where no PMs were
+// installed in known absolute-path roots.
 func checkWrappers(cfg config) []checkResult {
 	state, err := loadWrapperState(cfg)
 	if err != nil {
@@ -686,20 +725,26 @@ func checkWrappers(cfg config) []checkResult {
 			howToFix: "Inspect " + filepath.Join(cfg.CacheDir, stateFileName) + " — JSON may be corrupted.",
 		}}
 	}
-	if len(state.Wrappers) == 0 {
-		return []checkResult{{
-			status: statusWarn,
-			label:  "real-binary wrappers",
-			detail: "Layer 4 not installed — absolute-path invocations like /opt/homebrew/bin/npm bypass the gate",
-			howToFix: "Run `veto install-wrappers` to wrap homebrew/mise/asdf PM binaries with veto symlinks. " +
-				"This catches `subprocess.run([abs_path, ...])` even when DYLD_INSERT_LIBRARIES is unset.",
-		}}
-	}
+
+	// resolveVetoBinary is needed for the strict physical-path
+	// identity checks (pointsAtVeto / isAlreadyOursWrap). If it
+	// fails the survey can't reliably distinguish wrapped from
+	// not-wrapped, so we degrade to the older string-match check
+	// only for the state-drift phase. Survey phase short-circuits to
+	// a single WARN.
+	vetoPath, vetoErr := resolveVetoBinary()
 
 	out := []checkResult{}
-	healthy := 0
+	// Paths already reported by the state-drift phase. The host
+	// survey skips any path in this set so we don't get duplicate
+	// lines for one binary.
+	coveredByState := map[string]bool{}
+
+	// Phase 1: state-drift loop. Preserved semantics from the prior
+	// implementation; the new bit is the per-entry PASS line so
+	// --dir installs are visible.
 	for _, w := range state.Wrappers {
-		// Is `Path` still a symlink pointing at veto?
+		coveredByState[w.Path] = true
 		info, err := os.Lstat(w.Path)
 		if err != nil {
 			out = append(out, checkResult{
@@ -731,7 +776,6 @@ func checkWrappers(cfg config) []checkResult {
 			})
 			continue
 		}
-		// `.veto-original` must still exist for execReal to find.
 		if _, err := os.Stat(w.OriginalPath); err != nil {
 			out = append(out, checkResult{
 				status:   statusFail,
@@ -741,16 +785,259 @@ func checkWrappers(cfg config) []checkResult {
 			})
 			continue
 		}
-		healthy++
-	}
-	if healthy > 0 {
+		// Healthy entry: emit a per-PM PASS line. This matters for
+		// --dir installs in custom locations; the prior single-line
+		// "N/M healthy" summary hid them entirely.
 		out = append(out, checkResult{
 			status: statusPass,
-			label:  "real-binary wrappers",
-			detail: fmt.Sprintf("%d/%d healthy", healthy, len(state.Wrappers)),
+			label:  "wrapper:" + w.PM,
+			detail: fmt.Sprintf("%s (wrapped, original at %s)", w.Path, w.OriginalPath),
 		})
 	}
+
+	// If we couldn't resolve the veto binary, the host survey can't
+	// run reliably. Emit a single WARN and return whatever the
+	// state-drift phase produced.
+	if vetoErr != nil {
+		out = append(out, checkResult{
+			status:   statusWarn,
+			label:    "real-binary wrappers",
+			detail:   "cannot resolve veto binary for survey: " + vetoErr.Error(),
+			howToFix: "Confirm the running veto is on a readable path; re-run `veto doctor`.",
+		})
+		return out
+	}
+
+	// Phase 2: per-PM host survey.
+	anyUnwrappedFound := false
+	firstUnwrappedPM := ""
+	for _, pm := range pmlist.Wrapped {
+		locations := surveyWrappablePaths(pm)
+		seen := map[string]bool{}
+		pmHadDiscovery := false
+		for _, path := range locations {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			if coveredByState[path] {
+				// Already reported by the state-drift phase; don't
+				// double-report.
+				pmHadDiscovery = true
+				continue
+			}
+			pmHadDiscovery = true
+			if isAlreadyOursWrap(path, vetoPath) {
+				out = append(out, checkResult{
+					status: statusPass,
+					label:  "wrapper:" + pm,
+					detail: fmt.Sprintf("%s (wrapped, original at %s%s)", path, path, wrapperSuffix),
+				})
+				continue
+			}
+			// Not wrapped: real binary, or a non-veto symlink. Either
+			// way the absolute-path invocation skips the gate.
+			if !anyUnwrappedFound {
+				firstUnwrappedPM = pm
+			}
+			anyUnwrappedFound = true
+			out = append(out, checkResult{
+				status:   statusWarn,
+				label:    "wrapper:" + pm,
+				detail:   fmt.Sprintf("%s (NOT wrapped — run veto install-wrappers)", path),
+				howToFix: "Run `veto install-wrappers` to wrap this binary so absolute-path invocations route through veto.",
+			})
+		}
+		// No install of this PM anywhere on the host AND no state
+		// entry covering it: emit a single N/A line so the user sees
+		// the doctor actually surveyed this PM.
+		if !pmHadDiscovery {
+			pmCovered := false
+			for _, w := range state.Wrappers {
+				if w.PM == pm {
+					pmCovered = true
+					break
+				}
+			}
+			if !pmCovered {
+				out = append(out, checkResult{
+					status: statusNotApplicable,
+					label:  "wrapper:" + pm,
+					detail: "no absolute-path install detected on this host",
+				})
+			}
+		}
+	}
+
+	// Phase 3: generic Layer-4 WARN. Only when nothing is wrapped
+	// (state empty) AND something could be (the survey found at
+	// least one unwrapped install). Otherwise the per-PM WARN lines
+	// already make the situation visible, and a generic header is
+	// noise.
+	if len(state.Wrappers) == 0 && anyUnwrappedFound {
+		examplePath, envVar := layer4ExampleHints(firstUnwrappedPM)
+		out = append(out, checkResult{
+			status: statusWarn,
+			label:  "real-binary wrappers",
+			detail: fmt.Sprintf("Layer 4 not installed — absolute-path invocations like %s bypass the gate", examplePath),
+			howToFix: "Run `veto install-wrappers` to wrap PM binaries with veto symlinks. " +
+				"This catches `subprocess.run([abs_path, ...])` even when " + envVar + " is unset.",
+		})
+	}
+
 	return out
+}
+
+// surveyWrappablePaths returns every absolute path on this host where
+// `pm` could live and is a Layer-4 wrap candidate. Walks the same
+// well-known roots as discoverWrapCandidates in install_wrappers.go
+// (homebrew prefix, mise installs, asdf installs, pyenv versions, nvm
+// node versions, ~/.bun/bin) plus any $PATH entries that are NOT
+// known shim/version-manager dirs.
+//
+// Why we intentionally duplicate the dir-discovery patterns from
+// install_wrappers.go rather than refactor a shared helper: the
+// discovery there returns a richer wrapCandidate struct (with
+// source/include filters) coupled to install logic; extracting it
+// cleanly would balloon this PR. The canonical implementation is
+// discoverWrapCandidates — see that for the source of truth.
+//
+// Shim dirs we deliberately skip in $PATH:
+//
+//   - ~/.local/bin when it's a veto shim dir (symlink inside resolves
+//     to the veto binary) — the shim there is Layer-2 and counting it
+//     as a Layer-4 candidate would suggest the user run install-wrappers
+//     on their own shim.
+//   - */mise/shims, */.asdf/shims, */.pyenv/shims, */.nvm/versions/* —
+//     these are version-manager shim dirs whose contents are
+//     wrapper scripts the manager owns; veto's own absolute-path
+//     coverage hits the underlying install dir (already in the
+//     well-known roots list).
+func surveyWrappablePaths(pm string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		info, err := os.Lstat(p)
+		if err != nil || info.IsDir() {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+
+	// 1) Known absolute-path install roots. Mirrors
+	// discoverWrapCandidates in install_wrappers.go. Order parallels
+	// that function so behaviour stays predictable.
+	for _, dir := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
+		add(filepath.Join(dir, pm))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, binDir := range globToolVersionBinDirs(filepath.Join(home, ".local", "share", "mise", "installs")) {
+			add(filepath.Join(binDir, pm))
+		}
+		for _, binDir := range globToolVersionBinDirs(filepath.Join(home, ".asdf", "installs")) {
+			add(filepath.Join(binDir, pm))
+		}
+		for _, binDir := range globVersionBinDirs(filepath.Join(home, ".pyenv", "versions")) {
+			add(filepath.Join(binDir, pm))
+		}
+		for _, binDir := range globVersionBinDirs(filepath.Join(home, ".nvm", "versions", "node")) {
+			add(filepath.Join(binDir, pm))
+		}
+		if pm == "bun" || pm == "bunx" {
+			add(filepath.Join(home, ".bun", "bin", pm))
+		}
+	}
+
+	// 2) $PATH entries, skipping known shim/version-manager dirs.
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			continue
+		}
+		if isShimDirForSurvey(dir) {
+			continue
+		}
+		add(filepath.Join(dir, pm))
+	}
+
+	return out
+}
+
+// isShimDirForSurvey reports whether a $PATH entry is one the
+// per-PM host survey should skip. Two reasons to skip:
+//
+//   - veto's own Layer-2 shim dir (~/.local/bin when it holds a
+//     symlink pointing at the veto binary): surveying it would flag
+//     the shim itself as a wrap candidate, which is wrong — Layer-2
+//     and Layer-4 are different defenses at different paths.
+//   - version-manager shim dirs (mise/asdf/pyenv/nvm): their entries
+//     are wrapper scripts the manager owns and re-creates on
+//     activate; veto's absolute-path coverage hits the install dir
+//     downstream instead.
+func isShimDirForSurvey(dir string) bool {
+	// Substring matches catch both *nix-style and macOS paths.
+	switch {
+	case strings.Contains(dir, "/mise/shims"),
+		strings.Contains(dir, "/.asdf/shims"),
+		strings.Contains(dir, "/.pyenv/shims"):
+		return true
+	}
+	if strings.Contains(dir, "/.nvm/versions/") || strings.Contains(dir, "/nvm/versions/node/") {
+		return true
+	}
+	// veto's own shim dir: look for any symlink whose physical
+	// resolution contains "veto" in the path. Cheap heuristic — we
+	// don't need to be exact; if we skip a non-shim dir that happens
+	// to have a veto-named symlink the only consequence is we miss
+	// surveying a directory that almost certainly has nothing to wrap.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(filepath.Base(resolved), "veto") {
+			return true
+		}
+	}
+	return false
+}
+
+// layer4ExampleHints returns the platform-correct example path and
+// preload env var name for the generic Layer-4 WARN. The static
+// version of this message hardcoded /opt/homebrew/bin/npm and
+// DYLD_INSERT_LIBRARIES, which was both unhelpful and misleading on
+// Linux. firstUnwrappedPM is the first PM the survey found a
+// real binary for; "" means the survey found nothing (fall back to
+// "npm" so the message reads sensibly).
+func layer4ExampleHints(firstUnwrappedPM string) (examplePath, envVar string) {
+	pm := firstUnwrappedPM
+	if pm == "" {
+		pm = "npm"
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		envVar = "DYLD_INSERT_LIBRARIES"
+		if runtime.GOARCH == "arm64" {
+			examplePath = "/opt/homebrew/bin/" + pm
+		} else {
+			examplePath = "/usr/local/bin/" + pm
+		}
+	default:
+		// Linux and everything else: /usr/local/bin + LD_PRELOAD.
+		envVar = "LD_PRELOAD"
+		examplePath = "/usr/local/bin/" + pm
+	}
+	return examplePath, envVar
 }
 
 // checkIntel validates the malware-intel layer: the store can refresh,
@@ -961,9 +1248,17 @@ func printResults(w io.Writer, results []checkResult) {
 			marker = "[\x1b[33mWARN\x1b[0m]"
 		case statusFail:
 			marker = "[\x1b[31mFAIL\x1b[0m]"
+		case statusNotApplicable:
+			// Cyan [N/A] marker. Same column shape as the other
+			// three so a grep -E '\[(PASS|WARN|FAIL|N/A)\]' stays
+			// aligned. printResults never renders a fix arrow for
+			// N/A — there's nothing to fix, the PM just isn't here.
+			marker = "[\x1b[36mN/A\x1b[0m] "
 		}
 		fmt.Fprintf(w, "  %s  %-26s  %s\n", marker, r.label, r.detail)
-		if r.howToFix != "" && r.status != statusPass {
+		// Only PASS and N/A suppress the how-to-fix arrow. WARN/FAIL
+		// always print one when a fix string is present.
+		if r.howToFix != "" && r.status != statusPass && r.status != statusNotApplicable {
 			fmt.Fprintf(w, "         → %s\n", r.howToFix)
 		}
 	}
