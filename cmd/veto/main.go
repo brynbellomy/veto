@@ -1611,7 +1611,7 @@ Go/Cargo live gating:
 
 Environment:
   VETO_CACHE_DIR     override cache location (default: $XDG_CACHE_HOME/veto)
-  VETO_SOURCES       comma-separated source IDs (default: aikido,datadog,openssf,osv,pypa)
+  VETO_SOURCES       comma-separated source IDs (default: aikido,datadog,openssf,osv,pypa,hades)
                        optional vulnerability feeds: ghsa, rustsec, govulndb, gemnasium
   VETO_IOC_SOURCES   comma-separated host-level IOC feed IDs (default: none).
                        Available: abusech, misp. When set, cache artifacts are
@@ -1621,5 +1621,9 @@ Environment:
                      abusech IOC feed; without it the feed logs once and no-ops
   VETO_LOG           set to "debug" for verbose logging
   VETO_PATH          set by install-preload; consumed by the interposer
+  VETO_PTH_WHEEL_SCAN
+                     enable / disable the .pth wheel prescan for the Hades
+                     PyPI worm. Values: on (default; argv-direct only),
+                     full (also fetch resolved transitives), off.
 `)
 }
