@@ -70,3 +70,30 @@ func TestScannerIncludesProjectSireneCommandLogs(t *testing.T) {
 	require.Equal(t, scan.SeverityLow, result.Findings[0].Severity)
 	require.Contains(t, result.Findings[0].Title, "Sirene")
 }
+
+func TestScannerSurfacesHadesHostArtifacts(t *testing.T) {
+	// We can't reliably create files at /tmp/.bun_ran during a test (CI
+	// races, perms), so this test covers the home-dir probe shape which
+	// the scanner accepts under an arbitrary `home` root.
+	home := t.TempDir()
+	bunCache := filepath.Join(home, ".cache", "bun")
+	require.NoError(t, os.MkdirAll(bunCache, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bunCache, "bun"), []byte("x"), 0o755))
+
+	res := agentsurface.New(agentsurface.Options{Home: home}).Scan(context.Background())
+	var titles []string
+	for _, f := range res.Findings {
+		titles = append(titles, f.Title)
+	}
+	require.True(t, containsString(titles, "Hades / Shai-Hulud .pth worm host artifact present"),
+		"missing Hades host-artifact finding; got %v", titles)
+}
+
+func containsString(s []string, want string) bool {
+	for _, x := range s {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}

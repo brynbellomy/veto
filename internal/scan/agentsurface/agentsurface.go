@@ -94,6 +94,8 @@ func (s *Scanner) Scan(ctx context.Context) scan.Result {
 		}
 	}
 	result.Findings = append(result.Findings, s.scanLaunchdDisabled(ctx)...)
+	result.Findings = append(result.Findings, s.scanHadesHostArtifacts()...)
+	result.Findings = append(result.Findings, s.scanHadesTmpLocks()...)
 	return result
 }
 
@@ -136,6 +138,95 @@ func (s *Scanner) targets() []target {
 			target{owner: "cursor", path: filepath.Join(root, ".cursor"), accept: acceptConfig},
 			target{owner: "sirene", path: filepath.Join(root, ".sirene"), accept: acceptConfig},
 		)
+	}
+	return out
+}
+
+// hadesHostTargets returns probe paths for the on-host artifacts the Hades /
+// Shai-Hulud PyPI worm drops. Presence of any of these is the signal; we
+// stat-check rather than scan, so a missing file is the common case and
+// returns silently.
+func (s *Scanner) hadesHostTargets() []hadesProbe {
+	var probes []hadesProbe
+	probes = append(probes,
+		hadesProbe{path: "/tmp/.bun_ran", reason: "Hades worm runtime marker"},
+		hadesProbe{path: "/tmp/_index.js", reason: "Hades second-stage payload"},
+		hadesProbe{path: "/tmp/bun", reason: "Bun runtime dropped in /tmp by Hades worm"},
+	)
+	if home := s.home; home != "" {
+		probes = append(probes,
+			hadesProbe{path: filepath.Join(home, ".cache", "bun"), reason: "Bun runtime dropped under ~/.cache by Hades worm"},
+		)
+	}
+	return probes
+}
+
+type hadesProbe struct {
+	path   string
+	reason string
+}
+
+// scanHadesHostArtifacts emits a finding per Hades probe path present on the
+// host. Stat-only; no file contents are read.
+func (s *Scanner) scanHadesHostArtifacts() []scan.Finding {
+	var out []scan.Finding
+	for _, probe := range s.hadesHostTargets() {
+		info, err := os.Stat(probe.path)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			// Directory probes (e.g. ~/.cache/bun) only fire when present
+			// AND non-empty — an empty dir is unlikely to be the worm.
+			entries, _ := os.ReadDir(probe.path)
+			if len(entries) == 0 {
+				continue
+			}
+		}
+		out = append(out, scan.Finding{
+			ID:       fmt.Sprintf("agent-surface:hades-host:%s", probe.path),
+			Surface:  scan.SurfaceAgentSurface,
+			Severity: scan.SeverityHigh,
+			Path:     probe.path,
+			Title:    "Hades / Shai-Hulud .pth worm host artifact present",
+			Evidence: []scan.Evidence{
+				{Label: "owner", Value: "hades"},
+				{Label: "reason", Value: probe.reason},
+			},
+			Remediation: "Verify the artifact is not from the Hades worm; if any Python interpreter recently ran in a poisoned venv, treat reachable credentials as compromised, remove the artifact, and run `veto scan` over all venvs.",
+		})
+	}
+	return out
+}
+
+// scanHadesTmpLocks scans /tmp for tmp.*.lock files — the Hades single-
+// instance lock shape. Stat-only; we list /tmp once and filter by name.
+// /tmp on Linux+macOS is world-readable; on systems where it isn't, the
+// listing error is non-fatal.
+func (s *Scanner) scanHadesTmpLocks() []scan.Finding {
+	entries, err := os.ReadDir("/tmp")
+	if err != nil {
+		return nil
+	}
+	var out []scan.Finding
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "tmp.") || !strings.HasSuffix(name, ".lock") {
+			continue
+		}
+		path := filepath.Join("/tmp", name)
+		out = append(out, scan.Finding{
+			ID:       "agent-surface:hades-tmp-lock:" + path,
+			Surface:  scan.SurfaceAgentSurface,
+			Severity: scan.SeverityMedium,
+			Path:     path,
+			Title:    "/tmp/tmp.*.lock matches Hades worm single-instance lock shape",
+			Evidence: []scan.Evidence{
+				{Label: "owner", Value: "hades"},
+				{Label: "lock", Value: name},
+			},
+			Remediation: "If no recent legitimate process explains this lock, investigate the owning process and treat as a possible Hades infection.",
+		})
 	}
 	return out
 }
