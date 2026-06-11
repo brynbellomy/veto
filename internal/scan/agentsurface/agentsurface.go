@@ -152,7 +152,14 @@ var (
 	// hadesWorkflowExfilRe matches a GitHub Actions workflow that posts to
 	// a webhook with environment / secret material in its body — the worm's
 	// exfiltration shape. Heuristic, not a parser.
-	hadesWorkflowExfilRe = regexp.MustCompile(`(?is)curl\s+[^\n]*-X\s*POST[^\n]*\$\{\{\s*secrets\.|toJson\(\s*secrets\s*\)|webhook\.site|webhooks?\.[A-Za-z0-9.-]+/`)
+	//
+	// The (?s) flag makes . match newlines, which is required for the first
+	// alternative: real exfil workflows frequently split curl, -X POST, the
+	// target URL, and ${{ secrets.X }} across multiple lines inside a YAML
+	// run: | block, so [^\n]* would silently miss them. We use .*? (non-greedy)
+	// to avoid catastrophic backtracking on large YAML files while still
+	// spanning arbitrary line breaks within a single run block.
+	hadesWorkflowExfilRe = regexp.MustCompile(`(?is)curl\s+.*?-X\s*POST.*?\$\{\{\s*secrets\.|toJson\(\s*secrets\s*\)|webhook\.site|webhooks?\.[A-Za-z0-9.-]+/`)
 )
 
 // scanHadesPersistence emits findings for local GitHub persistence under each
