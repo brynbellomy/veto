@@ -1,6 +1,9 @@
 package intel
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // NormalizeName canonicalizes a package name for index insertion and lookup,
 // per ecosystem-specific equivalence rules.
@@ -43,6 +46,8 @@ func NormalizeVersion(eco Ecosystem, version string) string {
 	switch eco {
 	case EcosystemGo:
 		return normalizeGoVersion(version)
+	case EcosystemPyPI:
+		return normalizePyPIVersion(version)
 	default:
 		return version
 	}
@@ -53,6 +58,60 @@ func normalizeGoVersion(version string) string {
 		return version[1:]
 	}
 	return version
+}
+
+// normalizePyPIVersion produces the PEP 440 canonical form of a version
+// string so that alternate spellings of the same version all map to the
+// same index key.
+//
+// PEP 440 allows many equivalent representations:
+//
+//	0.8.6.post1  ==  0.8.6-post1  ==  0.8.6_post1
+//	0.8.6rc1     ==  0.8.6.rc1    ==  0.8.6-RC1
+//	0.8.6.dev1   ==  0.8.6-dev1
+//	1!0.8.6      ==  1!0.8.6
+//
+// Canonical output form:
+//   - epoch prefix "N!" if epoch != 0
+//   - release segments joined with "."
+//   - pre-release appended without separator: "a1", "b2", "rc3"
+//   - post-release appended with ".post" separator: ".post1"
+//   - dev release appended with ".dev" separator: ".dev1"
+//   - local label STRIPPED — PyPI rejects "+local" versions at publish
+//     time, so they cannot appear in advisory feeds. Stripping is safer
+//     than exact-matching because it lets a locally-built variant of a
+//     flagged version still be caught.
+//
+// If the input does not parse as a valid PEP 440 version, the original
+// string is returned unchanged (safe fallback; the store will do an
+// exact-string match against whatever the feed published).
+func normalizePyPIVersion(version string) string {
+	v, ok := parsePEP440Version(version)
+	if !ok {
+		return version
+	}
+	var b strings.Builder
+	if v.epoch != 0 {
+		fmt.Fprintf(&b, "%d!", v.epoch)
+	}
+	for i, seg := range v.release {
+		if i > 0 {
+			b.WriteByte('.')
+		}
+		fmt.Fprintf(&b, "%d", seg)
+	}
+	if v.pre.kind != "" {
+		// No separator before pre-release per PEP 440 canonical form.
+		fmt.Fprintf(&b, "%s%d", v.pre.kind, v.pre.num)
+	}
+	if v.post != nil {
+		fmt.Fprintf(&b, ".post%d", *v.post)
+	}
+	if v.dev != nil {
+		fmt.Fprintf(&b, ".dev%d", *v.dev)
+	}
+	// Local label intentionally omitted; see doc comment above.
+	return b.String()
 }
 
 // normalizePyPIName implements PEP 503's normalization rule: lower-case,
