@@ -20,3 +20,6 @@ libveto_interpose.dylib
 libveto_interpose.so
 
 .sirene/
+
+# bv (beads viewer) local config and caches
+.bv/
