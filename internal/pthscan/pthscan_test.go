@@ -165,3 +165,142 @@ func TestInspectEditableFilenameNotFlagged(t *testing.T) {
 	})
 	require.False(t, v.Flagged(), "got %v", codes(v))
 }
+
+// ─── Verifier tests (claims 1-4 from adversarial review) ─────────────────────
+
+// TestVerifierClaim1_TabSeparatorBypass verifies claim 1:
+// "import\t" (tab separator) bypasses pthscan detection.
+// CPython's site.py reads .pth lines and executes lines starting with "import "
+// (space), but "import\t" (tab) is also valid Python. pthscan must catch it.
+func TestVerifierClaim1_TabSeparatorBypass(t *testing.T) {
+	t.Run("evil-pth-no-setup-suffix", func(t *testing.T) {
+		// import\tos; ... — tab between "import" and "os"
+		content := []byte("import\tos; open('/tmp/marker','w').write('x')\n")
+		v := pthscan.Inspect(pthscan.Input{
+			PthContent: content,
+			FileName:   "evil.pth",
+		})
+		t.Logf("Severity: %s", v.Severity)
+		t.Logf("Signals: %v", codes(v))
+		// If claim is correct: severity == none (full bypass) because
+		// executableLines only matches "import " or "import(" prefix.
+	})
+
+	t.Run("evil-pth-with-setup-suffix", func(t *testing.T) {
+		content := []byte("import\tos; open('/tmp/marker','w').write('x')\n")
+		v := pthscan.Inspect(pthscan.Input{
+			PthContent: content,
+			FileName:   "evil-setup.pth",
+		})
+		t.Logf("Severity: %s", v.Severity)
+		t.Logf("Signals: %v", codes(v))
+		// If only filename fires: severity == medium (not critical),
+		// meaning the payload itself is missed.
+	})
+}
+
+// TestVerifierClaim2_CROnlyLineEndings verifies claim 2:
+// A .pth with \r-only line endings (no \n) bypasses pthscan.
+// CPython on some platforms accepts \r as a line terminator in .pth files.
+func TestVerifierClaim2_CROnlyLineEndings(t *testing.T) {
+	// "import os; os.system('x')\r" — \r but no \n
+	content := []byte("import os; os.system('x')\r")
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: content,
+		FileName:   "evil.pth",
+	})
+	t.Logf("Severity: %s", v.Severity)
+	t.Logf("Signals: %v", codes(v))
+	// If claim is correct: severity == none (no signals).
+	// Expected correct behavior: severity == critical with pth-payload-spawn.
+}
+
+// TestVerifierClaim3_UTF8BOMBypass verifies claim 3:
+// A .pth starting with a UTF-8 BOM (\xEF\xBB\xBF) bypasses pthscan.
+// CPython's site.py strips a BOM before processing .pth content.
+func TestVerifierClaim3_UTF8BOMBypass(t *testing.T) {
+	content := []byte{0xEF, 0xBB, 0xBF, 'i', 'm', 'p', 'o', 'r', 't', ' ', 'o', 's', ';', ' ', 'o', 's', '.', 's', 'y', 's', 't', 'e', 'm', '(', '\'', 'x', '\'', ')', '\n'}
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: content,
+		FileName:   "evil.pth",
+	})
+	t.Logf("Severity: %s", v.Severity)
+	t.Logf("Signals: %v", codes(v))
+	// If claim is correct: severity == none (BOM tricks the prefix check).
+	// Expected correct behavior: severity == critical with pth-payload-spawn.
+}
+
+// TestVerifierClaim4_DistutilsPrecedenceGetBypass verifies claim 4:
+// qwen says this is REFUTED — distutils-precedence pattern with os.system
+// IS detected because the allowlist regex requires a specific shape.
+func TestVerifierClaim4_DistutilsPrecedencePayload(t *testing.T) {
+	// This should NOT match the allowlist (allowlist requires __import__('_distutils_hack')
+	// as the terminal expression, not a chained call to os.system).
+	payload := "import os; __import__('_distutils_hack').get('evil_module')\nos.system('malicious')\n"
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: []byte(payload),
+		FileName:   "distutils-precedence.pth",
+	})
+	t.Logf("Severity: %s", v.Severity)
+	t.Logf("Signals: %v", codes(v))
+	// qwen claims: SeverityCritical + pth-payload-dynamic-exec
+	// We verify: does __import__('_distutils_hack').get(...) match payload regex?
+	// The payload regex for dynamic-exec is: \b(?:exec\(|eval\(|compile\(|__import__\()
+	// "__import__(" IS in that regex. So the first line should fire pth-payload-dynamic-exec.
+	// Then os.system('malicious') on second line fires pth-payload-spawn.
+
+	// Also check: does the allowlist match line 1?
+	// Allowlist regex: ^import\s+os\s*;\s*(?:...var...)?\s*__import__\(..._distutils_hack...\)(?:...method\(\))?\s*$
+	// Line 1: "import os; __import__('_distutils_hack').get('evil_module')"
+	// This does NOT match the allowlist because:
+	// - .get('evil_module') is not \.[A-Za-z_]+\(\s*\) (it has an arg)
+	// So line 1 goes to payload scan and __import__( fires.
+}
+
+// TestVerifierClaim4_AllowlistEscapeProbe checks whether a carefully crafted
+// single-line payload can match the distutils-precedence allowlist regex
+// while still being dangerous. We probe with getattr() indirection.
+func TestVerifierClaim4_AllowlistEscapeProbeGetattr(t *testing.T) {
+	// Can we craft something that:
+	// 1. Matches the distutils-precedence allowlist regex
+	// 2. Still does something dangerous
+	// The allowlist regex pattern:
+	//   ^import\s+os\s*;\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*os\.environ\.get\(.+?\)\s*;\s*)?__import__\(\s*['"]_distutils_hack['"]\s*\)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\(\s*\))?\s*$
+	//
+	// The terminal method call group is: (?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\(\s*\))?
+	// This allows exactly ONE method call with NO arguments.
+	// Dangerous via getattr: __import__('_distutils_hack').add_shim()  -- legit
+	// Dangerous via other methods with args: NOT matchable (args in (...) break $)
+	//
+	// Attempt: use a zero-arg method that has side effects
+	// e.g. __import__('_distutils_hack').install()  <- if _distutils_hack.install() is dangerous
+	// But that's a legitimate package, not the worm.
+	//
+	// Actual probe: try crafting something that matches allowlist AND has os.system side effect.
+	// Since the allowlist regex anchors with ^ and $ and only allows:
+	// "import os; [optional-var=os.environ.get(...);] __import__('_distutils_hack')[.method()]"
+	// There's no room for os.system() or any other payload after the anchor.
+
+	// The probe below is designed to test if getattr() can be smuggled in:
+	probe := "import os; __import__('_distutils_hack').add_shim()"
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: []byte(probe + "\n"),
+		FileName:   "distutils-precedence.pth",
+	})
+	t.Logf("Probe (known-legit shape): Severity=%s Signals=%v", v.Severity, codes(v))
+	// This should be SeverityNone (allowlist match).
+
+	// Now try a getattr indirection that doesn't match allowlist:
+	probe2 := "import os; getattr(__import__('_distutils_hack'), 'add_shim')()"
+	v2 := pthscan.Inspect(pthscan.Input{
+		PthContent: []byte(probe2 + "\n"),
+		FileName:   "distutils-precedence.pth",
+	})
+	t.Logf("Probe (getattr indirection): Severity=%s Signals=%v", v2.Severity, codes(v2))
+	// Does NOT match allowlist (starts with "import os; getattr(..." not "import os; __import__(...")
+	// And does NOT match payload groups (no exec/eval/compile/__import__( pattern)
+	// So this would be SeverityMedium (pth-executable-line) — not caught as Critical.
+	// BUT wait: does __import__( appear? No, because it's inside getattr(...)
+	// This is potentially a new finding: getattr indirection on _distutils_hack
+	// yields SeverityMedium instead of Critical.
+}
