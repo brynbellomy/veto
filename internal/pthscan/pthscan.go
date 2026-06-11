@@ -266,7 +266,7 @@ var payloadGroups = []struct {
 	{
 		code:  "pth-payload-dynamic-exec",
 		label: "evaluates code dynamically (exec/eval/compile/__import__ on a computed string).",
-		re:    regexp.MustCompile(`\b(?:exec\(|eval\(|compile\(|__import__\()`),
+		re:    regexp.MustCompile(`\b(?:exec|eval|compile|__import__)\s*\(`),
 	},
 	{
 		code:  "pth-payload-deobfuscation",

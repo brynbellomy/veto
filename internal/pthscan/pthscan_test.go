@@ -143,6 +143,28 @@ func TestInspectPayloadGroupsTable(t *testing.T) {
 	}
 }
 
+// TestInspectDynamicExecWithWhitespaceBeforeParen covers the
+// `__import__ ('os')` / `exec  (...)` shape. Python is fully happy with
+// whitespace between the callable name and the opening paren, so a regex
+// requiring the paren immediately after the name is trivially bypassed.
+func TestInspectDynamicExecWithWhitespaceBeforeParen(t *testing.T) {
+	cases := []string{
+		`import os; __import__ ('os').system('x')`,
+		`import os; __import__('os').system('x')`, // baseline (zero-space)
+		`import os; exec ("import os; os.system('x')")`,
+		`import os; eval ('1+1')`,
+		`import os; compile ("x","<x>","exec")`,
+		"import os; __import__\t('os')", // tab
+	}
+	for _, body := range cases {
+		t.Run(body, func(t *testing.T) {
+			v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n")})
+			require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+			require.Contains(t, codes(v), "pth-payload-dynamic-exec")
+		})
+	}
+}
+
 // TestInspectOsSpawnFamilyIsCritical covers the os.spawn{l,le,lp,lpe,v,ve,vp,vpe}
 // posix process-launch family, which has identical attack power to os.exec*
 // but was previously missed by the spawn regex.
