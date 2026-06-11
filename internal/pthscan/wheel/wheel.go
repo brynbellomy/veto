@@ -133,6 +133,33 @@ func collectPthEntries(zr *zip.Reader) ([]pthEntry, error) {
 // isPthInWheel reports whether a zip entry path is a position where Python
 // will install a .pth at install-time: either the data scheme's purelib /
 // platlib directories, or a top-level location alongside the dist-info.
+//
+// Why only purelib and platlib?
+//
+// PEP 427 (wheel format) defines five install destinations inside the
+// <dist>-<ver>.data/ tree: purelib, platlib, scripts, headers, and data.
+// Of those, only purelib and platlib map to directories on sys.path (the
+// site-packages trees returned by sysconfig.get_paths()["purelib"] and
+// sysconfig.get_paths()["platlib"]). The others land in locations that
+// Python's site.py never visits:
+//
+//   destination │ typical location              │ on sys.path?
+//   ────────────┼───────────────────────────────┼─────────────
+//   purelib     │ …/site-packages/              │ yes ✓
+//   platlib     │ …/site-packages/ (or platlib) │ yes ✓
+//   scripts     │ /usr/local/bin, ~/.local/bin   │ no
+//   headers     │ /usr/local/include/python…    │ no
+//   data        │ /usr/local/ (prefix root)     │ no
+//
+// site.py's .pth processing walks every directory in sys.path and executes
+// any .pth files it finds there. A .pth dropped into scripts/, headers/, or
+// data/ is therefore never executed at interpreter startup — it has no worm
+// surface. Checking those directories would admit false positives (legitimate
+// .pth files that pip places there for other purposes) without adding any
+// security value.
+//
+// Reference: CPython Lib/site.py (addsitedir / addpackage), PEP 427 §"The
+// .data directory", sysconfig.get_paths() output.
 func isPthInWheel(name string) bool {
 	if !strings.HasSuffix(name, ".pth") {
 		return false
