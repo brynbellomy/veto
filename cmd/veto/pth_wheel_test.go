@@ -165,3 +165,74 @@ func TestPipOutputIndicatesSdistOnly(t *testing.T) {
 		require.Equal(t, tc.want, got, "input: %q", tc.output)
 	}
 }
+
+// -- TOCTOU hash tests (veto-3w1.20) -----------------------------------------
+//
+// The TOCTOU mitigation records a SHA-256 of each scanned wheel so any
+// discrepancy between the inspected artifact and the actually-installed one
+// is detectable. We unit-test the hash function directly rather than going
+// through downloadAndInspectWheel (which requires a real pip subprocess in
+// a veto-wrapped environment).
+
+// TestHashWheelFileKnownInput verifies that hashWheelFile produces the correct
+// SHA-256 for known content.
+func TestHashWheelFileKnownInput(t *testing.T) {
+	cases := []struct {
+		input    []byte
+		wantHex  string // sha256sum verified externally
+	}{
+		{[]byte(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		{[]byte("hello"), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("len=%d", len(tc.input)), func(t *testing.T) {
+			got, err := hashWheelFile(bytes.NewReader(tc.input))
+			require.NoError(t, err)
+			require.Equal(t, tc.wantHex, got)
+		})
+	}
+}
+
+// TestHashWheelFileDifferentContent verifies that two different wheel byte
+// sequences produce different hashes — basic TOCTOU property.
+func TestHashWheelFileDifferentContent(t *testing.T) {
+	sha1, err := hashWheelFile(bytes.NewReader([]byte("wheel-clean")))
+	require.NoError(t, err)
+
+	sha2, err := hashWheelFile(bytes.NewReader([]byte("wheel-malicious")))
+	require.NoError(t, err)
+
+	require.NotEqual(t, sha1, sha2, "different wheel contents must produce different hashes")
+	require.Len(t, sha1, 64)
+	require.Len(t, sha2, 64)
+}
+
+// TestWheelFindingCarriesHash verifies that wheelFinding correctly stores the
+// whlSHA256 field, which is the TOCTOU anchor that would be used by the
+// install enforcement layer (veto-3w1.20a).
+func TestWheelFindingCarriesHash(t *testing.T) {
+	const knownSHA = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+	f := wheelFinding{
+		spec:      "evil==1.0",
+		whlSHA256: knownSHA,
+	}
+	// Verify the struct field is accessible (compile-time contract).
+	require.Equal(t, knownSHA, f.whlSHA256)
+}
+
+// TestPipOutputSdistOnlyDoesNotMatchTransient verifies that the sdist-only
+// detector does NOT fire on messages that indicate transient network errors,
+// which would incorrectly fail-closed on retryable failures.
+func TestPipOutputSdistOnlyDoesNotMatchTransient(t *testing.T) {
+	transientMessages := []string{
+		"ERROR: Could not install packages due to an OSError",
+		"WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None))",
+		"HTTPSConnectionPool(host='pypi.org', port=443): Max retries exceeded",
+		"Connection reset by peer",
+		"",
+	}
+	for _, msg := range transientMessages {
+		require.False(t, pipOutputIndicatesSdistOnly(msg),
+			"transient message should not be classified as sdist-only: %q", msg)
+	}
+}

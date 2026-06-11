@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -111,7 +113,7 @@ func pthWheelPreflight(
 			logger.Warn().Err(err).Msg(".pth wheel preflight: timed out; allowing (fail-open)")
 			break
 		}
-		verdict, err := downloadAndInspectWheel(ctx, realPip, workdir, tgt)
+		verdict, sha256hex, err := downloadAndInspectWheel(ctx, realPip, workdir, tgt)
 		if err != nil {
 			var sdistErr *errSdistOnly
 			if isErrSdistOnly(err, &sdistErr) {
@@ -131,8 +133,15 @@ func pthWheelPreflight(
 			logger.Warn().Err(err).Str("spec", tgt.spec()).Msg(".pth wheel preflight: fetch/inspect failed; skipping this package")
 			continue
 		}
+		// Log the scanned wheel hash. This is the TOCTOU anchor: any
+		// discrepancy between this hash and what pip actually installs
+		// means a different artifact was installed than the one veto saw.
+		logger.Info().
+			Str("spec", tgt.spec()).
+			Str("wheel_sha256", sha256hex).
+			Msg(".pth wheel preflight: scanned wheel")
 		if verdict.Severity == pthscan.SeverityCritical {
-			flagged = append(flagged, wheelFinding{spec: tgt.spec(), verdict: verdict})
+			flagged = append(flagged, wheelFinding{spec: tgt.spec(), verdict: verdict, whlSHA256: sha256hex})
 		}
 	}
 
@@ -163,6 +172,14 @@ func (t wheelTarget) spec() string {
 type wheelFinding struct {
 	spec    string
 	verdict pthscan.Verdict
+	// whlSHA256 is the hex-encoded SHA-256 of the wheel file that was
+	// downloaded and inspected. It is the ground truth for TOCTOU defence:
+	// if the real pip install fetches a wheel with a different hash, a
+	// different (potentially malicious) artifact was installed.
+	//
+	// @@TODO(veto-3w1.20a): thread this hash into the pip install invocation
+	// via --find-links / --require-hashes once main.go is in scope.
+	whlSHA256 string
 }
 
 func selectWheelTargets(direct, resolved []packagemanager.Install, full bool) []wheelTarget {
@@ -247,10 +264,15 @@ func pipOutputIndicatesSdistOnly(output string) bool {
 //
 // Returns *errSdistOnly when the package has no binary wheel (sdist-only).
 // The caller MUST fail-closed on that sentinel — not skip-and-continue.
-func downloadAndInspectWheel(ctx context.Context, realPip, workdir string, tgt wheelTarget) (pthscan.Verdict, error) {
+//
+// The returned whlSHA256 is the hex SHA-256 of the downloaded wheel file.
+// It is the TOCTOU anchor: if a different artifact is fetched during the real
+// install, a different wheel was installed than the one veto inspected.
+// See veto-3w1.20a for the enforcement integration.
+func downloadAndInspectWheel(ctx context.Context, realPip, workdir string, tgt wheelTarget) (verdict pthscan.Verdict, whlSHA256 string, err error) {
 	before, err := whlSet(workdir)
 	if err != nil {
-		return pthscan.Verdict{}, err
+		return pthscan.Verdict{}, "", err
 	}
 	cmd := exec.CommandContext(ctx, realPip,
 		"download", tgt.spec(),
@@ -264,17 +286,17 @@ func downloadAndInspectWheel(ctx context.Context, realPip, workdir string, tgt w
 	if pipErr != nil {
 		// pip exited non-zero. Distinguish "no wheel" from "transient error".
 		if pipOutputIndicatesSdistOnly(string(pipOut)) {
-			return pthscan.Verdict{}, &errSdistOnly{
+			return pthscan.Verdict{}, "", &errSdistOnly{
 				spec:   tgt.spec(),
 				detail: truncateForError(string(pipOut), 200),
 			}
 		}
-		return pthscan.Verdict{}, fmt.Errorf("pip download %s: %w (%s)", tgt.spec(), pipErr, truncateForError(string(pipOut), 400))
+		return pthscan.Verdict{}, "", fmt.Errorf("pip download %s: %w (%s)", tgt.spec(), pipErr, truncateForError(string(pipOut), 400))
 	}
 
-	whlPath, err := newlyWrittenWhl(workdir, before)
-	if err != nil {
-		return pthscan.Verdict{}, err
+	whlPath, whlErr := newlyWrittenWhl(workdir, before)
+	if whlErr != nil {
+		return pthscan.Verdict{}, "", whlErr
 	}
 	if whlPath == "" {
 		// pip exited 0 but wrote no wheel. This can happen when:
@@ -283,23 +305,54 @@ func downloadAndInspectWheel(ctx context.Context, realPip, workdir string, tgt w
 		//   - a wheel was already present in workdir and pip treated it as cached
 		//     (we guard against that with the before-set diff, so this is the former)
 		// Treat as sdist-only: fail-closed.
-		return pthscan.Verdict{}, &errSdistOnly{
+		return pthscan.Verdict{}, "", &errSdistOnly{
 			spec:   tgt.spec(),
 			detail: truncateForError(string(pipOut), 200),
 		}
 	}
 
-	f, err := os.Open(whlPath)
-	if err != nil {
-		return pthscan.Verdict{}, err
+	f, openErr := os.Open(whlPath)
+	if openErr != nil {
+		return pthscan.Verdict{}, "", openErr
 	}
 	defer f.Close()
 	defer os.Remove(whlPath)
-	info, err := f.Stat()
-	if err != nil {
-		return pthscan.Verdict{}, err
+
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return pthscan.Verdict{}, "", statErr
 	}
-	return wheel.Inspect(f, info.Size())
+
+	// Compute SHA-256 of the wheel for TOCTOU anchor (veto-3w1.20 partial
+	// mitigation). The hash records exactly which artifact was inspected.
+	// Full enforcement (--require-hashes during real pip install) requires
+	// threading this back through main.go; see veto-3w1.20a.
+	sha, hashErr := hashWheelFile(f)
+	if hashErr != nil {
+		return pthscan.Verdict{}, "", fmt.Errorf("hashing wheel %s: %w", whlPath, hashErr)
+	}
+
+	// Rewind for wheel.Inspect — hashWheelFile reads the whole file.
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+		return pthscan.Verdict{}, "", fmt.Errorf("seeking wheel %s: %w", whlPath, seekErr)
+	}
+
+	v, inspectErr := wheel.Inspect(f, info.Size())
+	if inspectErr != nil {
+		return pthscan.Verdict{}, "", inspectErr
+	}
+	return v, sha, nil
+}
+
+// hashWheelFile computes the hex-encoded SHA-256 of r's current content from
+// the current position to EOF. Does NOT seek; caller is responsible for
+// positioning and rewinding if needed.
+func hashWheelFile(r io.Reader) (string, error) {
+	h := sha256.New()
+	if _, err := io.Copy(h, r); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func whlSet(dir string) (map[string]struct{}, error) {
@@ -335,7 +388,11 @@ func newlyWrittenWhl(dir string, before map[string]struct{}) (string, error) {
 func printWheelRefusal(w io.Writer, findings []wheelFinding) {
 	fmt.Fprintln(w, "veto: install refused — a wheel about to be installed carries a .pth startup-hook worm (Hades / Shai-Hulud):")
 	for _, f := range findings {
-		fmt.Fprintf(w, "  - %s\n", f.spec)
+		if f.whlSHA256 != "" {
+			fmt.Fprintf(w, "  - %s  (inspected wheel sha256:%s)\n", f.spec, f.whlSHA256)
+		} else {
+			fmt.Fprintf(w, "  - %s\n", f.spec)
+		}
 		for _, sig := range f.verdict.Signals {
 			val := sig.Detail
 			if sig.Excerpt != "" {
