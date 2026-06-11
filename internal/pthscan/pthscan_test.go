@@ -143,6 +143,25 @@ func TestInspectPayloadGroupsTable(t *testing.T) {
 	}
 }
 
+// TestInspectOsSpawnFamilyIsCritical covers the os.spawn{l,le,lp,lpe,v,ve,vp,vpe}
+// posix process-launch family, which has identical attack power to os.exec*
+// but was previously missed by the spawn regex.
+func TestInspectOsSpawnFamilyIsCritical(t *testing.T) {
+	cases := []string{
+		"import os; os.spawnl(os.P_NOWAIT, '/tmp/x')",
+		"import os; os.spawnv(os.P_NOWAIT, '/tmp/x', ['x'])",
+		"import os; os.spawnlp(os.P_NOWAIT, 'sh', 'sh', '-c', 'x')",
+		"import os; os.spawnvpe(os.P_NOWAIT, 'sh', ['sh'], {})",
+	}
+	for _, body := range cases {
+		t.Run(body, func(t *testing.T) {
+			v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body + "\n")})
+			require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+			require.Contains(t, codes(v), "pth-payload-spawn")
+		})
+	}
+}
+
 func TestInspectSetupFilenameAloneIsMedium(t *testing.T) {
 	// A `*-setup.pth` with only path-entry lines and no executable line is
 	// suspicious (no real ecosystem ships this name) but not on its own a

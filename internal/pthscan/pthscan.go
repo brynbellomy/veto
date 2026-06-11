@@ -261,7 +261,7 @@ var payloadGroups = []struct {
 	{
 		code:  "pth-payload-spawn",
 		label: "spawns a process (subprocess, os.system/popen, pty.spawn, os.exec*) at interpreter startup.",
-		re:    regexp.MustCompile(`\b(?:subprocess|os\.system|os\.popen|popen|pty\.spawn|os\.exec[a-z]*)\b`),
+		re:    regexp.MustCompile(`\b(?:subprocess|os\.system|os\.popen|popen|pty\.spawn|os\.(?:exec|spawn)[a-z]*)\b`),
 	},
 	{
 		code:  "pth-payload-dynamic-exec",
