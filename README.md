@@ -398,7 +398,13 @@ veto detects this by content, not name, at four points:
    (no sdist building; nothing executed), opens each as a zip in memory,
    and inspects every `.pth` inside. Default-on for argv-direct installs;
    set `VETO_PTH_WHEEL_SCAN=full` for resolved transitives, `=off` to
-   disable.
+   disable. The prescan has a default timeout of **120 seconds**
+   (`VETO_PTH_WHEEL_SCAN_TIMEOUT` overrides it). On timeout the prescan
+   is **best-effort / fail-open** — veto logs a warning and allows the
+   install rather than blocking it indefinitely. Critical findings detected
+   before the timeout always refuse. This is an intentional UX trade-off:
+   a slow registry hiccup must not block every install. Set
+   `VETO_PTH_WHEEL_SCAN=off` to skip the prescan entirely when needed.
 4. **Claude Code hook** — a `pip install` / `uv pip install` issued by an
    agent in a poisoned environment is denied at the earliest point, with
    the worm reason instead of the usual "re-run with veto" nudge —
