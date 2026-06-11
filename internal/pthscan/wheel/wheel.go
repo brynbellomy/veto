@@ -142,8 +142,20 @@ func isPthInWheel(name string) bool {
 		return true
 	}
 	// Data scheme: <dist>-<ver>.data/purelib/<...>.pth or .../platlib/<...>.pth
-	if strings.Contains(name, ".data/purelib/") || strings.Contains(name, ".data/platlib/") {
-		return true
+	//
+	// Defense-in-depth: split on '/' and match segment positions rather than
+	// using strings.Contains. This prevents a crafted name like
+	// "malicious_purelib/foo.pth" from matching the ".data/purelib/" substring
+	// while not being in a real data-scheme purelib directory. After path.Clean
+	// the entry name has no ".." components, so the segment positions are
+	// authoritative: we require a segment ending in ".data" immediately followed
+	// by a segment that is exactly "purelib" or "platlib".
+	segs := strings.Split(name, "/")
+	for i := 0; i+2 < len(segs); i++ {
+		if strings.HasSuffix(segs[i], ".data") &&
+			(segs[i+1] == "purelib" || segs[i+1] == "platlib") {
+			return true
+		}
 	}
 	return false
 }

