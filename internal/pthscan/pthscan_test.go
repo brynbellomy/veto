@@ -227,6 +227,22 @@ func TestInspectOsSpawnFamilyIsCritical(t *testing.T) {
 	}
 }
 
+// TestInspectBareSetupFilenameAloneIsMedium covers the bare `setup.pth`
+// shape: the previous regex required a leading `-` or `_` separator
+// (`[-_]setup\.pth$`), so a worm dropping the file as plain `setup.pth`
+// inside a wheel was completely invisible to the filename heuristic.
+// Legitimate Python tooling does not ship a `setup.pth` either, so the
+// false-positive cost is the same as the `-setup.pth` variant.
+func TestInspectBareSetupFilenameAloneIsMedium(t *testing.T) {
+	v := pthscan.Inspect(pthscan.Input{
+		PthContent: []byte("some/path\n"),
+		FileName:   "setup.pth",
+	})
+	require.True(t, v.Flagged(), "got %v", codes(v))
+	require.Equal(t, pthscan.SeverityMedium, v.Severity)
+	require.True(t, hasSignal(v, "pth-setup-filename"))
+}
+
 func TestInspectSetupFilenameAloneIsMedium(t *testing.T) {
 	// A `*-setup.pth` with only path-entry lines and no executable line is
 	// suspicious (no real ecosystem ships this name) but not on its own a

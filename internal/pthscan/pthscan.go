@@ -323,7 +323,7 @@ var payloadGroups = []struct {
 // not known to ship `<name>-setup.pth`; the convention is `distutils-precedence.pth`,
 // `__editable__.<name>-<ver>.pth`, `easy-install.pth`, or per-package names
 // without a `-setup` suffix.
-var fileNameSetupRe = regexp.MustCompile(`(?i)[-_]setup\.pth$`)
+var fileNameSetupRe = regexp.MustCompile(`(?i)(^|[-_])setup\.pth$`)
 
 // scanPayloadSignals returns the per-group critical signals firing on body
 // (an executable line with its leading whitespace already removed).
