@@ -59,7 +59,6 @@ func (s *Scanner) Scan(ctx context.Context) scan.Result {
 		if root == "" {
 			continue
 		}
-		insideSitePackages := false
 		if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -87,7 +86,6 @@ func (s *Scanner) Scan(ctx context.Context) scan.Result {
 			if !insideSitePackagesPath(path) {
 				return nil
 			}
-			_ = insideSitePackages
 			result.FilesScanned++
 			finding, err := s.scanPth(path)
 			if err != nil {
