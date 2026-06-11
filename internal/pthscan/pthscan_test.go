@@ -143,6 +143,49 @@ func TestInspectPayloadGroupsTable(t *testing.T) {
 	}
 }
 
+// TestInspectBuiltinsAccessIsCritical covers the `getattr(__builtins__, …)`
+// and `__builtins__['exec']` indirection shapes \u2014 the canonical bypass
+// against a regex that only knows the literal name `exec(`. We also flag
+// any direct reference to the builtins namespace (`__builtins__.x`,
+// `import builtins`, `builtins.exec`) because no legitimate .pth file
+// reaches into builtins at interpreter startup.
+func TestInspectBuiltinsAccessIsCritical(t *testing.T) {
+	cases := []struct {
+		body string
+		want []string
+	}{
+		{
+			body: `import os; getattr(__builtins__, 'exec')("import os; os.system('x')")`,
+			want: []string{"pth-payload-dynamic-exec", "pth-payload-builtins-access"},
+		},
+		{
+			body: `import os; getattr(builtins, 'exec')("x")`,
+			want: []string{"pth-payload-dynamic-exec", "pth-payload-builtins-access"},
+		},
+		{
+			body: `import os; __builtins__['exec']("import os; os.system('x')")`,
+			want: []string{"pth-payload-builtins-access"},
+		},
+		{
+			body: `import os; __builtins__.exec("import os; os.system('x')")`,
+			want: []string{"pth-payload-builtins-access"},
+		},
+		{
+			body: `import builtins; builtins.exec("x")`,
+			want: []string{"pth-payload-builtins-access"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.body, func(t *testing.T) {
+			v := pthscan.Inspect(pthscan.Input{PthContent: []byte(tc.body + "\n")})
+			require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+			for _, want := range tc.want {
+				require.Contains(t, codes(v), want, "missing %s", want)
+			}
+		})
+	}
+}
+
 // TestInspectDynamicExecWithWhitespaceBeforeParen covers the
 // `__import__ ('os')` / `exec  (...)` shape. Python is fully happy with
 // whitespace between the callable name and the opening paren, so a regex

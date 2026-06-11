@@ -265,8 +265,23 @@ var payloadGroups = []struct {
 	},
 	{
 		code:  "pth-payload-dynamic-exec",
-		label: "evaluates code dynamically (exec/eval/compile/__import__ on a computed string).",
-		re:    regexp.MustCompile(`\b(?:exec|eval|compile|__import__)\s*\(`),
+		label: "evaluates code dynamically (exec/eval/compile/__import__/getattr on a computed string).",
+		// getattr is included because the canonical bypass shape is
+		// `getattr(__builtins__, 'exec')(payload)` \u2014 indirecting the dangerous
+		// symbol through getattr defeats a name-based regex on `exec(` alone.
+		// getattr is also useful enough in real code that pairing it with the
+		// __builtins__ attribute-access signal below preserves specificity.
+		re: regexp.MustCompile(`\b(?:exec|eval|compile|__import__|getattr)\s*\(`),
+	},
+	{
+		code:  "pth-payload-builtins-access",
+		label: "names `__builtins__` or `builtins` directly \u2014 startup-time scripts have no legitimate reason to reach into the builtins namespace; an attacker uses this to indirect through exec/eval/__import__ past a name-based filter.",
+		// Matches: `__builtins__.exec`, `__builtins__['exec']`,
+		// `getattr(__builtins__, ...)`, `import builtins`,
+		// `builtins.exec(...)`, etc. We deliberately catch both the dunder
+		// (interpreter-injected) and the module form because the module is
+		// `import builtins` and is the documented portable handle.
+		re: regexp.MustCompile(`\b(?:__builtins__|builtins)\b`),
 	},
 	{
 		code:  "pth-payload-deobfuscation",
