@@ -1625,5 +1625,11 @@ Environment:
                      enable / disable the .pth wheel prescan for the Hades
                      PyPI worm. Values: on (default; argv-direct only),
                      full (also fetch resolved transitives), off.
+  VETO_PTH_WHEEL_SCAN_TIMEOUT
+                     timeout for the wheel prescan (default: 120s). The prescan
+                     is best-effort: on timeout veto logs a warning and allows
+                     the install (fail-open). Critical findings detected before
+                     the timeout always refuse. Set VETO_PTH_WHEEL_SCAN=off to
+                     skip the prescan entirely.
 `)
 }
