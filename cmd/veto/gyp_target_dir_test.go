@@ -107,6 +107,147 @@ func TestInstallTargetDir(t *testing.T) {
 			args: []string{"install", "--prefix", filepath.Join(t.TempDir(), "first"), "--prefix", absoluteTarget},
 			want: absoluteTarget,
 		},
+
+		// ── Python-family: pip ────────────────────────────────────────────
+		{
+			name: "pip --target space form",
+			pm:   "pip",
+			args: []string{"install", "--target", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip --target equals form",
+			pm:   "pip",
+			args: []string{"install", "--target=" + absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip -t short form",
+			pm:   "pip",
+			args: []string{"install", "-t", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip -t equals form",
+			pm:   "pip",
+			args: []string{"install", "-t=" + absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip --target relative form",
+			pm:   "pip",
+			args: []string{"install", "--target", "vendor", "requests"},
+			want: filepath.Join(cwd, "vendor"),
+		},
+		{
+			name: "pip --prefix space form",
+			pm:   "pip",
+			args: []string{"install", "--prefix", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip --prefix equals form",
+			pm:   "pip",
+			args: []string{"install", "--prefix=" + absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip --root space form",
+			pm:   "pip",
+			args: []string{"install", "--root", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip --root equals form",
+			pm:   "pip",
+			args: []string{"install", "--root=" + absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip no target flag returns cwd",
+			pm:   "pip",
+			args: []string{"install", "requests"},
+			want: cwd,
+		},
+		{
+			name: "pip3 --target space form",
+			pm:   "pip3",
+			args: []string{"install", "--target", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip3 -t equals form",
+			pm:   "pip3",
+			args: []string{"install", "-t=" + absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "pip3 no target flag returns cwd",
+			pm:   "pip3",
+			args: []string{"install", "requests"},
+			want: cwd,
+		},
+
+		// ── Python-family: uv pip install ────────────────────────────────
+		{
+			name: "uv --target space form",
+			pm:   "uv",
+			args: []string{"pip", "install", "--target", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "uv --target equals form",
+			pm:   "uv",
+			args: []string{"pip", "install", "--target=" + absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "uv -t short form",
+			pm:   "uv",
+			args: []string{"pip", "install", "-t", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "uv --prefix space form",
+			pm:   "uv",
+			args: []string{"pip", "install", "--prefix", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "uv --root space form",
+			pm:   "uv",
+			args: []string{"pip", "install", "--root", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+		{
+			name: "uv no target flag returns cwd",
+			pm:   "uv",
+			args: []string{"pip", "install", "requests"},
+			want: cwd,
+		},
+		{
+			name: "uv last matching flag wins",
+			pm:   "uv",
+			args: []string{"pip", "install", "--target", filepath.Join(t.TempDir(), "first"), "--target", absoluteTarget, "requests"},
+			want: absoluteTarget,
+		},
+
+		// ── Python-family: poetry / pdm — no supported target-dir flags ──
+		// These PMs manage installs into their own venvs; --directory/
+		// --project select the project root, not the install destination.
+		// installTargetDir correctly returns cwd for them.
+		{
+			name: "poetry falls through to cwd",
+			pm:   "poetry",
+			args: []string{"add", "--directory", absoluteTarget, "requests"},
+			want: cwd,
+		},
+		{
+			name: "pdm falls through to cwd",
+			pm:   "pdm",
+			args: []string{"add", "--project", absoluteTarget, "requests"},
+			want: cwd,
+		},
 	}
 
 	for _, tc := range cases {
