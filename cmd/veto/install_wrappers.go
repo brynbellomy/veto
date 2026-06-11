@@ -43,6 +43,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
+	"github.com/brynbellomy/veto/internal/packagemanager/pmsurvey"
 )
 
 // wrapperSuffix is the rename target. `.veto-original` is verbose on
@@ -125,6 +126,10 @@ func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
 // vs. just unwritable-dir skips. The public runInstallWrappers wraps this
 // and discards the stats — preserves the existing standalone-command exit
 // contract (non-zero only on stats.failed > 0, per the original logic).
+//
+// Thin shim: resolves the veto binary identity then delegates to
+// runInstallWrappersWith. Tests plant their own veto binary in a tempdir
+// and call the *With variant directly.
 func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []string) (int, wrapperStats) {
 	opts, err := parseWrapperFlags(args)
 	if err != nil {
@@ -137,8 +142,19 @@ func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []strin
 		logger.Error().Err(err).Msg("locate veto binary")
 		return exitInternal, wrapperStats{}
 	}
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoPath)
+	if err != nil {
+		logger.Error().Err(err).Msg("build veto identity")
+		return exitInternal, wrapperStats{}
+	}
+	return runInstallWrappersWith(logger, cfg, opts, vetoPath, vetoID)
+}
 
-	candidates, err := discoverWrapCandidates(opts, vetoPath)
+// runInstallWrappersWith is the install-wrappers worker. It takes a
+// pre-built VetoIdentity so tests can drive it against a planted veto
+// binary in a tempdir without going through os.Executable.
+func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags, vetoPath string, vetoID *pmsurvey.VetoIdentity) (int, wrapperStats) {
+	candidates, err := discoverWrapCandidatesWith(opts, vetoID)
 	if err != nil {
 		logger.Error().Err(err).Msg("discover wrap candidates")
 		return exitInternal, wrapperStats{}
@@ -232,6 +248,26 @@ func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []strin
 						Msg("WAL rollback save failed; re-run install-wrappers to reconcile")
 				}
 			}
+		case action == wrapperActionSkipBrokenSymlink:
+			stats.skippedBroken++
+			fmt.Fprintf(os.Stderr, "  %-10s  SKIP  %s — broken symlink to %s (likely a previous wrapper tool's leftover; restore `<path>.veto-original` if present, then re-run)\n",
+				c.pm, c.path, c.target)
+			if !alreadyHad && !opts.dryRun {
+				state.remove(c.path)
+				if rbErr := saveWrapperState(cfg, state); rbErr != nil {
+					logger.Warn().Err(rbErr).Str("path", c.path).Msg("WAL rollback save failed")
+				}
+			}
+		case action == wrapperActionSkipForeignWrapper:
+			stats.skippedForeign++
+			fmt.Fprintf(os.Stderr, "  %-10s  SKIP  %s — symlink to %s, which is not the veto binary (foreign wrapper; pass --force to overwrite)\n",
+				c.pm, c.path, c.target)
+			if !alreadyHad && !opts.dryRun {
+				state.remove(c.path)
+				if rbErr := saveWrapperState(cfg, state); rbErr != nil {
+					logger.Warn().Err(rbErr).Str("path", c.path).Msg("WAL rollback save failed")
+				}
+			}
 		case action == wrapperActionSkipAlreadyOurs:
 			// The filesystem says this is wrapped. If state agrees, silent
 			// no-op. If state doesn't know about it (alreadyHad was false
@@ -271,8 +307,9 @@ func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []strin
 		}
 	}
 
-	fmt.Printf("\nSummary: %d wrapped, %d reconciled, %d already-ours, %d would-wrap, %d skipped (needs sudo), %d failed\n",
-		stats.wrapped, stats.reconciled, stats.alreadyOurs, stats.wouldWrap, stats.skippedUnwritable, stats.failed)
+	fmt.Printf("\nSummary: %d wrapped, %d reconciled, %d already-ours, %d would-wrap, %d skipped (needs sudo), %d skipped (broken symlink), %d skipped (foreign wrapper), %d failed\n",
+		stats.wrapped, stats.reconciled, stats.alreadyOurs, stats.wouldWrap, stats.skippedUnwritable,
+		stats.skippedBroken, stats.skippedForeign, stats.failed)
 	printUnwritableRemediation(skipped)
 	if stats.failed > 0 {
 		return exitInternal, stats
@@ -408,6 +445,8 @@ type wrapperStats struct {
 	alreadyOurs       int
 	wouldWrap         int
 	skippedUnwritable int
+	skippedBroken     int
+	skippedForeign    int
 	failed            int
 }
 
@@ -422,6 +461,19 @@ const (
 	// the user can finish under sudo. Reported as a skip with a
 	// copy-pasteable remediation command rather than aborting install-all.
 	wrapperActionSkipUnwritable
+	// wrapperActionSkipBrokenSymlink: discovery found a symlink whose
+	// target does not exist (typically a leftover from a previous
+	// wrapper tool whose binary was uninstalled). install-wrappers
+	// emits a visible SKIP line so the user can decide whether to
+	// delete the orphan rather than silently dropping the candidate.
+	wrapperActionSkipBrokenSymlink
+	// wrapperActionSkipForeignWrapper: discovery found a symlink to a
+	// binary whose SHA-256 does not match the running veto. Without
+	// --force, install-wrappers emits a visible SKIP line and leaves
+	// the symlink in place — overwriting could break whatever tool
+	// installed it. With --force, applyWrapper falls through to the
+	// regular wrap path.
+	wrapperActionSkipForeignWrapper
 	wrapperActionWrapped
 )
 
@@ -461,19 +513,31 @@ func parseWrapperFlags(args []string) (wrapperFlags, error) {
 
 // wrapCandidate is one (dir, pm) pair discovery surfaced.
 type wrapCandidate struct {
-	path   string // absolute path to the existing PM file
-	pm     string // basename (e.g. "npm")
-	source string // "homebrew", "mise", "asdf", "user"
+	path   string                  // absolute path to the existing PM file
+	pm     string                  // basename (e.g. "npm")
+	source string                  // "homebrew", "mise", "asdf", "user"
+	class  pmsurvey.Classification // result of pmsurvey.ClassifySymlink at discovery time
+	target string                  // resolved symlink target when class != ClassReal; "" otherwise
 }
 
 // discoverWrapCandidates walks the well-known install-dir patterns
-// looking for files whose basename matches one of wrappedManagers. We
-// emit a candidate for any path that is either (a) wrappable
-// (executable real binary, not yet ours) or (b) already a veto wrapper
-// (symlink-to-veto with a `.veto-original` sibling). The latter look
-// like no-ops to applyWrapper but let runInstallWrappers reconcile them
-// into wrappers.json when state has drifted from filesystem reality.
+// AND $PATH looking for files whose basename matches one of
+// wrappedManagers. Thin shim over discoverWrapCandidatesWith; tests use
+// the latter directly with a pre-built VetoIdentity.
 func discoverWrapCandidates(opts wrapperFlags, vetoPath string) ([]wrapCandidate, error) {
+	id, err := pmsurvey.VetoIdentityFor(vetoPath)
+	if err != nil {
+		return nil, errors.With(err, "discover wrap candidates")
+	}
+	return discoverWrapCandidatesWith(opts, id)
+}
+
+// discoverWrapCandidatesWith uses pmsurvey.PathsFor to enumerate every
+// absolute path on this host where each wrapped PM could live
+// (well-known roots plus $PATH minus shim dirs) and pmsurvey.ClassifySymlink
+// to pre-classify each candidate so applyWrapper can dispatch on
+// broken / foreign / ours without re-walking the disk.
+func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([]wrapCandidate, error) {
 	candidates := []wrapCandidate{}
 	pmFilter := func(name string) bool {
 		if len(opts.only) == 0 {
@@ -482,131 +546,81 @@ func discoverWrapCandidates(opts wrapperFlags, vetoPath string) ([]wrapCandidate
 		_, ok := opts.only[name]
 		return ok
 	}
-	include := func(p string) bool {
-		return isWrappableTarget(p, vetoPath) || isAlreadyOursWrap(p, vetoPath)
+
+	seen := map[string]struct{}{}
+	add := func(c wrapCandidate) {
+		if _, dup := seen[c.path]; dup {
+			return
+		}
+		seen[c.path] = struct{}{}
+		candidates = append(candidates, c)
 	}
 
-	// 1) Homebrew prefix dirs. On Apple Silicon, /opt/homebrew/bin; on
-	//    Intel, /usr/local/bin. We check both — the wrong one will be
-	//    a no-op rather than a failure.
-	for _, dir := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
-		for _, pm := range wrappedManagers {
-			if !pmFilter(pm) {
+	for _, pm := range wrappedManagers {
+		if !pmFilter(pm) {
+			continue
+		}
+		for _, path := range pmsurvey.PathsFor(pm) {
+			class, target, classErr := pmsurvey.ClassifySymlink(path, id)
+			if classErr != nil {
+				// I/O failure on a candidate is not a discovery error —
+				// applyWrapper will surface it per-candidate. Include
+				// the path with ClassReal so the regular path runs and
+				// the FAIL line emits if rename fails.
+				add(wrapCandidate{path: path, pm: pm, source: sourceFor(path), class: pmsurvey.ClassReal, target: ""})
 				continue
 			}
-			p := filepath.Join(dir, pm)
-			if include(p) {
-				candidates = append(candidates, wrapCandidate{path: p, pm: pm, source: "homebrew"})
-			}
+			add(wrapCandidate{path: path, pm: pm, source: sourceFor(path), class: class, target: target})
 		}
 	}
 
-	// 2) mise install dirs: ~/.local/share/mise/installs/<tool>/<v>/bin/<pm>.
-	if home, err := os.UserHomeDir(); err == nil {
-		miseRoot := filepath.Join(home, ".local", "share", "mise", "installs")
-		candidates = appendWrapCandidates(candidates, globToolVersionBinDirs(miseRoot), wrappedManagers, pmFilter, include, "mise")
-		// 3) asdf: ~/.asdf/installs/<tool>/<v>/bin/<pm>.
-		asdfRoot := filepath.Join(home, ".asdf", "installs")
-		candidates = appendWrapCandidates(candidates, globToolVersionBinDirs(asdfRoot), wrappedManagers, pmFilter, include, "asdf")
-		// 4) pyenv: ~/.pyenv/versions/<v>/bin/<pm>.
-		pyenvRoot := filepath.Join(home, ".pyenv", "versions")
-		candidates = appendWrapCandidates(candidates, globVersionBinDirs(pyenvRoot), wrappedManagers, pmFilter, include, "pyenv")
-		// 5) nvm: ~/.nvm/versions/node/<v>/bin/<pm>.
-		nvmRoot := filepath.Join(home, ".nvm", "versions", "node")
-		candidates = appendWrapCandidates(candidates, globVersionBinDirs(nvmRoot), wrappedManagers, pmFilter, include, "nvm")
-		// 6) Direct bun install: ~/.bun/bin
-		bunDir := filepath.Join(home, ".bun", "bin")
-		for _, pm := range []string{"bun", "bunx"} {
-			if !pmFilter(pm) {
-				continue
-			}
-			p := filepath.Join(bunDir, pm)
-			if include(p) {
-				candidates = append(candidates, wrapCandidate{path: p, pm: pm, source: "bun"})
-			}
-		}
-	}
-
-	// 7) User-supplied --dir entries.
+	// User-supplied --dir entries. These are NOT discovered via
+	// pmsurvey (the user knows where they live), but they still
+	// benefit from classification so applyWrapper handles broken /
+	// foreign cases uniformly.
 	for _, dir := range opts.dirs {
 		for _, pm := range wrappedManagers {
 			if !pmFilter(pm) {
 				continue
 			}
 			p := filepath.Join(dir, pm)
-			if include(p) {
-				candidates = append(candidates, wrapCandidate{path: p, pm: pm, source: "user"})
+			class, target, classErr := pmsurvey.ClassifySymlink(p, id)
+			if classErr != nil {
+				// A --dir entry that doesn't exist is a no-op, not an error.
+				continue
 			}
+			add(wrapCandidate{path: p, pm: pm, source: "user", class: class, target: target})
 		}
 	}
 
 	return candidates, nil
 }
 
-func appendWrapCandidates(candidates []wrapCandidate, binDirs []string, managers []string, pmFilter func(string) bool, include func(string) bool, source string) []wrapCandidate {
-	for _, binDir := range binDirs {
-		for _, pm := range managers {
-			if !pmFilter(pm) {
-				continue
-			}
-			p := filepath.Join(binDir, pm)
-			if include(p) {
-				candidates = append(candidates, wrapCandidate{path: p, pm: pm, source: source})
-			}
-		}
+// sourceFor returns a short label describing where a path was
+// discovered, used for diagnostic output ("homebrew" / "mise" / etc.).
+// Heuristic based on path substrings — exact match is impossible since
+// pmsurvey returns flat paths.
+func sourceFor(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/opt/homebrew/"), strings.HasPrefix(path, "/usr/local/bin/"):
+		return "homebrew"
+	case strings.Contains(path, "/.local/share/mise/installs/"):
+		return "mise"
+	case strings.Contains(path, "/.asdf/installs/"):
+		return "asdf"
+	case strings.Contains(path, "/.pyenv/versions/"):
+		return "pyenv"
+	case strings.Contains(path, "/.nvm/versions/node/"):
+		return "nvm"
+	case strings.Contains(path, "/.bun/bin"):
+		return "bun"
+	case strings.Contains(path, "/.cargo/bin"):
+		return "cargo"
+	case strings.HasPrefix(path, "/usr/bin/"), strings.HasPrefix(path, "/usr/sbin/"):
+		return "system"
+	default:
+		return "path"
 	}
-	return candidates
-}
-
-// globToolVersionBinDirs returns every `<tool>/<version>/bin` directory under
-// a version-manager root such as mise's installs root or asdf's installs root.
-func globToolVersionBinDirs(root string) []string {
-	out := []string{}
-	tools, err := os.ReadDir(root)
-	if err != nil {
-		return out
-	}
-	for _, tool := range tools {
-		if !tool.IsDir() {
-			continue
-		}
-		toolDir := filepath.Join(root, tool.Name())
-		versions, err := os.ReadDir(toolDir)
-		if err != nil {
-			continue
-		}
-		for _, v := range versions {
-			if !v.IsDir() {
-				continue
-			}
-			binDir := filepath.Join(toolDir, v.Name(), "bin")
-			if info, err := os.Stat(binDir); err == nil && info.IsDir() {
-				out = append(out, binDir)
-			}
-		}
-	}
-	return out
-}
-
-// globVersionBinDirs returns every `<version>/bin` directory under a
-// version-manager root such as pyenv's versions root or nvm's node versions
-// root.
-func globVersionBinDirs(root string) []string {
-	out := []string{}
-	versions, err := os.ReadDir(root)
-	if err != nil {
-		return out
-	}
-	for _, v := range versions {
-		if !v.IsDir() {
-			continue
-		}
-		binDir := filepath.Join(root, v.Name(), "bin")
-		if info, err := os.Stat(binDir); err == nil && info.IsDir() {
-			out = append(out, binDir)
-		}
-	}
-	return out
 }
 
 // pointsAtVeto reports whether linkPath (a symlink) resolves to the
@@ -703,6 +717,25 @@ func isWrappableTarget(p, vetoPath string) bool {
 // recoverable state: the user can move .veto-original back manually,
 // or re-run install-wrappers to retry.
 func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAction, error) {
+	// Classification-driven short-circuits for the broken / foreign
+	// cases. Discovery (discoverWrapCandidatesWith) pre-classifies
+	// every candidate via pmsurvey.ClassifySymlink, so applyWrapper
+	// can dispatch without re-walking the disk.
+	switch c.class {
+	case pmsurvey.ClassBrokenSymlink:
+		return wrapperActionSkipBrokenSymlink, nil
+	case pmsurvey.ClassForeignWrapper:
+		// Without --force, leave foreign wrappers in place — overwriting
+		// them silently could break whatever installed them. The skip
+		// emits a visible line with the target so the user can decide.
+		// With --force, fall through to the regular wrap path; the
+		// existing rename dance moves the foreign symlink to
+		// .veto-original.
+		if !force {
+			return wrapperActionSkipForeignWrapper, nil
+		}
+	}
+
 	original := c.path + wrapperSuffix
 
 	// Already wrapped? `c.path` is a symlink that resolves to the SAME
