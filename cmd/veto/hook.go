@@ -144,6 +144,17 @@ func runClaudeCodeHook(logger zerolog.Logger, stdin io.Reader, stdout io.Writer)
 		}
 	}
 
+	// Hades / Shai-Hulud .pth startup-hook worm check. Symmetrical to the
+	// npm-family branch above: site.py loads a .pth at every interpreter
+	// startup, so prefixing the command with `veto` would NOT make a
+	// poisoned environment safe to install into — the worm fires before
+	// the install completes. Deny directly with the worm reason.
+	if isPythonFamilyPM(finding.PM) {
+		if reason, found := pthWormReasonForTree(logger, finding.PM, hookPMArgs(finding.Tokens)); found {
+			return writeDecisionOrFail(stdout, reason)
+		}
+	}
+
 	// Defense layer 2: if veto itself isn't on PATH at hook time,
 	// telling the agent to "prefix with veto" is useless. Fail closed
 	// loudly so the mis-install is visible.
@@ -185,6 +196,35 @@ var npmFamilyHookPMs = map[string]struct{}{
 func isNpmFamilyPM(pm string) bool {
 	_, ok := npmFamilyHookPMs[pm]
 	return ok
+}
+
+// pythonFamilyHookPMs are the package-manager finding names whose installs
+// run inside a Python interpreter / venv — i.e. whose target tree has a
+// site-packages and could carry a Hades .pth worm.
+var pythonFamilyHookPMs = map[string]struct{}{
+	"pip": {}, "pip3": {}, "uv": {}, "pipx": {}, "poetry": {}, "pdm": {}, "uvx": {},
+}
+
+func isPythonFamilyPM(pm string) bool {
+	_, ok := pythonFamilyHookPMs[pm]
+	return ok
+}
+
+// pthWormReasonForTree scans the target install tree's site-packages dirs
+// for a critical .pth worm match and, if found, returns a hook-shaped deny
+// reason. found=false means clean (or scan-error / cwd-unresolvable — all
+// non-blocking, mirroring gypWormReasonForTree).
+func pthWormReasonForTree(logger zerolog.Logger, pmName string, pmArgs []string) (string, bool) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		logger.Warn().Err(err).Msg("hook .pth check: resolve cwd failed; skipping")
+		return "", false
+	}
+	var buf strings.Builder
+	if !pthPreflightRoots(logger, &buf, pthScanRootsForInstall(pmName, pmArgs, cwd)) {
+		return "", false
+	}
+	return "veto-hook: BLOCKED — " + buf.String(), true
 }
 
 func hookPMArgs(tokens []string) []string {

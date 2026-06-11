@@ -1,0 +1,455 @@
+// Package pthscan is a content heuristic for the Hades / Shai-Hulud PyPI
+// supply-chain worm (June 2026), the Python branch of the same Miasma
+// lineage gypscan fights on npm. The worm ships its payload as a `*-setup.pth`
+// file inside a wheel; Python's `site` module evaluates every `*.pth` whose
+// first token is `import` at each interpreter startup, so the file detonates
+// on the next `python` invocation in a poisoned environment — every time, not
+// just at install.
+//
+// pthscan reads a single `.pth` file's bytes and classifies it as benign,
+// structurally anomalous, or worm-shaped. It performs no I/O, runs no
+// Python, and never executes the file. Callers (the scan walker, the
+// wheel prescan, the Claude Code hook) own the bytes and turn a Verdict
+// into their own finding/refusal type.
+package pthscan
+
+import (
+	"bytes"
+	"regexp"
+	"strings"
+)
+
+// utf8BOM is the leading byte sequence CPython's site.py strips before
+// decoding a .pth file. If we don't strip it too, the first executable line
+// arrives at the prefix check carrying \xEF\xBB\xBF in front of `import`,
+// fails HasPrefix("import "), and the whole payload is treated as inert.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// utf16BOMLE / utf16BOMBE are the UTF-16 byte-order marks. CPython's
+// site.py won't actually `exec()` a UTF-16-encoded .pth (it opens the file
+// in text mode with the default encoding, which is UTF-8 on every modern
+// platform), but an attacker who confuses a future encoding-detection layer
+// shouldn't be able to use one of these as a covering blanket. We refuse to
+// scan UTF-16 .pth files outright and emit Critical so the install gets
+// refused rather than silently green-lit by a scanner that can't see the
+// bytes it would need to flag.
+var (
+	utf16BOMLE = []byte{0xFF, 0xFE}
+	utf16BOMBE = []byte{0xFE, 0xFF}
+)
+
+// Severity ranks how confident pthscan is that a .pth is malicious.
+type Severity string
+
+const (
+	// SeverityNone: only inert path lines, or an executable line matching
+	// the tightly-anchored known-legit allowlist (distutils-precedence,
+	// PEP 660 __editable__*, legacy easy-install).
+	SeverityNone Severity = "none"
+
+	// SeverityMedium: an executable .pth line that is neither obviously
+	// payload-shaped nor on the allowlist — a structural anomaly worth
+	// surfacing in `veto scan`, not on its own enough to block the
+	// install hot path.
+	SeverityMedium Severity = "medium"
+
+	// SeverityCritical: a confirmed startup-time code-execution payload —
+	// an `import`-line carrying network / spawn / dynamic-exec /
+	// deobfuscation / runtime-fetch / worm-marker tokens. This is the
+	// Hades / Shai-Hulud signature. Do not install; do not run python in
+	// this environment.
+	SeverityCritical Severity = "critical"
+)
+
+// Signal is one matched heuristic.
+type Signal struct {
+	Code    string
+	Detail  string
+	Excerpt string
+}
+
+// Verdict is the result of inspecting one .pth file.
+type Verdict struct {
+	Severity Severity
+	Signals  []Signal
+}
+
+// Flagged reports whether the .pth is suspicious enough to surface or block.
+func (v Verdict) Flagged() bool {
+	return v.Severity == SeverityMedium || v.Severity == SeverityCritical
+}
+
+// Input is everything pthscan needs to classify one .pth.
+type Input struct {
+	// PthContent is the raw bytes of the .pth file. Required.
+	PthContent []byte
+
+	// FileName is the base name (e.g. "evil-setup.pth"). Optional but
+	// recommended: a `*-setup.pth` name is a worm marker on its own.
+	FileName string
+
+	// SiblingFiles is a flat list of base names alongside the .pth in
+	// the same dist. Optional; currently unused but reserved for future
+	// "is this distribution shipping anything else?" heuristics.
+	SiblingFiles []string
+
+	// Truncated indicates the caller hit its size cap and PthContent
+	// holds only a prefix. pthscan treats a truncated .pth as critical
+	// (fail-closed: a worm can hide past the cap).
+	Truncated bool
+}
+
+const maxExcerpt = 200
+
+// Inspect classifies a single .pth file. It never errors: an empty .pth
+// yields SeverityNone (Python ignores blank files), and every positive
+// signal is additive. Inspect is pure and safe for concurrent use.
+func Inspect(in Input) Verdict {
+	if in.Truncated {
+		return Verdict{
+			Severity: SeverityCritical,
+			Signals: []Signal{{
+				Code:   "pth-file-too-large",
+				Detail: ".pth file exceeded the scanner size cap and cannot be fully inspected; treating as unscannable so payloads cannot hide after the read cap.",
+			}},
+		}
+	}
+	raw := in.PthContent
+	// UTF-16 .pth files are not a CPython-supported shape, but a scanner
+	// that can't see import-line bytes shouldn't quietly pass the file as
+	// inert. Fail closed.
+	if bytes.HasPrefix(raw, utf16BOMLE) || bytes.HasPrefix(raw, utf16BOMBE) {
+		return Verdict{
+			Severity: SeverityCritical,
+			Signals: []Signal{{
+				Code:    "pth-unscannable-encoding",
+				Detail:  ".pth file begins with a UTF-16 byte-order mark; pthscan only decodes UTF-8 and refuses to scan UTF-16 content rather than green-light a file whose import-lines it can't read.",
+				Excerpt: "UTF-16 BOM",
+			}},
+		}
+	}
+	// CPython's site.py strips a leading UTF-8 BOM before splitlines();
+	// mirror that so the import-prefix check sees the same bytes site.py
+	// does. Without this strip the first line is "\xEF\xBB\xBFimport ..."
+	// which TrimLeft(" \t") leaves untouched and the prefix check rejects.
+	raw = bytes.TrimPrefix(raw, utf8BOM)
+	content := string(raw)
+	if strings.TrimSpace(content) == "" {
+		return Verdict{Severity: SeverityNone}
+	}
+
+	var signals []Signal
+	severity := SeverityNone
+	bump := func(s Severity) {
+		if severityRank(s) > severityRank(severity) {
+			severity = s
+		}
+	}
+
+	// Track which payload group codes already fired (or were explicitly
+	// allowed) on a per-line basis. The safety-net content scan below only
+	// emits a signal for groups whose token shows up in the body but did
+	// NOT appear inside any line our line-gate inspected — so a known-bad
+	// line firing `pth-payload-spawn` doesn't also produce a redundant
+	// out-of-gate Medium signal, and a known-legit line (distutils,
+	// editable, easy-install) carrying `__import__(` in its allowed shape
+	// doesn't either.
+	gatedCodes := make(map[string]struct{})
+	markGated := func(body string) {
+		for _, g := range payloadGroups {
+			if g.re.MatchString(body) {
+				gatedCodes[g.code] = struct{}{}
+			}
+		}
+	}
+
+	for _, body := range executableLines(content) {
+		if matchesKnownLegit(body) {
+			// A whitelisted body still consumed its payload tokens —
+			// record them as gated so the safety net below doesn't fire
+			// on the exact same characters from a different angle.
+			markGated(body)
+			continue
+		}
+		if payload := scanPayloadSignals(body); len(payload) > 0 {
+			signals = append(signals, payload...)
+			for _, s := range payload {
+				gatedCodes[s.Code] = struct{}{}
+			}
+			bump(SeverityCritical)
+			continue
+		}
+		signals = append(signals, Signal{
+			Code:    "pth-executable-line",
+			Detail:  "executable `import …` line in a .pth file with no payload tokens, but not on the known-legit allowlist — site.py exec()'s these at every interpreter startup.",
+			Excerpt: excerpt(body),
+		})
+		bump(SeverityMedium)
+	}
+
+	// Defense in depth: also run the payload regex group over the whole
+	// content body. If a token shows up in bytes that the line-gate
+	// classified as inert (comment, path entry, line below a splitlines()
+	// terminator we didn't recognize), the line-gate alone wouldn't have
+	// surfaced it. Emit a Medium safety-net signal so a human reviewer can
+	// take a look — we deliberately stay below SeverityCritical here so a
+	// future parser-divergence bug surfaces in `veto scan` output without
+	// auto-refusing every install that happens to mention `exec(` inside a
+	// comment. Known-legit lines and already-Critical lines have their
+	// tokens recorded in gatedCodes above so we don't double-fire.
+	for _, g := range payloadGroups {
+		if _, alreadyGated := gatedCodes[g.code]; alreadyGated {
+			continue
+		}
+		if g.re.MatchString(content) {
+			signals = append(signals, Signal{
+				Code:    "pth-content-payload-token-out-of-gate",
+				Detail:  "payload token `" + g.code + "` matched the .pth content but did not appear inside any line our import-prefix gate classified as executable — likely a benign mention in a comment or path entry, but flagged at Medium as a safety net against future parser-divergence bypasses.",
+				Excerpt: excerpt(g.re.FindString(content)),
+			})
+			bump(SeverityMedium)
+		}
+	}
+
+	if in.FileName != "" && fileNameSetupRe.MatchString(in.FileName) && !allowlistedLegitName.MatchString(in.FileName) {
+		signals = append(signals, Signal{
+			Code:    "pth-setup-filename",
+			Detail:  ".pth filename matches the Hades `*-setup.pth` worm shape — legitimate Python tooling does not ship `-setup.pth` files; the canonical names are distutils-precedence.pth, __editable__.<name>-<ver>.pth, or per-package <name>.pth without a `-setup` suffix.",
+			Excerpt: in.FileName,
+		})
+		bump(SeverityMedium)
+	}
+
+	return Verdict{Severity: severity, Signals: signals}
+}
+
+// isCPythonLineTerm reports whether r is a character CPython's str.splitlines()
+// treats as a line terminator. site.py runs `f.read().splitlines()` on the
+// decoded .pth content, so any of these in the file body starts a fresh line
+// from the parser's point of view. Splitting on a strict subset (e.g. only
+// "\n") collapses two distinct lines into one and lets a `# comment\rimport os…`
+// shape slip past the comment-skip filter as a single inert-looking line —
+// veto-3w1.4 was exactly that bug.
+//
+// CPython's set (per the str.splitlines() docs):
+//
+//	\n  LF       \r  CR        \r\n  CR+LF (handled as one terminator)
+//	\v  0x0B     \f  0x0C
+//	\x1c FS      \x1d GS       \x1e RS
+//	NEL (\u0085)
+//	LS  (\u2028)
+//	PS  (\u2029)
+//
+// We deliberately drive the line splitter from strings.FieldsFunc over this
+// predicate rather than a hand-rolled byte loop. FieldsFunc has two
+// properties the byte loop didn't have:
+//
+//  1. it iterates by rune, not byte, so multibyte terminators (NEL, LS, PS)
+//     fall out for free instead of needing a parallel utf8.DecodeRune scaffold;
+//  2. it discards empty fields, which means \r\n collapses to one terminator
+//     (the empty span between \r and \n is dropped) and we never emit a
+//     phantom blank line. Same shape handles any other adjacent-terminator
+//     run an attacker might construct.
+//
+// Future readers: do not "optimize" this back into a manual loop that checks
+// content[i] != '\n'. That regression has happened once already.
+func isCPythonLineTerm(r rune) bool {
+	switch r {
+	case '\n', '\r', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029:
+		return true
+	}
+	return false
+}
+
+// executableLines walks the .pth using Python's site.py rule: a line is
+// executable iff its first non-whitespace token is `import` (case-sensitive,
+// matching CPython). Blank lines and lines whose first non-whitespace
+// character is `#` are inert. All other lines are inert path entries.
+//
+// Each returned string is the line body with leading ASCII whitespace
+// (space, tab) already trimmed — the same bytes site.py would feed to
+// Python's exec(), so the downstream payload classifiers and known-legit
+// allowlist can match anchored ^...$ shapes without needing to model the
+// leading-whitespace dance themselves.
+func executableLines(content string) []string {
+	var out []string
+	for _, line := range strings.FieldsFunc(content, isCPythonLineTerm) {
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// Python's site.py treats a line as executable when its first
+		// token is `import` followed by space or tab. CPython site.py
+		// literally checks `line.startswith(("import ", "import\t"))`,
+		// so a tab between `import` and the module name detonates the
+		// payload but a naive space-only prefix check misses it. We
+		// accept space, tab, `(` (the unusual but legal `import(x)`
+		// shape), and a bare `import` line.
+		if isImportPrefix(trimmed) {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// isImportPrefix reports whether a line (with leading whitespace already
+// trimmed) begins with the CPython site.py `import` token. site.py's literal
+// check is `line.startswith(("import ", "import\t"))` — space and tab only;
+// neither form-feed nor vertical-tab work here because str.splitlines()
+// treats those as line terminators upstream, so by the time a single line
+// reaches the prefix check there cannot be one between `import` and the
+// module name. We additionally accept `import(x)` (the unusual but legal
+// statement form) and a bare `import` line.
+func isImportPrefix(trimmed string) bool {
+	const tok = "import"
+	if trimmed == tok {
+		return true
+	}
+	if !strings.HasPrefix(trimmed, tok) {
+		return false
+	}
+	switch trimmed[len(tok)] {
+	case ' ', '\t', '(':
+		return true
+	}
+	return false
+}
+
+func excerpt(line string) string {
+	flat := strings.Join(strings.Fields(line), " ")
+	if len(flat) > maxExcerpt {
+		flat = flat[:maxExcerpt] + "…"
+	}
+	return flat
+}
+
+// payloadGroups partitions the Hades payload vocabulary by the *kind* of
+// risk so the finding's evidence can name which capability the worm used.
+// Group order matters only for diagnostic readability; the first matching
+// group wins per signal so the report points at the most specific lens.
+var payloadGroups = []struct {
+	code  string
+	label string
+	re    *regexp.Regexp
+}{
+	{
+		code:  "pth-payload-network",
+		label: "uses network calls (urllib, requests, socket, http.client, ftplib) — startup-time outbound fetch is the Hades infection pattern.",
+		re:    regexp.MustCompile(`\b(?:urllib(?:\.request)?|urlopen|urlretrieve|requests|socket|http\.client|httplib|ftplib)\b`),
+	},
+	{
+		code:  "pth-payload-spawn",
+		label: "spawns a process (subprocess, os.system/popen, pty.spawn, os.exec*) at interpreter startup.",
+		re:    regexp.MustCompile(`\b(?:subprocess|os\.system|os\.popen|popen|pty\.spawn|os\.(?:exec|spawn)[a-z]*)\b`),
+	},
+	{
+		code:  "pth-payload-dynamic-exec",
+		label: "evaluates code dynamically (exec/eval/compile/__import__/getattr on a computed string).",
+		// getattr is included because the canonical bypass shape is
+		// `getattr(__builtins__, 'exec')(payload)` \u2014 indirecting the dangerous
+		// symbol through getattr defeats a name-based regex on `exec(` alone.
+		// getattr is also useful enough in real code that pairing it with the
+		// __builtins__ attribute-access signal below preserves specificity.
+		re: regexp.MustCompile(`\b(?:exec|eval|compile|__import__|getattr)\s*\(`),
+	},
+	{
+		code:  "pth-payload-builtins-access",
+		label: "names `__builtins__` or `builtins` directly \u2014 startup-time scripts have no legitimate reason to reach into the builtins namespace; an attacker uses this to indirect through exec/eval/__import__ past a name-based filter.",
+		// Matches: `__builtins__.exec`, `__builtins__['exec']`,
+		// `getattr(__builtins__, ...)`, `import builtins`,
+		// `builtins.exec(...)`, etc. We deliberately catch both the dunder
+		// (interpreter-injected) and the module form because the module is
+		// `import builtins` and is the documented portable handle.
+		re: regexp.MustCompile(`\b(?:__builtins__|builtins)\b`),
+	},
+	{
+		code:  "pth-payload-deobfuscation",
+		label: "decodes or unpacks an embedded blob (base64, marshal, codecs.decode, hex/lzma/zlib) — startup-time decoders are the Hades obfuscation tell.",
+		re:    regexp.MustCompile(`\b(?:b64decode|base64|marshal\.loads|codecs\.decode|bytes\.fromhex|zlib\.decompress|lzma)\b|\.decode\(\s*['"]hex['"]\s*\)|(?:\\x[0-9A-Fa-f]{2}){8,}`),
+	},
+	{
+		code:  "pth-payload-runtime-fetch",
+		label: "names an external runtime / fetcher (bun, bunx, curl, wget, node, deno) — startup-time downloader for a second-stage payload.",
+		re:    regexp.MustCompile(`\b(?:bun|bunx|curl|wget|node|deno)\b`),
+	},
+	{
+		code:  "pth-payload-worm-marker",
+		label: "carries a Hades / Shai-Hulud worm marker string.",
+		re:    regexp.MustCompile(`\.bun_ran\b|_index\.js\b|\bHades\b|shai-hulud|stygian|tartarean`),
+	},
+}
+
+// fileNameSetupRe matches the `*-setup.pth` shape Hades-style wheels drop —
+// a filename signal independent of body content. Real PyPI ecosystems are
+// not known to ship `<name>-setup.pth`; the convention is `distutils-precedence.pth`,
+// `__editable__.<name>-<ver>.pth`, `easy-install.pth`, or per-package names
+// without a `-setup` suffix.
+var fileNameSetupRe = regexp.MustCompile(`(?i)(^|[-_])setup\.pth$`)
+
+// scanPayloadSignals returns the per-group critical signals firing on body
+// (an executable line with its leading whitespace already removed).
+func scanPayloadSignals(body string) []Signal {
+	var out []Signal
+	for _, g := range payloadGroups {
+		if g.re.MatchString(body) {
+			out = append(out, Signal{
+				Code:    g.code,
+				Detail:  g.label,
+				Excerpt: excerpt(body),
+			})
+		}
+	}
+	return out
+}
+
+// knownLegitLines is the anchored allowlist of executable .pth line shapes
+// real Python tooling produces. Each entry is a whole-line regex (after the
+// leading whitespace is stripped); a worm that *also* names __editable__ or
+// _distutils_hack does NOT match because the regex anchors `^` and `$` and
+// covers the entire legitimate body, not a substring.
+var knownLegitLines = []*regexp.Regexp{
+	// setuptools' distutils-precedence shim. Distros ship variants; the
+	// pattern is "import os; <hack-import>".
+	regexp.MustCompile(`^import\s+os\s*;\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*os\.environ\.get\(.+?\)\s*;\s*)?__import__\(\s*['"]_distutils_hack['"]\s*\)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\(\s*\))?\s*$`),
+
+	// PEP 660 editable installs — pip writes __editable___<name>_finder.py
+	// plus a one-line .pth that imports and installs the finder.
+	regexp.MustCompile(`^import\s+__editable___[A-Za-z0-9_]+_finder\s*;\s*__editable___[A-Za-z0-9_]+_finder\.install\(\s*\)\s*$`),
+	regexp.MustCompile(`^from\s+__editable___[A-Za-z0-9_]+(?:_finder)?\s+import\s+[A-Za-z_][A-Za-z0-9_]*\s*$`),
+	regexp.MustCompile(`^import\s+__editable___[A-Za-z0-9_]+_finder\s*;\s*MapPathFinder\.install\(\s*\)\s*$`),
+
+	// Legacy easy-install.pth path-munge.
+	regexp.MustCompile(`^import\s+sys\s*;\s*sys\.__plen\s*=\s*len\(sys\.path\)\s*$`),
+	regexp.MustCompile(`^import\s+sys\s*;\s*sys\.__egginsert\s*=\s*0\s*$`),
+}
+
+// allowlistedFileName reports whether the .pth's base name is one whose
+// known-legit body is allowed by the regex pack above. We don't require this
+// — the body regex is the load-bearing check — but a non-matching body that
+// nevertheless rides one of these well-known names still gets flagged.
+var allowlistedLegitName = regexp.MustCompile(`^(?:distutils-precedence\.pth|__editable__[._-][A-Za-z0-9_.-]+\.pth|easy-install\.pth)$`)
+
+// matchesKnownLegit reports whether trimmed (a single .pth executable line
+// with leading whitespace already removed and no trailing newline) matches
+// any whole-line legit pattern.
+func matchesKnownLegit(trimmed string) bool {
+	for _, re := range knownLegitLines {
+		if re.MatchString(trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
+func severityRank(s Severity) int {
+	switch s {
+	case SeverityCritical:
+		return 3
+	case SeverityMedium:
+		return 2
+	case SeverityNone:
+		return 1
+	default:
+		return 0
+	}
+}

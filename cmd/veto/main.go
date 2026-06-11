@@ -35,6 +35,7 @@ import (
 	"github.com/brynbellomy/veto/internal/intel/sources/gemnasium"
 	"github.com/brynbellomy/veto/internal/intel/sources/ghsa"
 	"github.com/brynbellomy/veto/internal/intel/sources/govulndb"
+	"github.com/brynbellomy/veto/internal/intel/sources/hades"
 	"github.com/brynbellomy/veto/internal/intel/sources/openssf"
 	"github.com/brynbellomy/veto/internal/intel/sources/osv"
 	"github.com/brynbellomy/veto/internal/intel/sources/pypa"
@@ -469,6 +470,27 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 		// WHOLE tree, so a worm already in node_modules (from an earlier
 		// install) would detonate on this unrelated install. Scan it.
 		if runGypPreflightIfNpmFamily(logger, pm, pmArgs) {
+			return exitRefused
+		}
+	}
+
+	// Hades / Shai-Hulud .pth startup-hook worm layers. The intel gate
+	// above cannot see this worm — it rides a trusted name and keeps
+	// package metadata clean — so for Python-family installs we apply
+	// the same two content heuristics before letting the real package
+	// manager run.
+	if isPythonFamily(pm.Ecosystem()) {
+		// (a) Wheel prescan: fetch the wheels about to be installed
+		// (Task 8) and inspect each .pth they would drop. Catches a
+		// freshly-resolved/compromised version that is not yet in any
+		// intel feed. Wired below; Task 8 fills the body.
+		if pthWheelPreflight(logger, os.Stderr, cfg, installs, preScanInstalls) {
+			return exitRefused
+		}
+		// (b) Existing-tree scan: site.py loads every .pth at every
+		// `python` startup, so a worm already in the target venv would
+		// detonate before this install completes. Scan it.
+		if runPthPreflightIfPythonFamily(logger, pm, pmArgs) {
 			return exitRefused
 		}
 	}
@@ -1298,7 +1320,7 @@ func loadConfig() (config, error) {
 	v.SetEnvPrefix("VETO")
 	v.AutomaticEnv()
 	v.SetDefault("cache_dir", defaultCacheDir())
-	v.SetDefault("sources", []string{"aikido", "datadog", "openssf", "osv", "pypa"})
+	v.SetDefault("sources", []string{"aikido", "datadog", "openssf", "osv", "pypa", "hades"})
 	// IOC feeds (abuse.ch, MISP, ...) are all opt-in and land in Wave 4. The
 	// default is empty so the IOC subsystem costs nothing until a feed is
 	// explicitly enabled via ioc_sources / VETO_IOC_SOURCES.
@@ -1394,6 +1416,8 @@ func buildSource(logger zerolog.Logger, cfg config, id string) (intel.Source, er
 			CacheDir: filepath.Join(cfg.CacheDir, "gemnasium"),
 			Logger:   logger,
 		})
+	case "hades":
+		return hades.New(), nil
 	default:
 		return nil, errors.WithNew("unknown source").Set("id", id)
 	}
@@ -1651,7 +1675,7 @@ Go/Cargo live gating:
 
 Environment:
   VETO_CACHE_DIR     override cache location (default: $XDG_CACHE_HOME/veto)
-  VETO_SOURCES       comma-separated source IDs (default: aikido,datadog,openssf,osv,pypa)
+  VETO_SOURCES       comma-separated source IDs (default: aikido,datadog,openssf,osv,pypa,hades)
                        optional vulnerability feeds: ghsa, rustsec, govulndb, gemnasium
   VETO_IOC_SOURCES   comma-separated host-level IOC feed IDs (default: none).
                        Available: abusech, misp. When set, cache artifacts are
@@ -1661,5 +1685,15 @@ Environment:
                      abusech IOC feed; without it the feed logs once and no-ops
   VETO_LOG           set to "debug" for verbose logging
   VETO_PATH          set by install-preload; consumed by the interposer
+  VETO_PTH_WHEEL_SCAN
+                     enable / disable the .pth wheel prescan for the Hades
+                     PyPI worm. Values: on (default; argv-direct only),
+                     full (also fetch resolved transitives), off.
+  VETO_PTH_WHEEL_SCAN_TIMEOUT
+                     timeout for the wheel prescan (default: 120s). The prescan
+                     is best-effort: on timeout veto logs a warning and allows
+                     the install (fail-open). Critical findings detected before
+                     the timeout always refuse. Set VETO_PTH_WHEEL_SCAN=off to
+                     skip the prescan entirely.
 `)
 }

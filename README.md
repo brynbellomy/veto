@@ -387,6 +387,52 @@ above) block an install; **medium** structural anomalies are surfaced by `veto s
 review but do not refuse on the hot path, where a false block stops real
 work.
 
+### `.pth` startup-hook worm detection (Hades / Shai-Hulud)
+
+The June 2026 Hades wave is the PyPI branch of the same Miasma lineage veto
+fights on npm with `binding.gyp`. It rides a trusted package name (maintainer
+account takeover, so the name is not in any malware feed for hours), keeps the
+package metadata clean, and ships its payload as a `*-setup.pth` file inside
+a wheel. Python's `site` module exec()s every `*.pth` whose first token is
+`import` at *every* interpreter startup — so a poisoned environment detonates
+the worm on the next `python` call, not just at install time.
+
+veto detects this by content, not name, at four points:
+
+1. **`veto scan`** — walks every `site-packages` / `dist-packages` directory
+   under each project root and classifies each `.pth` via the `pthscan`
+   content heuristic. Critical findings are the Hades signature; medium
+   findings are non-allowlisted executable lines that warrant attention.
+2. **Install hot path — existing tree** — before `pip` / `uv` / `poetry` /
+   `pdm` runs, veto scans the target venv for `.pth` worms. A critical hit
+   refuses the install fail-closed.
+3. **Install hot path — incoming wheels** — veto downloads the wheel(s)
+   about to be installed with `pip download --no-deps --only-binary :all:`
+   (no sdist building; nothing executed), opens each as a zip in memory,
+   and inspects every `.pth` inside. Default-on for argv-direct installs;
+   set `VETO_PTH_WHEEL_SCAN=full` for resolved transitives, `=off` to
+   disable. The prescan has a default timeout of **120 seconds**
+   (`VETO_PTH_WHEEL_SCAN_TIMEOUT` overrides it). On timeout the prescan
+   is **best-effort / fail-open** — veto logs a warning and allows the
+   install rather than blocking it indefinitely. Critical findings detected
+   before the timeout always refuse. This is an intentional UX trade-off:
+   a slow registry hiccup must not block every install. Set
+   `VETO_PTH_WHEEL_SCAN=off` to skip the prescan entirely when needed.
+4. **Claude Code hook** — a `pip install` / `uv pip install` issued by an
+   agent in a poisoned environment is denied at the earliest point, with
+   the worm reason instead of the usual "re-run with veto" nudge —
+   prefixing would not make the environment safe to install into.
+
+veto also surfaces Hades infection markers via `veto scan`'s agent-surface
+sub-scanner: host artifacts (`/tmp/.bun_ran`, `/tmp/tmp.*.lock`, dropped
+Bun binaries), local GitHub persistence (`.github/workflows/*.yml` exfil
+shapes, clones with attacker naming), and `sitecustomize.py` /
+`usercustomize.py` *presence inside `site-packages`*.
+
+The intel store also ships a curated stopgap source (`hades`) carrying the
+known Hades package@versions. The durable defense is the `.pth` content
+heuristic; the stopgap shortens the window for already-catalogued names.
+
 **Fail-closed defaults.** Per-source malware feeds are fetched
 concurrently with etag-based caching in `~/.cache/veto/`.
 On network outage the last good snapshot is used; if zero sources
