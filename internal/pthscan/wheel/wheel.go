@@ -8,9 +8,8 @@ package wheel
 
 import (
 	"archive/zip"
-	"bytes"
-	"encoding/csv"
 	"io"
+	"os"
 	"path"
 	"strings"
 
@@ -27,6 +26,15 @@ const maxPthBytes = 256 * 1024
 // maxWheelEntries caps wheel-zip entries walked. Real wheels have hundreds
 // of entries; pathological wheels with millions are rejected.
 const maxWheelEntries = 100_000
+
+// maxWheelDecompressedBytes caps the total bytes decompressed across all
+// entries in a single wheel scan. Per-entry reads are already capped at
+// maxPthBytes (256 KB); this total cap guards against zip-bomb payloads
+// that embed many entries each just below the per-entry limit, or against
+// non-.pth entries that are read en-route (e.g. RECORD parsing, if ever
+// re-added). 256 MB is orders of magnitude above any legitimate wheel while
+// still small enough to bound memory pressure on a DoS-shaped input.
+const maxWheelDecompressedBytes = 256 * 1024 * 1024
 
 // Inspect reads a wheel from r (must be a ReaderAt; the *bytes.Reader and
 // *os.File from a downloaded wheel both satisfy this) of size and classifies
@@ -75,40 +83,33 @@ type pthEntry struct {
 	truncated bool
 }
 
-// collectPthEntries walks the wheel zip and gathers every .pth file via
-// either the data scheme or a top-level location. RECORD is consulted as a
-// hint but not relied on (some adversarial wheels omit / corrupt RECORD).
+// collectPthEntries walks the wheel zip and gathers every .pth file that
+// Python's site.py could execute at startup: entries in the data-scheme
+// purelib/platlib directories and bare top-level .pth files.
+//
+// Note: RECORD parsing was considered (to discover .pth files listed in
+// RECORD at unusual paths) but removed — the data-scheme zip walk is
+// sufficient for all known worm vectors, RECORD parsing had an unsatisfiable
+// predicate (base cannot contain '/'), and recordEntries had no consumer.
+// If a future wheel layout requires RECORD consultation, add it then with a
+// tested consumer. Adversarial wheels that omit/corrupt RECORD are already
+// handled correctly by the direct zip walk.
 func collectPthEntries(zr *zip.Reader) ([]pthEntry, error) {
 	var out []pthEntry
-	recordEntries := map[string]struct{}{}
+	var totalDecompressed int64
 	for _, f := range zr.File {
 		name := path.Clean(f.Name)
 		if name == "." || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "..") {
 			continue
 		}
-		base := path.Base(name)
-		if strings.HasSuffix(base, ".dist-info/RECORD") || strings.HasSuffix(name, "RECORD") && strings.Contains(name, ".dist-info/") {
-			// Parse RECORD as a CSV; first column is the entry path. Best-effort.
-			content, _, err := readZipEntry(f, maxPthBytes*4)
-			if err == nil {
-				rd := csv.NewReader(bytes.NewReader(content))
-				rd.FieldsPerRecord = -1
-				for {
-					row, err := rd.Read()
-					if err != nil {
-						break
-					}
-					if len(row) == 0 {
-						continue
-					}
-					rel := strings.TrimSpace(row[0])
-					if strings.HasSuffix(rel, ".pth") {
-						recordEntries[rel] = struct{}{}
-					}
-				}
-			}
+		// Defense-in-depth: explicitly skip symlink entries. The scanner
+		// never extracts to disk, so symlinks are not currently exploitable,
+		// but rejecting them here prevents any future extraction path from
+		// accidentally following a wheel-embedded symlink outside the zip.
+		if f.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
+		base := path.Base(name)
 		if !strings.HasSuffix(base, ".pth") {
 			continue
 		}
@@ -119,20 +120,46 @@ func collectPthEntries(zr *zip.Reader) ([]pthEntry, error) {
 		if err != nil {
 			return nil, errors.With(err, "read wheel .pth entry").Set("path", name)
 		}
+		totalDecompressed += int64(len(content))
+		if totalDecompressed > maxWheelDecompressedBytes {
+			return nil, errors.WithNew("wheel decompressed size exceeds limit").
+				Set("limit", maxWheelDecompressedBytes, "path", name)
+		}
 		out = append(out, pthEntry{name: name, content: content, truncated: truncated})
 	}
-	// RECORD entries we haven't seen yet would be a `.pth` in an unusual
-	// path. The zip walk above already enumerated every file; recordEntries
-	// is informational. (We keep the parse in place because it would matter
-	// in a future where a wheel ships a custom installer script that places
-	// .pth files outside the data-scheme directories.)
-	_ = recordEntries
 	return out, nil
 }
 
 // isPthInWheel reports whether a zip entry path is a position where Python
 // will install a .pth at install-time: either the data scheme's purelib /
 // platlib directories, or a top-level location alongside the dist-info.
+//
+// Why only purelib and platlib?
+//
+// PEP 427 (wheel format) defines five install destinations inside the
+// <dist>-<ver>.data/ tree: purelib, platlib, scripts, headers, and data.
+// Of those, only purelib and platlib map to directories on sys.path (the
+// site-packages trees returned by sysconfig.get_paths()["purelib"] and
+// sysconfig.get_paths()["platlib"]). The others land in locations that
+// Python's site.py never visits:
+//
+//   destination │ typical location              │ on sys.path?
+//   ────────────┼───────────────────────────────┼─────────────
+//   purelib     │ …/site-packages/              │ yes ✓
+//   platlib     │ …/site-packages/ (or platlib) │ yes ✓
+//   scripts     │ /usr/local/bin, ~/.local/bin   │ no
+//   headers     │ /usr/local/include/python…    │ no
+//   data        │ /usr/local/ (prefix root)     │ no
+//
+// site.py's .pth processing walks every directory in sys.path and executes
+// any .pth files it finds there. A .pth dropped into scripts/, headers/, or
+// data/ is therefore never executed at interpreter startup — it has no worm
+// surface. Checking those directories would admit false positives (legitimate
+// .pth files that pip places there for other purposes) without adding any
+// security value.
+//
+// Reference: CPython Lib/site.py (addsitedir / addpackage), PEP 427 §"The
+// .data directory", sysconfig.get_paths() output.
 func isPthInWheel(name string) bool {
 	if !strings.HasSuffix(name, ".pth") {
 		return false
@@ -142,8 +169,20 @@ func isPthInWheel(name string) bool {
 		return true
 	}
 	// Data scheme: <dist>-<ver>.data/purelib/<...>.pth or .../platlib/<...>.pth
-	if strings.Contains(name, ".data/purelib/") || strings.Contains(name, ".data/platlib/") {
-		return true
+	//
+	// Defense-in-depth: split on '/' and match segment positions rather than
+	// using strings.Contains. This prevents a crafted name like
+	// "malicious_purelib/foo.pth" from matching the ".data/purelib/" substring
+	// while not being in a real data-scheme purelib directory. After path.Clean
+	// the entry name has no ".." components, so the segment positions are
+	// authoritative: we require a segment ending in ".data" immediately followed
+	// by a segment that is exactly "purelib" or "platlib".
+	segs := strings.Split(name, "/")
+	for i := 0; i+2 < len(segs); i++ {
+		if strings.HasSuffix(segs[i], ".data") &&
+			(segs[i+1] == "purelib" || segs[i+1] == "platlib") {
+			return true
+		}
 	}
 	return false
 }
