@@ -232,17 +232,39 @@ func TestVerifierClaim2_CROnlyLineEndings(t *testing.T) {
 
 // TestVerifierClaim3_UTF8BOMBypass verifies claim 3:
 // A .pth starting with a UTF-8 BOM (\xEF\xBB\xBF) bypasses pthscan.
-// CPython's site.py strips a BOM before processing .pth content.
+// CPython's site.py strips a BOM before processing .pth content; pthscan
+// must mirror the strip so the import-prefix check sees the same bytes.
 func TestVerifierClaim3_UTF8BOMBypass(t *testing.T) {
 	content := []byte{0xEF, 0xBB, 0xBF, 'i', 'm', 'p', 'o', 'r', 't', ' ', 'o', 's', ';', ' ', 'o', 's', '.', 's', 'y', 's', 't', 'e', 'm', '(', '\'', 'x', '\'', ')', '\n'}
 	v := pthscan.Inspect(pthscan.Input{
 		PthContent: content,
 		FileName:   "evil.pth",
 	})
-	t.Logf("Severity: %s", v.Severity)
-	t.Logf("Signals: %v", codes(v))
-	// If claim is correct: severity == none (BOM tricks the prefix check).
-	// Expected correct behavior: severity == critical with pth-payload-spawn.
+	require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+	require.Contains(t, codes(v), "pth-payload-spawn")
+}
+
+// TestInspectUTF16BOMIsCritical exercises the belt-and-braces UTF-16 refusal:
+// CPython won't exec a UTF-16 .pth in practice, but pthscan can't read its
+// import-lines either, so a UTF-16-encoded file is treated as unscannable
+// rather than allowed through with SeverityNone.
+func TestInspectUTF16BOMIsCritical(t *testing.T) {
+	t.Run("utf16-le", func(t *testing.T) {
+		v := pthscan.Inspect(pthscan.Input{
+			PthContent: []byte{0xFF, 0xFE, 'i', 0, 'm', 0, 'p', 0, 'o', 0, 'r', 0, 't', 0, ' ', 0, 'x', 0},
+			FileName:   "evil.pth",
+		})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity)
+		require.Contains(t, codes(v), "pth-unscannable-encoding")
+	})
+	t.Run("utf16-be", func(t *testing.T) {
+		v := pthscan.Inspect(pthscan.Input{
+			PthContent: []byte{0xFE, 0xFF, 0, 'i', 0, 'm', 0, 'p', 0, 'o', 0, 'r', 0, 't'},
+			FileName:   "evil.pth",
+		})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity)
+		require.Contains(t, codes(v), "pth-unscannable-encoding")
+	})
 }
 
 // TestVerifierClaim4_DistutilsPrecedenceGetBypass verifies claim 4:

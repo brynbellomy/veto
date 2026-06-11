@@ -14,8 +14,28 @@
 package pthscan
 
 import (
+	"bytes"
 	"regexp"
 	"strings"
+)
+
+// utf8BOM is the leading byte sequence CPython's site.py strips before
+// decoding a .pth file. If we don't strip it too, the first executable line
+// arrives at the prefix check carrying \xEF\xBB\xBF in front of `import`,
+// fails HasPrefix("import "), and the whole payload is treated as inert.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// utf16BOMLE / utf16BOMBE are the UTF-16 byte-order marks. CPython's
+// site.py won't actually `exec()` a UTF-16-encoded .pth (it opens the file
+// in text mode with the default encoding, which is UTF-8 on every modern
+// platform), but an attacker who confuses a future encoding-detection layer
+// shouldn't be able to use one of these as a covering blanket. We refuse to
+// scan UTF-16 .pth files outright and emit Critical so the install gets
+// refused rather than silently green-lit by a scanner that can't see the
+// bytes it would need to flag.
+var (
+	utf16BOMLE = []byte{0xFF, 0xFE}
+	utf16BOMBE = []byte{0xFE, 0xFF}
 )
 
 // Severity ranks how confident pthscan is that a .pth is malicious.
@@ -94,7 +114,26 @@ func Inspect(in Input) Verdict {
 			}},
 		}
 	}
-	content := string(in.PthContent)
+	raw := in.PthContent
+	// UTF-16 .pth files are not a CPython-supported shape, but a scanner
+	// that can't see import-line bytes shouldn't quietly pass the file as
+	// inert. Fail closed.
+	if bytes.HasPrefix(raw, utf16BOMLE) || bytes.HasPrefix(raw, utf16BOMBE) {
+		return Verdict{
+			Severity: SeverityCritical,
+			Signals: []Signal{{
+				Code:    "pth-unscannable-encoding",
+				Detail:  ".pth file begins with a UTF-16 byte-order mark; pthscan only decodes UTF-8 and refuses to scan UTF-16 content rather than green-light a file whose import-lines it can't read.",
+				Excerpt: "UTF-16 BOM",
+			}},
+		}
+	}
+	// CPython's site.py strips a leading UTF-8 BOM before splitlines();
+	// mirror that so the import-prefix check sees the same bytes site.py
+	// does. Without this strip the first line is "\xEF\xBB\xBFimport ..."
+	// which TrimLeft(" \t") leaves untouched and the prefix check rejects.
+	raw = bytes.TrimPrefix(raw, utf8BOM)
+	content := string(raw)
 	if strings.TrimSpace(content) == "" {
 		return Verdict{Severity: SeverityNone}
 	}
