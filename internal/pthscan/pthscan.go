@@ -163,15 +163,15 @@ func Inspect(in Input) Verdict {
 		}
 	}
 
-	for _, line := range executableLines(content) {
-		if matchesKnownLegit(line.body) {
+	for _, body := range executableLines(content) {
+		if matchesKnownLegit(body) {
 			// A whitelisted body still consumed its payload tokens —
 			// record them as gated so the safety net below doesn't fire
 			// on the exact same characters from a different angle.
-			markGated(line.body)
+			markGated(body)
 			continue
 		}
-		if payload := scanPayloadSignals(line.body); len(payload) > 0 {
+		if payload := scanPayloadSignals(body); len(payload) > 0 {
 			signals = append(signals, payload...)
 			for _, s := range payload {
 				gatedCodes[s.Code] = struct{}{}
@@ -182,7 +182,7 @@ func Inspect(in Input) Verdict {
 		signals = append(signals, Signal{
 			Code:    "pth-executable-line",
 			Detail:  "executable `import …` line in a .pth file with no payload tokens, but not on the known-legit allowlist — site.py exec()'s these at every interpreter startup.",
-			Excerpt: excerpt(line.body),
+			Excerpt: excerpt(body),
 		})
 		bump(SeverityMedium)
 	}
@@ -223,23 +223,36 @@ func Inspect(in Input) Verdict {
 	return Verdict{Severity: severity, Signals: signals}
 }
 
-// executableLine carries an executable .pth line's body (everything after
-// the leading whitespace).
-type executableLine struct {
-	body string
-}
-
 // isCPythonLineTerm reports whether r is a character CPython's str.splitlines()
 // treats as a line terminator. site.py runs `f.read().splitlines()` on the
 // decoded .pth content, so any of these in the file body starts a fresh line
 // from the parser's point of view. Splitting on a strict subset (e.g. only
 // "\n") collapses two distinct lines into one and lets a `# comment\rimport os…`
-// shape slip past the comment-skip filter as a single inert-looking line.
+// shape slip past the comment-skip filter as a single inert-looking line —
+// veto-3w1.4 was exactly that bug.
 //
-// CPython's set (per the str.splitlines() docs): \n, \r, \r\n, \v (0x0B),
-// \f (0x0C), \x1c, \x1d, \x1e, NEL (\u0085), LS (\u2028), PS (\u2029).
-// \r\n is handled correctly by strings.FieldsFunc since the empty span
-// between the two terminator bytes is discarded as a zero-length field.
+// CPython's set (per the str.splitlines() docs):
+//
+//	\n  LF       \r  CR        \r\n  CR+LF (handled as one terminator)
+//	\v  0x0B     \f  0x0C
+//	\x1c FS      \x1d GS       \x1e RS
+//	NEL (\u0085)
+//	LS  (\u2028)
+//	PS  (\u2029)
+//
+// We deliberately drive the line splitter from strings.FieldsFunc over this
+// predicate rather than a hand-rolled byte loop. FieldsFunc has two
+// properties the byte loop didn't have:
+//
+//  1. it iterates by rune, not byte, so multibyte terminators (NEL, LS, PS)
+//     fall out for free instead of needing a parallel utf8.DecodeRune scaffold;
+//  2. it discards empty fields, which means \r\n collapses to one terminator
+//     (the empty span between \r and \n is dropped) and we never emit a
+//     phantom blank line. Same shape handles any other adjacent-terminator
+//     run an attacker might construct.
+//
+// Future readers: do not "optimize" this back into a manual loop that checks
+// content[i] != '\n'. That regression has happened once already.
 func isCPythonLineTerm(r rune) bool {
 	switch r {
 	case '\n', '\r', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029:
@@ -253,27 +266,27 @@ func isCPythonLineTerm(r rune) bool {
 // matching CPython). Blank lines and lines whose first non-whitespace
 // character is `#` are inert. All other lines are inert path entries.
 //
-// We use strings.FieldsFunc over the CPython-equivalent terminator set so a
-// multi-line CR-only file (or any of the more exotic Unicode line breaks
-// site.py honors) cannot collapse two logical lines into one and smuggle a
-// payload past the comment-skip filter.
-func executableLines(content string) []executableLine {
-	var out []executableLine
+// Each returned string is the line body with leading ASCII whitespace
+// (space, tab) already trimmed — the same bytes site.py would feed to
+// Python's exec(), so the downstream payload classifiers and known-legit
+// allowlist can match anchored ^...$ shapes without needing to model the
+// leading-whitespace dance themselves.
+func executableLines(content string) []string {
+	var out []string
 	for _, line := range strings.FieldsFunc(content, isCPythonLineTerm) {
 		trimmed := strings.TrimLeft(line, " \t")
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 		// Python's site.py treats a line as executable when its first
-		// token is `import` followed by any token-separator byte. CPython
-		// site.py literally checks `line.startswith(("import ", "import\t"))`,
+		// token is `import` followed by space or tab. CPython site.py
+		// literally checks `line.startswith(("import ", "import\t"))`,
 		// so a tab between `import` and the module name detonates the
-		// payload but a naive space-only prefix check misses it. We accept
-		// the full set of inter-token whitespace CPython's tokenizer treats
-		// as a gap — space, tab, form-feed, vertical tab — plus `(` (the
-		// unusual `import(x)` form that still parses) and bare `import`.
+		// payload but a naive space-only prefix check misses it. We
+		// accept space, tab, `(` (the unusual but legal `import(x)`
+		// shape), and a bare `import` line.
 		if isImportPrefix(trimmed) {
-			out = append(out, executableLine{body: trimmed})
+			out = append(out, trimmed)
 		}
 	}
 	return out
