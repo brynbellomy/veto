@@ -143,6 +143,64 @@ func TestInspectPayloadGroupsTable(t *testing.T) {
 	}
 }
 
+// TestInspectContentBodyPayloadOutOfGate exercises the defense-in-depth safety
+// net: payload tokens that show up in the content body but never inside a
+// line classified as executable by the import-prefix gate are surfaced as
+// pth-content-payload-token-out-of-gate at SeverityMedium.
+//
+// Case (a) — content-only payload the line-gate misses. We mock the
+// parser-divergence shape by putting the payload inside a comment (#) line.
+// A future bypass that lets CPython execute the payload while our gate
+// classifies the line as inert would land here.
+//
+// Case (b) — false-positive we accept. A real-world .pth comment mentioning
+// `exec(` or `os.system` in human-language documentation will fire Medium.
+// This is intentional: we'd rather surface for human review than silently
+// pass content carrying payload-shaped tokens we can't precisely classify.
+func TestInspectContentBodyPayloadOutOfGate(t *testing.T) {
+	t.Run("comment-hiding-payload-fires-medium", func(t *testing.T) {
+		// The line-gate sees only a `#` comment line; the os.system token
+		// reaches the safety-net content scan unchallenged.
+		body := "# os.system('whoami')\n"
+		v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body), FileName: "x.pth"})
+		require.True(t, v.Flagged(), "got %v", codes(v))
+		require.Equal(t, pthscan.SeverityMedium, v.Severity)
+		require.True(t, hasSignal(v, "pth-content-payload-token-out-of-gate"))
+	})
+
+	t.Run("benign-comment-with-exec-mention-fires-medium-known-FP", func(t *testing.T) {
+		// Documented false positive: a legitimate .pth whose comment text
+		// happens to mention exec( will be flagged Medium. We accept the
+		// noise as the cost of catching future parser-divergence bypasses.
+		body := "# This .pth installs a hook similar to exec('hook-init')\nsome/path\n"
+		v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body), FileName: "legit.pth"})
+		require.True(t, v.Flagged(), "got %v", codes(v))
+		require.Equal(t, pthscan.SeverityMedium, v.Severity)
+		require.True(t, hasSignal(v, "pth-content-payload-token-out-of-gate"))
+	})
+
+	t.Run("known-legit-distutils-still-not-flagged", func(t *testing.T) {
+		// Regression guard: the distutils-precedence allowlist body
+		// contains `__import__(`, which is a dynamic-exec token. The
+		// safety net must NOT fire on it because the line-gate explicitly
+		// classified that body as legit and recorded its tokens.
+		body := `import os; __import__('_distutils_hack').add_shim()` + "\n"
+		v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body), FileName: "distutils-precedence.pth"})
+		require.False(t, v.Flagged(), "got %v", codes(v))
+	})
+
+	t.Run("critical-line-suppresses-redundant-safety-net", func(t *testing.T) {
+		// A Critical-tier payload firing through the line-gate must NOT
+		// also produce a duplicate Medium safety-net signal for the same
+		// token group.
+		body := `import os; os.system('curl http://x')` + "\n"
+		v := pthscan.Inspect(pthscan.Input{PthContent: []byte(body), FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity)
+		require.False(t, hasSignal(v, "pth-content-payload-token-out-of-gate"),
+			"safety net duplicated a token already gated by the line-gate: %v", codes(v))
+	})
+}
+
 // TestInspectBuiltinsAccessIsCritical covers the `getattr(__builtins__, …)`
 // and `__builtins__['exec']` indirection shapes \u2014 the canonical bypass
 // against a regex that only knows the literal name `exec(`. We also flag

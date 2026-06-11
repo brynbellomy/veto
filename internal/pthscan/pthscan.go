@@ -146,12 +146,36 @@ func Inspect(in Input) Verdict {
 		}
 	}
 
+	// Track which payload group codes already fired (or were explicitly
+	// allowed) on a per-line basis. The safety-net content scan below only
+	// emits a signal for groups whose token shows up in the body but did
+	// NOT appear inside any line our line-gate inspected — so a known-bad
+	// line firing `pth-payload-spawn` doesn't also produce a redundant
+	// out-of-gate Medium signal, and a known-legit line (distutils,
+	// editable, easy-install) carrying `__import__(` in its allowed shape
+	// doesn't either.
+	gatedCodes := make(map[string]struct{})
+	markGated := func(body string) {
+		for _, g := range payloadGroups {
+			if g.re.MatchString(body) {
+				gatedCodes[g.code] = struct{}{}
+			}
+		}
+	}
+
 	for _, line := range executableLines(content) {
 		if matchesKnownLegit(line.body) {
+			// A whitelisted body still consumed its payload tokens —
+			// record them as gated so the safety net below doesn't fire
+			// on the exact same characters from a different angle.
+			markGated(line.body)
 			continue
 		}
 		if payload := scanPayloadSignals(line.body); len(payload) > 0 {
 			signals = append(signals, payload...)
+			for _, s := range payload {
+				gatedCodes[s.Code] = struct{}{}
+			}
 			bump(SeverityCritical)
 			continue
 		}
@@ -161,6 +185,30 @@ func Inspect(in Input) Verdict {
 			Excerpt: excerpt(line.body),
 		})
 		bump(SeverityMedium)
+	}
+
+	// Defense in depth: also run the payload regex group over the whole
+	// content body. If a token shows up in bytes that the line-gate
+	// classified as inert (comment, path entry, line below a splitlines()
+	// terminator we didn't recognize), the line-gate alone wouldn't have
+	// surfaced it. Emit a Medium safety-net signal so a human reviewer can
+	// take a look — we deliberately stay below SeverityCritical here so a
+	// future parser-divergence bug surfaces in `veto scan` output without
+	// auto-refusing every install that happens to mention `exec(` inside a
+	// comment. Known-legit lines and already-Critical lines have their
+	// tokens recorded in gatedCodes above so we don't double-fire.
+	for _, g := range payloadGroups {
+		if _, alreadyGated := gatedCodes[g.code]; alreadyGated {
+			continue
+		}
+		if g.re.MatchString(content) {
+			signals = append(signals, Signal{
+				Code:    "pth-content-payload-token-out-of-gate",
+				Detail:  "payload token `" + g.code + "` matched the .pth content but did not appear inside any line our import-prefix gate classified as executable — likely a benign mention in a comment or path entry, but flagged at Medium as a safety net against future parser-divergence bypasses.",
+				Excerpt: excerpt(g.re.FindString(content)),
+			})
+			bump(SeverityMedium)
+		}
 	}
 
 	if in.FileName != "" && fileNameSetupRe.MatchString(in.FileName) && !allowlistedLegitName.MatchString(in.FileName) {
