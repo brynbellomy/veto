@@ -9,6 +9,7 @@ package wheel
 import (
 	"archive/zip"
 	"io"
+	"os"
 	"path"
 	"strings"
 
@@ -89,6 +90,13 @@ func collectPthEntries(zr *zip.Reader) ([]pthEntry, error) {
 	for _, f := range zr.File {
 		name := path.Clean(f.Name)
 		if name == "." || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "..") {
+			continue
+		}
+		// Defense-in-depth: explicitly skip symlink entries. The scanner
+		// never extracts to disk, so symlinks are not currently exploitable,
+		// but rejecting them here prevents any future extraction path from
+		// accidentally following a wheel-embedded symlink outside the zip.
+		if f.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
 		base := path.Base(name)
