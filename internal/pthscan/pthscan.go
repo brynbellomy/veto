@@ -176,28 +176,44 @@ func Inspect(in Input) Verdict {
 }
 
 // executableLine carries an executable .pth line's body (everything after
-// the leading whitespace) plus its 0-based offset in the original content,
-// so excerpt rendering and tests can point at exact bytes.
+// the leading whitespace).
 type executableLine struct {
-	body   string
-	offset int
+	body string
+}
+
+// isCPythonLineTerm reports whether r is a character CPython's str.splitlines()
+// treats as a line terminator. site.py runs `f.read().splitlines()` on the
+// decoded .pth content, so any of these in the file body starts a fresh line
+// from the parser's point of view. Splitting on a strict subset (e.g. only
+// "\n") collapses two distinct lines into one and lets a `# comment\rimport os…`
+// shape slip past the comment-skip filter as a single inert-looking line.
+//
+// CPython's set (per the str.splitlines() docs): \n, \r, \r\n, \v (0x0B),
+// \f (0x0C), \x1c, \x1d, \x1e, NEL (\u0085), LS (\u2028), PS (\u2029).
+// \r\n is handled correctly by strings.FieldsFunc since the empty span
+// between the two terminator bytes is discarded as a zero-length field.
+func isCPythonLineTerm(r rune) bool {
+	switch r {
+	case '\n', '\r', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029:
+		return true
+	}
+	return false
 }
 
 // executableLines walks the .pth using Python's site.py rule: a line is
 // executable iff its first non-whitespace token is `import` (case-sensitive,
 // matching CPython). Blank lines and lines whose first non-whitespace
 // character is `#` are inert. All other lines are inert path entries.
+//
+// We use strings.FieldsFunc over the CPython-equivalent terminator set so a
+// multi-line CR-only file (or any of the more exotic Unicode line breaks
+// site.py honors) cannot collapse two logical lines into one and smuggle a
+// payload past the comment-skip filter.
 func executableLines(content string) []executableLine {
 	var out []executableLine
-	start := 0
-	for i := 0; i <= len(content); i++ {
-		if i < len(content) && content[i] != '\n' {
-			continue
-		}
-		line := strings.TrimSuffix(content[start:i], "\r")
+	for _, line := range strings.FieldsFunc(content, isCPythonLineTerm) {
 		trimmed := strings.TrimLeft(line, " \t")
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			start = i + 1
 			continue
 		}
 		// Python's site.py treats a line as executable when its first
@@ -209,18 +225,20 @@ func executableLines(content string) []executableLine {
 		// as a gap — space, tab, form-feed, vertical tab — plus `(` (the
 		// unusual `import(x)` form that still parses) and bare `import`.
 		if isImportPrefix(trimmed) {
-			out = append(out, executableLine{body: trimmed, offset: start + (len(line) - len(trimmed))})
+			out = append(out, executableLine{body: trimmed})
 		}
-		start = i + 1
 	}
 	return out
 }
 
 // isImportPrefix reports whether a line (with leading whitespace already
 // trimmed) begins with the CPython site.py `import` token. site.py's literal
-// check is `line.startswith(("import ", "import\t"))`; we additionally accept
-// form-feed and vertical-tab (other ASCII whitespace the CPython tokenizer
-// treats as inter-token gap), the `import(x)` shape, and a bare `import` line.
+// check is `line.startswith(("import ", "import\t"))` — space and tab only;
+// neither form-feed nor vertical-tab work here because str.splitlines()
+// treats those as line terminators upstream, so by the time a single line
+// reaches the prefix check there cannot be one between `import` and the
+// module name. We additionally accept `import(x)` (the unusual but legal
+// statement form) and a bare `import` line.
 func isImportPrefix(trimmed string) bool {
 	const tok = "import"
 	if trimmed == tok {
@@ -230,7 +248,7 @@ func isImportPrefix(trimmed string) bool {
 		return false
 	}
 	switch trimmed[len(tok)] {
-	case ' ', '\t', '\f', '\v', '(':
+	case ' ', '\t', '(':
 		return true
 	}
 	return false

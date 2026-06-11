@@ -285,33 +285,52 @@ func TestVerifierClaim1_TabSeparatorBypass(t *testing.T) {
 		require.Contains(t, codes(v), "pth-payload-spawn")
 		require.Contains(t, codes(v), "pth-setup-filename")
 	})
-
-	t.Run("form-feed-separator", func(t *testing.T) {
-		// \f (form-feed) is also CPython tokenizer whitespace; defense in depth
-		// against attackers who switch separator after we patch \t.
-		v := pthscan.Inspect(pthscan.Input{
-			PthContent: []byte("import\fos; os.system('x')\n"),
-			FileName:   "evil.pth",
-		})
-		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
-		require.Contains(t, codes(v), "pth-payload-spawn")
-	})
 }
 
 // TestVerifierClaim2_CROnlyLineEndings verifies claim 2:
-// A .pth with \r-only line endings (no \n) bypasses pthscan.
-// CPython on some platforms accepts \r as a line terminator in .pth files.
+// A .pth with \r-only line endings (no \n) must be split into lines exactly
+// the way CPython's str.splitlines() does. The single-line case was caught
+// by the implicit end-of-buffer terminator + the TrimSuffix("\r"); the
+// multi-line case below is the real bug: a `# comment\rimport os; …\r`
+// collapses into one logical line whose first non-whitespace byte is `#`,
+// which the comment-skip filter marks inert and the payload sails through.
 func TestVerifierClaim2_CROnlyLineEndings(t *testing.T) {
-	// "import os; os.system('x')\r" — \r but no \n
-	content := []byte("import os; os.system('x')\r")
-	v := pthscan.Inspect(pthscan.Input{
-		PthContent: content,
-		FileName:   "evil.pth",
+	t.Run("single-line-cr", func(t *testing.T) {
+		content := []byte("import os; os.system('x')\r")
+		v := pthscan.Inspect(pthscan.Input{PthContent: content, FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
 	})
-	t.Logf("Severity: %s", v.Severity)
-	t.Logf("Signals: %v", codes(v))
-	// If claim is correct: severity == none (no signals).
-	// Expected correct behavior: severity == critical with pth-payload-spawn.
+
+	t.Run("multi-line-cr-comment-then-payload", func(t *testing.T) {
+		// `# comment\rimport os; os.system('x')\r` — a single-`\n` splitter
+		// folds both into one line whose first non-whitespace byte is `#`,
+		// hiding the import statement behind a comment-skip.
+		content := []byte("# decoy\rimport os; os.system('x')\r")
+		v := pthscan.Inspect(pthscan.Input{PthContent: content, FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
+	})
+
+	t.Run("multi-line-crlf-comment-then-payload", func(t *testing.T) {
+		// \r\n must collapse to a single terminator (not two) so an empty
+		// phantom line doesn't appear; both halves of this file must still
+		// split correctly.
+		content := []byte("# decoy\r\nimport os; os.system('x')\r\n")
+		v := pthscan.Inspect(pthscan.Input{PthContent: content, FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
+	})
+
+	t.Run("nel-line-terminator", func(t *testing.T) {
+		// CPython splitlines() also honors \u0085 (NEL), \u2028 (LS),
+		// \u2029 (PS). Defense against an attacker who notices the multi-byte
+		// terminators land outside the \n/\r predicate.
+		content := []byte("# decoy\u0085import os; os.system('x')\u0085")
+		v := pthscan.Inspect(pthscan.Input{PthContent: content, FileName: "evil.pth"})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
+	})
 }
 
 // TestVerifierClaim3_UTF8BOMBypass verifies claim 3:
