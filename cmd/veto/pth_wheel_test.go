@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -19,22 +21,60 @@ func zerologNop() zerolog.Logger { return zerolog.Nop() }
 
 func TestPthWheelScanModeDefaults(t *testing.T) {
 	t.Setenv("VETO_PTH_WHEEL_SCAN", "")
-	enabled, full := pthWheelScanMode()
+	enabled, full, raw := pthWheelScanMode()
 	require.True(t, enabled)
 	require.False(t, full)
+	require.Equal(t, "", raw)
 }
 
 func TestPthWheelScanModeOff(t *testing.T) {
 	t.Setenv("VETO_PTH_WHEEL_SCAN", "off")
-	enabled, _ := pthWheelScanMode()
+	enabled, _, raw := pthWheelScanMode()
 	require.False(t, enabled)
+	require.Equal(t, "off", raw)
 }
 
 func TestPthWheelScanModeFull(t *testing.T) {
 	t.Setenv("VETO_PTH_WHEEL_SCAN", "full")
-	enabled, full := pthWheelScanMode()
+	enabled, full, _ := pthWheelScanMode()
 	require.True(t, enabled)
 	require.True(t, full)
+}
+
+// TestPthWheelScanModeOnlyOffDisables verifies that legacy boolean-ish values
+// ("0", "false", "no") are no longer treated as disable — they fall through to
+// the default (enabled, argv-direct) and log an unrecognised-value warning.
+// Only the literal string "off" turns the scan off.
+func TestPthWheelScanModeOnlyOffDisables(t *testing.T) {
+	for _, v := range []string{"0", "false", "no"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("VETO_PTH_WHEEL_SCAN", v)
+			enabled, _, _ := pthWheelScanMode()
+			require.True(t, enabled, "expected %q NOT to disable the scan (only 'off' should)", v)
+		})
+	}
+}
+
+// TestPthWheelPreflightDisabledLogsAndWarns verifies that setting
+// VETO_PTH_WHEEL_SCAN=off causes pthWheelPreflight to:
+//  1. return false (no refusal — prescan skipped)
+//  2. write a visible WARNING to the output writer
+func TestPthWheelPreflightDisabledLogsAndWarns(t *testing.T) {
+	t.Setenv("VETO_PTH_WHEEL_SCAN", "off")
+	var buf bytes.Buffer
+
+	// Use a real zerolog logger pointing at buf so we can check it logged.
+	log := zerolog.New(&buf)
+
+	refused := pthWheelPreflight(
+		log, &buf, config{},
+		[]packagemanager.Install{ins("ensmallen", "0.8.6", intel.EcosystemPyPI)}, nil,
+	)
+	require.False(t, refused)
+
+	out := buf.String()
+	require.True(t, strings.Contains(out, "DISABLED") || strings.Contains(out, "disabled"),
+		"expected output to mention 'DISABLED', got: %q", out)
 }
 
 func TestSelectWheelTargetsDirectOnly(t *testing.T) {

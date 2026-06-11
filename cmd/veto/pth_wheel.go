@@ -22,18 +22,30 @@ import (
 // from stalling the install indefinitely.
 const pthWheelScanTimeout = 120 * time.Second
 
+// pthWheelScanDisabled is the sentinel returned by pthWheelScanMode when the
+// scan has been explicitly disabled via VETO_PTH_WHEEL_SCAN=off. The caller
+// should log and surface this in the install summary so operators can see
+// when the prescan is silently inactive.
+const pthWheelScanDisabled = "off"
+
 // pthWheelScanMode reads VETO_PTH_WHEEL_SCAN.
-//   - off / 0 / false / no  → disabled
-//   - full / all / transitive → fetch every resolved install too
+//
+//   - "off"                   → disabled (the ONLY accepted disable value)
+//   - "full" / "all" / "transitive" → fetch every resolved install too
 //   - anything else (default) → argv-direct only
-func pthWheelScanMode() (enabled bool, full bool) {
-	switch os.Getenv("VETO_PTH_WHEEL_SCAN") {
-	case "0", "off", "false", "no":
-		return false, false
+//
+// Note: legacy boolean-ish values ("0", "false", "no") are no longer treated
+// as disable. An unrecognised value is logged and treated as the default
+// (argv-direct only) so a typo doesn't silently turn the scan off.
+func pthWheelScanMode() (enabled bool, full bool, rawEnv string) {
+	v := os.Getenv("VETO_PTH_WHEEL_SCAN")
+	switch v {
+	case pthWheelScanDisabled:
+		return false, false, v
 	case "full", "all", "transitive":
-		return true, true
+		return true, true, v
 	default:
-		return true, false
+		return true, false, v
 	}
 }
 
@@ -51,9 +63,23 @@ func pthWheelPreflight(
 	directInstalls []packagemanager.Install,
 	resolvedInstalls []packagemanager.Install,
 ) bool {
-	enabled, full := pthWheelScanMode()
+	enabled, full, rawEnv := pthWheelScanMode()
 	if !enabled {
+		// Log at WARN — disabled prescan is an observable operational event,
+		// not a silent state. An attacker that already has env-write can set
+		// VETO_PTH_WHEEL_SCAN=off to bypass this layer; make that visible.
+		logger.Warn().
+			Str("VETO_PTH_WHEEL_SCAN", rawEnv).
+			Msg(".pth wheel prescan DISABLED via VETO_PTH_WHEEL_SCAN=off — wheel contents will NOT be inspected before install")
+		fmt.Fprintln(w, "veto: WARNING — .pth wheel prescan is DISABLED (VETO_PTH_WHEEL_SCAN=off). Wheels will not be inspected before install.")
 		return false
+	}
+	// Log unrecognised values so a mis-typed env var is caught at the
+	// operator level rather than silently falling back to default behaviour.
+	if rawEnv != "" && rawEnv != "full" && rawEnv != "all" && rawEnv != "transitive" {
+		logger.Warn().
+			Str("VETO_PTH_WHEEL_SCAN", rawEnv).
+			Msg(".pth wheel prescan: unrecognised VETO_PTH_WHEEL_SCAN value; using default (argv-direct only). Use 'off' to disable, 'full' for transitive scan.")
 	}
 
 	targets := selectWheelTargets(directInstalls, resolvedInstalls, full)
