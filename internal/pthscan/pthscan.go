@@ -161,14 +161,40 @@ func executableLines(content string) []executableLine {
 			start = i + 1
 			continue
 		}
-		// Python checks for `import` as the first token; tolerate either
-		// `import x` or `import(x)` (the latter is unusual but still parsed).
-		if strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "import(") || trimmed == "import" {
+		// Python's site.py treats a line as executable when its first
+		// token is `import` followed by any token-separator byte. CPython
+		// site.py literally checks `line.startswith(("import ", "import\t"))`,
+		// so a tab between `import` and the module name detonates the
+		// payload but a naive space-only prefix check misses it. We accept
+		// the full set of inter-token whitespace CPython's tokenizer treats
+		// as a gap — space, tab, form-feed, vertical tab — plus `(` (the
+		// unusual `import(x)` form that still parses) and bare `import`.
+		if isImportPrefix(trimmed) {
 			out = append(out, executableLine{body: trimmed, offset: start + (len(line) - len(trimmed))})
 		}
 		start = i + 1
 	}
 	return out
+}
+
+// isImportPrefix reports whether a line (with leading whitespace already
+// trimmed) begins with the CPython site.py `import` token. site.py's literal
+// check is `line.startswith(("import ", "import\t"))`; we additionally accept
+// form-feed and vertical-tab (other ASCII whitespace the CPython tokenizer
+// treats as inter-token gap), the `import(x)` shape, and a bare `import` line.
+func isImportPrefix(trimmed string) bool {
+	const tok = "import"
+	if trimmed == tok {
+		return true
+	}
+	if !strings.HasPrefix(trimmed, tok) {
+		return false
+	}
+	switch trimmed[len(tok)] {
+	case ' ', '\t', '\f', '\v', '(':
+		return true
+	}
+	return false
 }
 
 func excerpt(line string) string {
