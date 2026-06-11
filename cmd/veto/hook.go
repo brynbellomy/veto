@@ -206,8 +206,15 @@ func gypWormReasonForTree(logger zerolog.Logger, pmName string, pmArgs []string)
 		logger.Warn().Err(err).Msg("hook gyp check: resolve cwd failed; skipping")
 		return "", false
 	}
+	// The hook entrypoint doesn't thread cfg; resolve the cache dir the same
+	// way the gate does so both layers honor the same gyp allowlist. A config
+	// load failure degrades to an empty allowlist — fail closed.
+	var allowed map[string]struct{}
+	if cfg, err := loadConfig(); err == nil {
+		allowed = loadGypAllowlist(logger, cfg.CacheDir)
+	}
 	var buf strings.Builder
-	if !gypPreflightRoots(logger, &buf, gypScanRootsForInstall(pmName, pmArgs, cwd)) {
+	if !gypPreflightRoots(logger, &buf, gypScanRootsForInstall(pmName, pmArgs, cwd), allowed) {
 		return "", false
 	}
 	return "veto-hook: BLOCKED — " + buf.String(), true

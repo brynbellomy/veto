@@ -387,6 +387,24 @@ above) block an install; **medium** structural anomalies are surfaced by `veto s
 review but do not refuse on the hot path, where a false block stops real
 work.
 
+**Acknowledging a false positive.** Some long-established native packages
+legitimately use payload-shaped shell in their `binding.gyp` (sharp's
+pkg-config/readelf ABI probe, bufferutil's `cc -v | perl` version probe).
+After you have **inspected the file yourself** and confirmed it is the
+package's legitimate build probe, acknowledge it by content hash:
+
+```sh
+veto gyp-allow node_modules/sharp/src/binding.gyp
+veto gyp-allow --list
+```
+
+The allowlist (in the veto cache dir, `gyp-allowlist`) pins the sha256 of
+the exact bytes — the same legitimate file is acknowledged once across every
+cache and `node_modules` copy, while a tampered variant of the same package
+hashes differently and still refuses. `veto scan` keeps reporting
+acknowledged findings for visibility; only the install-time block is
+lifted.
+
 **Fail-closed defaults.** Per-source malware feeds are fetched
 concurrently with etag-based caching in `~/.cache/veto/`.
 On network outage the last good snapshot is used; if zero sources

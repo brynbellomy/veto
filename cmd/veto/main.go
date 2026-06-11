@@ -298,6 +298,8 @@ func run(args []string) int {
 		return runAuditAgentSurface(logger, cfg, args[1:])
 	case "quarantine-cache":
 		return runQuarantineCache(logger, cfg, args[1:])
+	case "gyp-allow":
+		return runGypAllow(logger, cfg, args[1:])
 	}
 
 	return runGate(logger, cfg, args)
@@ -468,7 +470,7 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 		// (b) Existing-tree scan: an `npm install` re-runs node-gyp for the
 		// WHOLE tree, so a worm already in node_modules (from an earlier
 		// install) would detonate on this unrelated install. Scan it.
-		if runGypPreflightIfNpmFamily(logger, pm, pmArgs) {
+		if runGypPreflightIfNpmFamily(logger, cfg, pm, pmArgs) {
 			return exitRefused
 		}
 	}
@@ -1568,6 +1570,10 @@ Usage:
   veto quarantine-cache [--dry-run] [--purge] [--json]
                             scan cache exposure and optionally purge confirmed
                             malicious cache artifacts
+  veto gyp-allow <binding.gyp>... | --list
+                            acknowledge an INSPECTED binding.gyp by content
+                            hash so its copies stop blocking installs; a
+                            modified variant still refuses
   veto audit-agent-surface [--json]
                             inspect Claude/Codex/Cursor/Sirene/MCP/launchd
                             persistence surfaces only
