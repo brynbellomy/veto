@@ -45,10 +45,10 @@ const (
 //   - 0  every requested step succeeded.
 //   - 10 a user-scoped layer (shims/shell/hook/preload/intel/doctor) failed.
 //   - 20 the wrappers step couldn't touch one or more candidate dirs
-//        because the current user lacks write access (non-root); caller
-//        can retry under sudo without re-running layers 1–4.
+//     because the current user lacks write access (non-root); caller
+//     can retry under sudo without re-running layers 1–4.
 //   - 30 the wrappers step had write access (or we are root) and still
-//        failed — caller has a real bug, not a permissions one.
+//     failed — caller has a real bug, not a permissions one.
 func runInstallAll(logger zerolog.Logger, cfg config, args []string) int {
 	opts, err := parseInstallAllFlags(args)
 	if err != nil {
@@ -167,14 +167,14 @@ func wrapperStepArgs(opts installAllOpts) []string {
 // Pure (no I/O, no globals) so it can be unit tested exhaustively.
 //
 //   - stats.failed > 0  → genuine wrappers failure (30), regardless of euid.
-//                         If we are root and still hit a hard failure, it's
-//                         not a permissions problem.
+//     If we are root and still hit a hard failure, it's
+//     not a permissions problem.
 //   - stats.failed == 0 && stats.skippedUnwritable > 0:
-//       - euid != 0 → needs-root (20). User can retry under sudo.
-//       - euid == 0 → wrappers fail (30). We ARE root and still can't
-//                     write; the dir is read-only at the OS level
-//                     (SIP-protected, immutable flag, etc.) so
-//                     elevation will not help.
+//   - euid != 0 → needs-root (20). User can retry under sudo.
+//   - euid == 0 → wrappers fail (30). We ARE root and still can't
+//     write; the dir is read-only at the OS level
+//     (SIP-protected, immutable flag, etc.) so
+//     elevation will not help.
 //   - rc != 0 (no skipped, no failed) → wrappers fail (30). Defensive:
 //     install-wrappers should only return non-zero when stats.failed > 0,
 //     but if a future change adds another non-zero path we surface it
