@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -114,4 +115,53 @@ func TestPthWheelPreflightDisabledShortCircuits(t *testing.T) {
 		[]packagemanager.Install{ins("ensmallen", "0.8.6", intel.EcosystemPyPI)}, nil,
 	)
 	require.False(t, refused)
+}
+
+// -- sdist-only sentinel tests (veto-3w1.3) -----------------------------------
+
+func TestErrSdistOnlyError(t *testing.T) {
+	err := &errSdistOnly{spec: "evil==1.0", detail: "No matching distribution found for evil==1.0"}
+	require.Contains(t, err.Error(), "evil==1.0")
+	require.Contains(t, err.Error(), "sdist-only")
+}
+
+func TestErrSdistOnlyErrorNilDetail(t *testing.T) {
+	err := &errSdistOnly{spec: "foo"}
+	require.Contains(t, err.Error(), "foo")
+}
+
+func TestIsErrSdistOnly(t *testing.T) {
+	var target *errSdistOnly
+
+	// nil → false
+	require.False(t, isErrSdistOnly(nil, &target))
+
+	// wrong type → false
+	require.False(t, isErrSdistOnly(fmt.Errorf("other error"), &target))
+
+	// correct type → true + target populated
+	orig := &errSdistOnly{spec: "pkg==1"}
+	require.True(t, isErrSdistOnly(orig, &target))
+	require.Equal(t, "pkg==1", target.spec)
+}
+
+func TestPipOutputIndicatesSdistOnly(t *testing.T) {
+	cases := []struct {
+		output string
+		want   bool
+	}{
+		// pip 22+ canonical messages
+		{"ERROR: No matching distribution found for evil==1.0.0", true},
+		{"Could not find a version that satisfies the requirement evil==1.0.0", true},
+		// pip --only-binary hint
+		{"Note: This would have installed a sdist (source distribution)", true},
+		// transient / unrelated
+		{"ERROR: pip's dependency resolver does not currently take into account all the packages", false},
+		{"Collecting evil==1.0.0\n  Downloading evil-1.0.0-py3-none-any.whl\nSuccessfully downloaded evil", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		got := pipOutputIndicatesSdistOnly(tc.output)
+		require.Equal(t, tc.want, got, "input: %q", tc.output)
+	}
 }

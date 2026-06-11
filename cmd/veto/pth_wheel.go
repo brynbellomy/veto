@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -104,6 +105,7 @@ func pthWheelPreflight(
 	defer cancel()
 
 	var flagged []wheelFinding
+	var sdistRefused []string
 	for _, tgt := range targets {
 		if err := ctx.Err(); err != nil {
 			logger.Warn().Err(err).Msg(".pth wheel preflight: timed out; allowing (fail-open)")
@@ -111,12 +113,32 @@ func pthWheelPreflight(
 		}
 		verdict, err := downloadAndInspectWheel(ctx, realPip, workdir, tgt)
 		if err != nil {
+			var sdistErr *errSdistOnly
+			if isErrSdistOnly(err, &sdistErr) {
+				// Fail-CLOSED: the package has no binary wheel. veto cannot
+				// inspect an sdist before install (build-time code runs).
+				// Refuse rather than allow. An attacker shipping sdist-only
+				// worms would otherwise bypass the prescan entirely.
+				logger.Error().
+					Err(err).
+					Str("spec", tgt.spec()).
+					Msg(".pth wheel preflight: sdist-only package; refusing install (cannot inspect before build)")
+				sdistRefused = append(sdistRefused, tgt.spec())
+				continue
+			}
+			// Transient error (network, pip crash, timeout on one package) →
+			// fail-open so a registry hiccup doesn't block all installs.
 			logger.Warn().Err(err).Str("spec", tgt.spec()).Msg(".pth wheel preflight: fetch/inspect failed; skipping this package")
 			continue
 		}
 		if verdict.Severity == pthscan.SeverityCritical {
 			flagged = append(flagged, wheelFinding{spec: tgt.spec(), verdict: verdict})
 		}
+	}
+
+	if len(sdistRefused) > 0 {
+		printSdistRefusal(w, sdistRefused)
+		return true
 	}
 
 	if len(flagged) == 0 {
@@ -185,9 +207,46 @@ func selectWheelTargets(direct, resolved []packagemanager.Install, full bool) []
 	return out
 }
 
+// errSdistOnly is returned by downloadAndInspectWheel when pip successfully
+// contacted the index but found no binary wheel — the package is sdist-only.
+// This is a sentinel for the caller: unlike a transient fetch error (network
+// timeout, registry 5xx, unknown package), sdist-only is a structural
+// property of the package that means veto cannot inspect it before install.
+// The caller must fail-closed rather than fail-open.
+type errSdistOnly struct {
+	spec   string
+	detail string // pip output excerpt
+}
+
+func (e *errSdistOnly) Error() string {
+	if e.detail != "" {
+		return fmt.Sprintf("pip download %s: no binary wheel available (sdist-only): %s", e.spec, e.detail)
+	}
+	return fmt.Sprintf("pip download %s: no binary wheel available (package may be sdist-only or require a build backend)", e.spec)
+}
+
+// pipOutputIndicatesSdistOnly returns true when pip's combined output contains
+// canonical "no binary distribution found" messages. These messages appear
+// when --only-binary :all: is specified and no wheel matches the platform.
+func pipOutputIndicatesSdistOnly(output string) bool {
+	// Canonical pip messages for "no binary wheel exists":
+	//   pip 22+: "No matching distribution found for <pkg>"
+	//   pip 22+: "Could not find a version that satisfies the requirement <pkg>"
+	//   pip 22+: "ERROR: Could not find a version …" (--no-color is not set so may have ANSI)
+	//   pip hint: "Note: This would have installed a sdist …" (--only-binary :all: hint)
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "no matching distribution") ||
+		strings.Contains(lower, "could not find a version that satisfies") ||
+		strings.Contains(lower, "no matching distribution found") ||
+		strings.Contains(lower, "sdist") // pip hint: "would have installed a sdist"
+}
+
 // downloadAndInspectWheel downloads one package's wheel with `pip download
 // --no-deps --only-binary :all:` (no sdist building; wheels only) into
 // workdir and inspects it in memory. The wheel is never installed.
+//
+// Returns *errSdistOnly when the package has no binary wheel (sdist-only).
+// The caller MUST fail-closed on that sentinel — not skip-and-continue.
 func downloadAndInspectWheel(ctx context.Context, realPip, workdir string, tgt wheelTarget) (pthscan.Verdict, error) {
 	before, err := whlSet(workdir)
 	if err != nil {
@@ -201,8 +260,16 @@ func downloadAndInspectWheel(ctx context.Context, realPip, workdir string, tgt w
 	)
 	cmd.Dir = workdir
 	cmd.Env = sanitizedEnv(os.Environ())
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return pthscan.Verdict{}, fmt.Errorf("pip download %s: %w (%s)", tgt.spec(), err, truncateForError(string(out), 400))
+	pipOut, pipErr := cmd.CombinedOutput()
+	if pipErr != nil {
+		// pip exited non-zero. Distinguish "no wheel" from "transient error".
+		if pipOutputIndicatesSdistOnly(string(pipOut)) {
+			return pthscan.Verdict{}, &errSdistOnly{
+				spec:   tgt.spec(),
+				detail: truncateForError(string(pipOut), 200),
+			}
+		}
+		return pthscan.Verdict{}, fmt.Errorf("pip download %s: %w (%s)", tgt.spec(), pipErr, truncateForError(string(pipOut), 400))
 	}
 
 	whlPath, err := newlyWrittenWhl(workdir, before)
@@ -210,7 +277,16 @@ func downloadAndInspectWheel(ctx context.Context, realPip, workdir string, tgt w
 		return pthscan.Verdict{}, err
 	}
 	if whlPath == "" {
-		return pthscan.Verdict{}, fmt.Errorf("pip download %s produced no wheel (only-binary forbids sdist; package may not publish wheels)", tgt.spec())
+		// pip exited 0 but wrote no wheel. This can happen when:
+		//   - the package only publishes sdists (pip --only-binary :all: succeeds
+		//     but produces nothing on some pip versions)
+		//   - a wheel was already present in workdir and pip treated it as cached
+		//     (we guard against that with the before-set diff, so this is the former)
+		// Treat as sdist-only: fail-closed.
+		return pthscan.Verdict{}, &errSdistOnly{
+			spec:   tgt.spec(),
+			detail: truncateForError(string(pipOut), 200),
+		}
 	}
 
 	f, err := os.Open(whlPath)
@@ -272,4 +348,32 @@ func printWheelRefusal(w io.Writer, findings []wheelFinding) {
 	fmt.Fprintln(w, "so installing it would detonate the worm on the next `python` call. The wheel was")
 	fmt.Fprintln(w, "downloaded for inspection only and never installed. Do NOT install it; the package")
 	fmt.Fprintln(w, "name may be a trusted one compromised via account takeover.")
+}
+
+// isErrSdistOnly unwraps err and sets *target to the *errSdistOnly if present.
+// Uses type-assertion rather than errors.As to avoid importing errors; this
+// function and errSdistOnly are in the same package so direct assertion is fine.
+func isErrSdistOnly(err error, target **errSdistOnly) bool {
+	if err == nil {
+		return false
+	}
+	e, ok := err.(*errSdistOnly)
+	if ok && target != nil {
+		*target = e
+	}
+	return ok
+}
+
+// printSdistRefusal renders the refusal message for sdist-only packages.
+func printSdistRefusal(w io.Writer, specs []string) {
+	fmt.Fprintln(w, "veto: install refused — one or more packages publish only source distributions (sdists) and cannot be inspected before install:")
+	for _, s := range specs {
+		fmt.Fprintf(w, "  - %s\n", s)
+	}
+	fmt.Fprintln(w, "\nveto's .pth wheel prescan requires a binary wheel to inspect. An sdist is built")
+	fmt.Fprintln(w, "at install time, which means arbitrary code in setup.py / build backends runs")
+	fmt.Fprintln(w, "before veto can inspect any .pth files it installs. To proceed, either:")
+	fmt.Fprintln(w, "  1. Confirm the package is safe via an out-of-band channel and use `pip install`")
+	fmt.Fprintln(w, "     directly (bypassing veto — do this only if you understand the risk).")
+	fmt.Fprintln(w, "  2. Build the sdist into a wheel locally (`pip wheel <pkg>`) and install the wheel.")
 }
