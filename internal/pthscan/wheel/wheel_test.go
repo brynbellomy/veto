@@ -3,6 +3,7 @@ package wheel_test
 import (
 	"archive/zip"
 	"bytes"
+	"fmt"
 	"os"
 	"testing"
 
@@ -128,4 +129,44 @@ func TestInspectSkipsSymlinkEntries(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, pthscan.SeverityNone, v.Severity,
 		"symlink entry must be skipped; if flagged, the scanner read symlink content")
+}
+
+// buildZipBombWheel constructs a synthetic zip bomb: many entries each
+// containing maxPthBytes (256 KB) of a single repeating byte. Zip compression
+// reduces that to nearly nothing on disk, but decompression yields the full
+// byte count. The total decompressed size deliberately exceeds
+// maxWheelDecompressedBytes (256 MB) to trigger the DoS guard.
+//
+// maxPthBytes = 256*1024 = 262144 bytes
+// ceil(256 MB / 256 KB) = 1024 entries to hit the limit; we use 1025.
+func buildZipBombWheel(t *testing.T) (*bytes.Reader, int64) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := zip.NewWriter(&buf)
+	payload := bytes.Repeat([]byte{0x00}, 256*1024) // 256 KB; compresses to ~200 bytes
+	const entries = 1025                             // 1025 * 256 KB = 263 MB > 256 MB limit
+	for i := range entries {
+		name := fmt.Sprintf("bomb-%d.data/purelib/bomb-%d.pth", i, i)
+		fw, err := w.CreateHeader(&zip.FileHeader{
+			Name:   name,
+			Method: zip.Deflate,
+		})
+		require.NoError(t, err)
+		_, err = fw.Write(payload)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+	return bytes.NewReader(buf.Bytes()), int64(buf.Len())
+}
+
+func TestInspectZipBombRejected(t *testing.T) {
+	// Zip-bomb DoS guard: a wheel whose total decompressed .pth bytes exceed
+	// maxWheelDecompressedBytes (256 MB) must be rejected with an error rather
+	// than consuming unbounded memory. The synthetic bomb uses 1025 entries of
+	// 256 KB each (263 MB decompressed, ~200 KB compressed in the zip).
+	r, n := buildZipBombWheel(t)
+	_, err := wheel.Inspect(r, n)
+	require.Error(t, err, "wheel with 263 MB of decompressed .pth content must be rejected")
+	require.Contains(t, err.Error(), "decompressed size exceeds limit",
+		"error should identify the decompression limit as the cause")
 }

@@ -27,6 +27,15 @@ const maxPthBytes = 256 * 1024
 // of entries; pathological wheels with millions are rejected.
 const maxWheelEntries = 100_000
 
+// maxWheelDecompressedBytes caps the total bytes decompressed across all
+// entries in a single wheel scan. Per-entry reads are already capped at
+// maxPthBytes (256 KB); this total cap guards against zip-bomb payloads
+// that embed many entries each just below the per-entry limit, or against
+// non-.pth entries that are read en-route (e.g. RECORD parsing, if ever
+// re-added). 256 MB is orders of magnitude above any legitimate wheel while
+// still small enough to bound memory pressure on a DoS-shaped input.
+const maxWheelDecompressedBytes = 256 * 1024 * 1024
+
 // Inspect reads a wheel from r (must be a ReaderAt; the *bytes.Reader and
 // *os.File from a downloaded wheel both satisfy this) of size and classifies
 // every .pth file inside via pthscan.Inspect. Returns the highest-severity
@@ -87,6 +96,7 @@ type pthEntry struct {
 // handled correctly by the direct zip walk.
 func collectPthEntries(zr *zip.Reader) ([]pthEntry, error) {
 	var out []pthEntry
+	var totalDecompressed int64
 	for _, f := range zr.File {
 		name := path.Clean(f.Name)
 		if name == "." || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "..") {
@@ -109,6 +119,11 @@ func collectPthEntries(zr *zip.Reader) ([]pthEntry, error) {
 		content, truncated, err := readZipEntry(f, maxPthBytes)
 		if err != nil {
 			return nil, errors.With(err, "read wheel .pth entry").Set("path", name)
+		}
+		totalDecompressed += int64(len(content))
+		if totalDecompressed > maxWheelDecompressedBytes {
+			return nil, errors.WithNew("wheel decompressed size exceeds limit").
+				Set("limit", maxWheelDecompressedBytes, "path", name)
 		}
 		out = append(out, pthEntry{name: name, content: content, truncated: truncated})
 	}
