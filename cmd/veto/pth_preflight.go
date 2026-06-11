@@ -103,9 +103,15 @@ func runPthPreflightIfPythonFamily(logger zerolog.Logger, pm packagemanager.Pack
 	return pthPreflightRoots(logger, os.Stderr, pthScanRootsForInstall(pm.Name(), pmArgs, cwd))
 }
 
-// pthScanRootsForInstall picks the venvs the install will affect: the
-// argv-named target dir (e.g. `pip install --target ./vendor`) if present,
-// plus cwd. The walker descends into any .venv/venv beneath these.
+// pthScanRootsForInstall picks the venvs the install will affect.  It
+// resolves the argv-named install root for pip/pip3/uv (`--target`/`-t`
+// for an exact flat dir; `--prefix`/`--root` for a prefix tree whose
+// actual site-packages lives in a subdirectory) and the analogous flags
+// for npm-family managers, then adds cwd as a second root so that any
+// venv already present in the project tree is always scanned.  The walker
+// descends into any .venv/venv/lib/pythonX.Y/site-packages it finds
+// beneath each root, so approximate roots (--prefix, --root) are still
+// covered.
 func pthScanRootsForInstall(pmName string, pmArgs []string, cwd string) []string {
 	seen := map[string]struct{}{}
 	roots := make([]string, 0, 2)
