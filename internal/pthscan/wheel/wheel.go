@@ -8,8 +8,6 @@ package wheel
 
 import (
 	"archive/zip"
-	"bytes"
-	"encoding/csv"
 	"io"
 	"path"
 	"strings"
@@ -75,40 +73,25 @@ type pthEntry struct {
 	truncated bool
 }
 
-// collectPthEntries walks the wheel zip and gathers every .pth file via
-// either the data scheme or a top-level location. RECORD is consulted as a
-// hint but not relied on (some adversarial wheels omit / corrupt RECORD).
+// collectPthEntries walks the wheel zip and gathers every .pth file that
+// Python's site.py could execute at startup: entries in the data-scheme
+// purelib/platlib directories and bare top-level .pth files.
+//
+// Note: RECORD parsing was considered (to discover .pth files listed in
+// RECORD at unusual paths) but removed — the data-scheme zip walk is
+// sufficient for all known worm vectors, RECORD parsing had an unsatisfiable
+// predicate (base cannot contain '/'), and recordEntries had no consumer.
+// If a future wheel layout requires RECORD consultation, add it then with a
+// tested consumer. Adversarial wheels that omit/corrupt RECORD are already
+// handled correctly by the direct zip walk.
 func collectPthEntries(zr *zip.Reader) ([]pthEntry, error) {
 	var out []pthEntry
-	recordEntries := map[string]struct{}{}
 	for _, f := range zr.File {
 		name := path.Clean(f.Name)
 		if name == "." || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "..") {
 			continue
 		}
 		base := path.Base(name)
-		if strings.HasSuffix(base, ".dist-info/RECORD") || strings.HasSuffix(name, "RECORD") && strings.Contains(name, ".dist-info/") {
-			// Parse RECORD as a CSV; first column is the entry path. Best-effort.
-			content, _, err := readZipEntry(f, maxPthBytes*4)
-			if err == nil {
-				rd := csv.NewReader(bytes.NewReader(content))
-				rd.FieldsPerRecord = -1
-				for {
-					row, err := rd.Read()
-					if err != nil {
-						break
-					}
-					if len(row) == 0 {
-						continue
-					}
-					rel := strings.TrimSpace(row[0])
-					if strings.HasSuffix(rel, ".pth") {
-						recordEntries[rel] = struct{}{}
-					}
-				}
-			}
-			continue
-		}
 		if !strings.HasSuffix(base, ".pth") {
 			continue
 		}
@@ -121,12 +104,6 @@ func collectPthEntries(zr *zip.Reader) ([]pthEntry, error) {
 		}
 		out = append(out, pthEntry{name: name, content: content, truncated: truncated})
 	}
-	// RECORD entries we haven't seen yet would be a `.pth` in an unusual
-	// path. The zip walk above already enumerated every file; recordEntries
-	// is informational. (We keep the parse in place because it would matter
-	// in a future where a wheel ships a custom installer script that places
-	// .pth files outside the data-scheme directories.)
-	_ = recordEntries
 	return out, nil
 }
 
