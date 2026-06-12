@@ -115,6 +115,22 @@ func TestAnalyze(t *testing.T) {
 		{"python -m pip with env assignment", "FOO=bar python -m pip install foo", "pip"},
 		{"python -m pip chained", "cd /tmp && python -m pip install foo", "pip"},
 
+		// Versioned python aliases (uv-managed cpython, pyenv, …)
+		// must dispatch as risky too — the uv-venv bypass made
+		// `python3.X -m pip install …` reach the canonical interpreter
+		// by absolute path.
+		{"python3.12 -m pip install", "python3.12 -m pip install foo", "pip"},
+		{"python3.11 -m uv add", "python3.11 -m uv add pandas", "uv"},
+		{"python3.10 -m pip via absolute path", "/Users/x/.local/share/uv/python/cpython-3.10.14-macos-aarch64-none/bin/python3.10 -m pip install foo", "pip"},
+		{"python3.11.2 (patch-level) -m pip install", "python3.11.2 -m pip install foo", "pip"},
+		{"plain python3.12 script is benign", "python3.12 script.py", ""},
+		{"python3.12 -m venv is benign", "python3.12 -m venv .venv", ""},
+		// Adjacent shapes that look pythonic but aren't versioned aliases
+		// must NOT match the python branch — they're unknown PMs and
+		// should pass through.
+		{"python3-config -m pip is not gated", "python3-config -m pip install foo", ""},
+		{"python4 -m pip is not gated", "python4 -m pip install foo", ""},
+
 		{"go get", "go get github.com/evil/module@v1.2.3", "go"},
 		{"go install", "go install github.com/evil/cmd@v0.2.0", "go"},
 		{"remote go run", "go run github.com/evil/cmd@latest", "go"},

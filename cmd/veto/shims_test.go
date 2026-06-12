@@ -187,4 +187,116 @@ func TestIsShimName(t *testing.T) {
 	}
 	require.False(t, isShimName("veto"))
 	require.False(t, isShimName(""))
+	// Versioned python aliases must also dispatch as shims so an
+	// install-shims-created ~/.local/bin/python3.12 routes through
+	// veto when resolved through PATH.
+	require.True(t, isShimName("python3.10"))
+	require.True(t, isShimName("python3.12"))
+	require.True(t, isShimName("python3.11.2"))
+	require.False(t, isShimName("python3-config"))
+	require.False(t, isShimName("python4"))
+}
+
+// TestDiscoverVersionedPythons proves install-shims enumerates the uv
+// canonical store and the host PATH for python3.X aliases, deduping
+// across both surfaces.
+func TestDiscoverVersionedPythons(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// uv canonical store: python3.12 and python3.11
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	require.NoError(t, os.MkdirAll(uvBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(uvBin, "python3.12"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(uvBin, "python3"), []byte("#!/bin/sh\n"), 0o755))
+
+	uvBin11 := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.11.9-macos-aarch64-none", "bin")
+	require.NoError(t, os.MkdirAll(uvBin11, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(uvBin11, "python3.11"), []byte("#!/bin/sh\n"), 0o755))
+
+	// PATH: python3.10 lives somewhere else (a system / pyenv install
+	// the uv store doesn't know about).
+	pathDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(pathDir, "python3.10"), []byte("#!/bin/sh\n"), 0o755))
+	// PATH also has python3.12 — must dedupe against the uv entry.
+	require.NoError(t, os.WriteFile(filepath.Join(pathDir, "python3.12"), []byte("#!/bin/sh\n"), 0o755))
+	// Adjacent non-aliases that must NOT be picked up.
+	require.NoError(t, os.WriteFile(filepath.Join(pathDir, "python3-config"), []byte(""), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(pathDir, "python4"), []byte(""), 0o755))
+	t.Setenv("PATH", pathDir)
+
+	got := discoverVersionedPythons()
+	require.Equal(t, []string{"python3.10", "python3.11", "python3.12"}, got,
+		"versioned pythons must be deduped + sorted; non-aliases skipped")
+}
+
+// TestDiscoverVersionedPythonsEmpty proves discovery returns an empty
+// slice (not nil-deref) when neither the uv store nor PATH yield any
+// versioned aliases. install-shims falls back to the static list in
+// that case.
+func TestDiscoverVersionedPythonsEmpty(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	got := discoverVersionedPythons()
+	require.Empty(t, got)
+}
+
+// TestRunInstallShims_CreatesVersionedPythonShims drives the install
+// flow end-to-end with a faked uv store + tempdir shim dir, asserting
+// that every discovered python3.X gets a symlink to the veto binary.
+func TestRunInstallShims_CreatesVersionedPythonShims(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+
+	// Plant a fake veto binary so resolveVetoBinary's
+	// os.Executable() lookup resolves to a real path.
+	// The runtime test binary IS already a real exec; we just need
+	// the shim dir.
+	shimDir := filepath.Join(home, "shimout")
+
+	// Plant a python3.12 in the uv store.
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	require.NoError(t, os.MkdirAll(uvBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(uvBin, "python3.12"), []byte("#!/bin/sh\n"), 0o755))
+
+	logger := zerologNop()
+	rc := runInstallShims(logger, []string{"--dir", shimDir})
+	require.Equal(t, exitOK, rc, "install-shims should succeed")
+
+	// python3.12 shim must exist and be a symlink to the resolved veto
+	// binary (the test binary itself, via os.Executable()).
+	link := filepath.Join(shimDir, "python3.12")
+	info, err := os.Lstat(link)
+	require.NoError(t, err)
+	require.NotZero(t, info.Mode()&os.ModeSymlink, "expected symlink at python3.12 shim")
+	// Static-canonical PMs also got shimmed.
+	for _, name := range []string{"npm", "pip", "python", "python3"} {
+		_, err := os.Lstat(filepath.Join(shimDir, name))
+		require.NoError(t, err, "static-canonical %s should be shimmed", name)
+	}
+}
+
+// TestRunInstallShims_DryRunDoesNotMutate proves --dry-run lists what
+// would be done without touching the filesystem.
+func TestRunInstallShims_DryRunDoesNotMutate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	shimDir := filepath.Join(home, "shimout-dryrun")
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	require.NoError(t, os.MkdirAll(uvBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(uvBin, "python3.12"), []byte("#!/bin/sh\n"), 0o755))
+
+	rc := runInstallShims(zerologNop(), []string{"--dir", shimDir, "--dry-run"})
+	require.Equal(t, exitOK, rc)
+	// Shim dir must NOT exist after dry-run.
+	_, err := os.Lstat(shimDir)
+	require.True(t, os.IsNotExist(err), "dry-run must not create the shim dir")
 }

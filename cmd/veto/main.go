@@ -127,7 +127,7 @@ func main() {
 		// rewrite that lets the existing gate logic handle the PM lookup
 		// while still exec'ing python (not the PM directly) on the allow
 		// path.
-		if self == "python" || self == "python3" {
+		if isPythonBasename(self) {
 			if pm, ok := pythonDashMTarget(args); ok {
 				// `python -m pip install foo` → route through veto as if
 				// the user had typed `pip install foo`. We thread the
@@ -306,7 +306,7 @@ func run(args []string) int {
 
 // isShimName reports whether basename matches one of the package-manager
 // binaries veto shadows via PATH shims. Delegates to the canonical
-// pmlist.IsShimmed so this hot path and `veto install-shims` consume
+// pmlist.MatchesShim so this hot path and `veto install-shims` consume
 // one source of truth — see internal/packagemanager/pmlist for why.
 //
 // "python" and "python3" are in the canonical list because
@@ -316,8 +316,25 @@ func run(args []string) int {
 // hot-paths every non-`-m {pm}` python call straight to the real
 // interpreter so REPLs, `-V`, `-c`, scripts, and `-m http.server` etc.
 // stay fast and transparent.
+//
+// Versioned aliases ("python3.10", "python3.11.2", …) match through
+// pmlist.MatchesShim's regex too — install-shims creates per-version
+// symlinks for every uv-managed cpython on disk, and the dispatch
+// here recognises them so the same fast-path applies. Without this,
+// a venv that exec's python3.12 directly would dispatch as "unknown"
+// and route through the gate's `unknown package manager; passing
+// through` branch — slow and noisy.
 func isShimName(basename string) bool {
-	return pmlist.IsShimmed(basename)
+	return pmlist.MatchesShim(basename)
+}
+
+// isPythonBasename reports whether basename is one of the python
+// flavors veto fast-paths through the `-m <pm>` gate: the canonical
+// "python" / "python3" names OR a versioned `python3.X` alias.
+// Centralised so main()'s shim-dispatch + execReal lookup stay in
+// sync with the python-family classification in pmlist.
+func isPythonBasename(basename string) bool {
+	return basename == "python" || basename == "python3" || pmlist.IsVersionedPython(basename)
 }
 
 // runGate handles the `veto <pm> <args...>` path: parse the invocation,
@@ -1608,7 +1625,7 @@ Layer 1 — Claude Code hook (Bash tool interception):
                                decision to stdout if the command reaches a PM
 
 Layer 2 — PATH shims (any agent shell, Codex, CI):
-  veto install-shims [--dir DIR] [--force]
+  veto install-shims [--dir DIR] [--force] [--dry-run]
                                symlinks ~/.local/bin/{npm,pip,…} → veto
   veto uninstall-shims [--dir DIR]
                                remove veto-managed symlinks
