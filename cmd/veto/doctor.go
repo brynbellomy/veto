@@ -184,7 +184,14 @@ func checkShimDir() []checkResult {
 		})
 	}
 
-	for _, name := range shimmedManagers {
+	// Static-canonical shim names PLUS every `python3.X` shim already
+	// installed in the shim dir. The latter is what catches versioned
+	// aliases install-shims created on a previous run — we want
+	// doctor to confirm they STILL point at the current veto binary,
+	// not silently ignore them.
+	shimNames := append([]string{}, shimmedManagers...)
+	shimNames = append(shimNames, discoverInstalledPythonShims(shimDir)...)
+	for _, name := range shimNames {
 		shimPath := filepath.Join(shimDir, name)
 		info, err := os.Lstat(shimPath)
 		if err != nil {
