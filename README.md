@@ -36,6 +36,34 @@ Use `veto npm install <pkg>`, `veto pip install <pkg>`, `veto uv pip
 install <pkg>`, `veto go get <pkg>`, or `veto cargo add <crate>` to run
 one package-manager command through the gate explicitly.
 
+### Upgrading an existing install
+
+veto iterates quickly. When you pull a new version the layered
+install state on disk needs to be re-synced with the new binary —
+some shims/wrappers point at the old veto path, the C interposer
+header may have changed PMs, and new shim names may have been added
+(uv-managed python3.X aliases, for example). The canonical upgrade
+sequence:
+
+```sh
+cd path/to/veto
+git pull
+make install                       # rebuild + replace ~/.local/bin/veto
+veto install-shims --force         # re-point Layer 2 shims at the new binary,
+                                   # add any newly-discovered python3.X shims
+make interposer                    # regenerate pm_names.h, rebuild the dylib
+veto install-preload --lib $(pwd)/libveto_interpose.dylib  # macOS path; see
+                                                            # `install-preload --help`
+veto install-wrappers --force      # re-point Layer 4 wrappers; add new ones
+                                   # (uv canonical python3.X binaries, …)
+veto sync                          # refresh intel
+veto doctor                        # confirm green
+```
+
+`veto install-all --force` is the one-shot equivalent for the common
+case; the granular commands above let you skip layers that haven't
+changed.
+
 ## What it actually blocks
 
 Tested end-to-end on a macOS / mise / homebrew dev machine against the
@@ -51,9 +79,13 @@ veto npm ci  # against a lockfile naming a flagged package # transitive coverage
 veto npm install clean-direct # refused if npm resolves a flagged transitive
 
 # The canonical Python install form — caught via the python shim,
-# which fast-paths every non-`-m {pm}` invocation back to real python:
+# which fast-paths every non-`-m {pm}` invocation back to real python.
+# Every versioned `python3.X` alias on disk gets its own shim too
+# (install-shims enumerates uv's canonical cpython store) so a venv
+# that resolves python3.12 directly still routes through veto:
 python -m pip install chai-as-upgraded                        # refused
 python3 -m uv pip install chai-as-upgraded                    # refused
+python3.12 -m pip install chai-as-upgraded                    # refused (uv-venv path)
 
 # Fetch-and-run forms (npx-style):
 npm exec chai-as-upgraded                                     # refused
@@ -629,13 +661,25 @@ these):
   by dyld for `/usr/bin/*` and `/System/...`; the dir is also
   read-only so Layer 4 wrappers can't be installed there. Out of
   veto's reach by design — it's a command-layer scanner, not a
-  kernel-level interposer. Non-SIP python (mise, pyenv, homebrew) IS
-  covered via the Layer 2 python shim — only the system interpreter
-  at `/usr/bin/python3` is unreachable. `install-wrappers` emits a
-  clean `SKIP /usr/bin/<pm> — read-only filesystem (SIP-protected)`
-  line for these paths and exits 0 (a previous version reported them
-  as `FAIL`, aborting `install-all` even though no remediation
-  exists).
+  kernel-level interposer. Non-SIP python (mise, pyenv, homebrew,
+  uv-managed cpython) IS covered via the Layer 2 python shim and the
+  Layer 4 wrappers, including every versioned `python3.X` alias on
+  disk — only the system interpreter at `/usr/bin/python3` is
+  unreachable. `install-wrappers` emits a clean
+  `SKIP /usr/bin/<pm> — read-only filesystem (SIP-protected)` line
+  for these paths and exits 0 (a previous version reported them as
+  `FAIL`, aborting `install-all` even though no remediation exists).
+- **Per-python-invocation cost** (intentional). Layer 4 now wraps
+  every canonical `python` / `python3` / `python3.X` binary on disk
+  — including uv's `~/.local/share/uv/python/cpython-*/bin/*` store
+  — to close the uv-venv bypass (an `uv run python -c "..."`
+  resolves the venv python by absolute path; without wrapping the
+  canonical binary the call skipped Layer 2). Every python
+  invocation now exec's through veto, which dispatches the `-m {pm}`
+  fast-path and forwards everything else to the real interpreter
+  before touching the intel store. The overhead is small (one
+  binary load + a few syscalls) but real; the user explicitly
+  accepted it as the cost of closing the bypass.
 - **Linux `execl*` / `fexecve` / `execveat` coverage**: best-effort.
   The interposer exports LD_PRELOAD shadows for execl/execlp/execle/
   execvpe/fexecve/execveat, but glibc's internal `__execve` calls and
