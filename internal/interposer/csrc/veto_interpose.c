@@ -108,6 +108,13 @@
 // python-specific branch that only flags the `-m <pm>` form; bare
 // python invocations (scripts, REPLs, -V, -m http.server, …) pass
 // through untouched.
+//
+// Versioned python aliases ("python3.10", "python3.12.1") are NOT in
+// PM_NAMES — bake them in and the generated header would have to
+// regenerate every time a user installs a new uv-managed cpython.
+// Instead, is_risky() runs an inline regex check via
+// matches_python_versioned() so the dynamic surface stays in C, not
+// in the codegen. Same approach as pmlist.MatchesShim on the Go side.
 #include "pm_names.h"
 
 // Subset of PM_NAMES that, when invoked via `python -m <name>`, count
@@ -172,6 +179,51 @@ static int in_list(const char *s, const char *const *list) {
     if (!strcmp(s, *list)) return 1;
   }
   return 0;
+}
+
+// Forward declaration: is_python_basename's body sits further down so
+// classify_invocation can call it from a single place. is_risky also
+// dispatches on it for the versioned-alias branch.
+static int is_python_basename(const char *bn);
+
+// matches_python_versioned reports whether s is a strict `python3.X`
+// (or `python3.X.Y`) alias. Mirrors pmlist.IsVersionedPython on the
+// Go side; the two MUST agree on what they accept and reject because
+// install-shims, install-wrappers, the claudecode hook, and the
+// interposer all consume the same classification.
+//
+// Strict grammar (regex equivalent: ^python3\.\d+(\.\d+)?$):
+//   - exact prefix "python3."
+//   - one or more digits
+//   - optional ".<digits>" patch segment
+//   - end of string
+//
+// "python3" by itself is NOT accepted — that's a static-list entry
+// (PM_NAMES already has it). "python3-config", "python3.X-foo",
+// "python3.10.", "python3.10.2.4", "python4", "python2.7" all fail.
+//
+// Branch-free; no regex library; runs on the execve hot path.
+static int matches_python_versioned(const char *s) {
+  if (!s) return 0;
+  // Prefix "python3."
+  static const char prefix[] = "python3.";
+  size_t i = 0;
+  while (prefix[i]) {
+    if (s[i] != prefix[i]) return 0;
+    i++;
+  }
+  // At least one digit must follow.
+  if (s[i] < '0' || s[i] > '9') return 0;
+  while (s[i] >= '0' && s[i] <= '9') i++;
+  // End-of-string OK: this is "python3.<minor>".
+  if (s[i] == '\0') return 1;
+  // Optional patch segment ".<digits>".
+  if (s[i] != '.') return 0;
+  i++;
+  if (s[i] < '0' || s[i] > '9') return 0;
+  while (s[i] >= '0' && s[i] <= '9') i++;
+  // No trailing chars allowed.
+  return s[i] == '\0';
 }
 
 static int first_nonflag(char *const argv[], int start, const char *const *flags_with_values) {
@@ -255,12 +307,19 @@ static const char *is_risky(const char *path, char *const argv[]) {
   // Already through veto? Don't recurse.
   if (!strcmp(bn, "veto")) return NULL;
 
-  if (!in_list(bn, PM_NAMES)) return NULL;
+  // Static PM_NAMES OR a versioned python alias. Versioned aliases
+  // ("python3.12", "python3.11.2") are NOT in PM_NAMES because that
+  // would force the generated header to churn whenever a user
+  // installs a new uv-managed cpython. matches_python_versioned()
+  // recognises the dynamic surface inline instead.
+  if (!in_list(bn, PM_NAMES) && !matches_python_versioned(bn)) return NULL;
 
-  // python / python3: only the `python -m <pm>` form is gated. Every
-  // other invocation (scripts, REPL, -c, -V, -m http.server, …) is
-  // explicitly NOT risky and passes straight through.
-  if (!strcmp(bn, "python") || !strcmp(bn, "python3")) {
+  // python / python3 / python3.X: only the `python -m <pm>` form is
+  // gated. Every other invocation (scripts, REPL, -c, -V, -m
+  // http.server, …) is explicitly NOT risky and passes straight
+  // through. is_python_basename covers all three classes; the static
+  // names short-circuit the regex.
+  if (is_python_basename(bn)) {
     return python_m_target(argv); // PM name or NULL
   }
 
@@ -405,12 +464,24 @@ static void log_route(const char *pm, const char *path) {
   fprintf(stderr, "veto-interpose: routed %s (path=%s) through veto\n", pm, path);
 }
 
-// is_python_basename reports whether bn is "python" or "python3".
-// Centralised so the python-m detection in the exec wrappers stays in
-// sync with PM_NAMES / is_risky.
+// is_python_basename reports whether bn is one of the python
+// flavors the interposer treats as an interpreter for `-m <pm>`
+// dispatch: the canonical "python" / "python3" names AND every
+// versioned `python3.X` alias. Centralised so the python-m detection
+// in the exec wrappers stays in sync with PM_NAMES / is_risky AND
+// the dynamic versioned-python regex.
+//
+// Without the versioned check, a `python3.12 -m pip install foo`
+// invocation would still be classified risky by is_risky (which
+// also calls matches_python_versioned), but classify_invocation
+// would NOT prepend VETO_PYTHON_M_ORIGINAL=python3.12 to the env
+// because is_python_basename returned false — and the allow-path
+// exec would call bare `pip` instead of `python3.12 -m pip`,
+// silently breaking venv-scoped resolution.
 static int is_python_basename(const char *bn) {
   if (!bn) return 0;
-  return !strcmp(bn, "python") || !strcmp(bn, "python3");
+  if (!strcmp(bn, "python") || !strcmp(bn, "python3")) return 1;
+  return matches_python_versioned(bn);
 }
 
 // classify_invocation packages the per-call decisions in one struct:

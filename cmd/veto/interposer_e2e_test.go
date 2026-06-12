@@ -171,6 +171,114 @@ func TestInterposerEndToEnd_RewritesPythonDashMPipInstall(t *testing.T) {
 		"VETO_PYTHON_M_ORIGINAL must be propagated so the allow-path exec rebuilds the python -m form")
 }
 
+// TestInterposerEndToEnd_RewritesPythonVersionedDashMPipInstall is the
+// uv-venv-bypass regression: a venv that exec's `python3.12 -m pip
+// install foo` (the canonical uv install form inside a 3.12 venv)
+// must hit the interposer's versioned-python pattern and route
+// through veto. Without the matches_python_versioned() check in is_risky,
+// PM_NAMES alone would not classify `python3.12` as a covered PM and
+// the call would silently skip Layer 3.
+func TestInterposerEndToEnd_RewritesPythonVersionedDashMPipInstall(t *testing.T) {
+	libPath := interposerLibPath(t)
+	if libPath == "" {
+		t.Skip("interposer artifact not built; run `make interposer` to enable this test")
+	}
+
+	dir := t.TempDir()
+	argLog := filepath.Join(dir, "argv.log")
+	envLog := filepath.Join(dir, "env.log")
+
+	fakeVeto := filepath.Join(dir, "veto")
+	vetoScript := "#!/bin/sh\n" +
+		"for a in \"$@\"; do printf '%s\\n' \"$a\"; done > " + argLog + "\n" +
+		"printf '%s\\n' \"${VETO_PYTHON_M_ORIGINAL:-<unset>}\" > " + envLog + "\n" +
+		"exit 0\n"
+	require.NoError(t, os.WriteFile(fakeVeto, []byte(vetoScript), 0o755))
+
+	// Fake python3.12 — the versioned alias an uv venv would exec.
+	fakePython := filepath.Join(dir, "python3.12")
+	require.NoError(t, os.WriteFile(fakePython, []byte("#!/bin/sh\nexit 77\n"), 0o755))
+
+	spawnerSrc := filepath.Join("testdata", "interpose_spawner", "main.go")
+	spawnerBin := filepath.Join(dir, "spawner")
+	require.NoError(t, exec.Command("go", "build", "-o", spawnerBin, spawnerSrc).Run())
+
+	cmd := exec.Command(spawnerBin, fakePython, "-m", "pip", "install", "foo")
+	cmd.Env = withPreloadEnv(libPath, fakeVeto)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	require.NoError(t, cmd.Run(), "spawner exit error; stderr=%s", stderr.String())
+
+	data, err := os.ReadFile(argLog)
+	require.NoError(t, err, "fakeVeto did not write argv.log — interposer missed python3.12 -m pip install")
+	require.Equal(t, []string{"pip", "install", "foo"}, splitLines(string(data)))
+
+	envData, err := os.ReadFile(envLog)
+	require.NoError(t, err)
+	require.Equal(t, "python3.12", strings.TrimSpace(string(envData)),
+		"VETO_PYTHON_M_ORIGINAL must carry the versioned basename so the allow-path exec rebuilds python3.12 -m pip")
+}
+
+// TestInterposerEndToEnd_PassesThroughPythonVersionedScript ensures
+// the matches_python_versioned() check doesn't accidentally rewrite
+// bare `python3.12 script.py` — the fast-path guarantee from the
+// canonical python branch must extend to every versioned alias.
+func TestInterposerEndToEnd_PassesThroughPythonVersionedScript(t *testing.T) {
+	libPath := interposerLibPath(t)
+	if libPath == "" {
+		t.Skip("interposer artifact not built; run `make interposer`")
+	}
+
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	fakePython := filepath.Join(dir, "python3.12")
+	require.NoError(t, os.WriteFile(fakePython, []byte("#!/bin/sh\ntouch "+marker+"\nexit 0\n"), 0o755))
+
+	fakeVeto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(fakeVeto, []byte("#!/bin/sh\nexit 99\n"), 0o755))
+
+	spawnerSrc := filepath.Join("testdata", "interpose_spawner", "main.go")
+	spawnerBin := filepath.Join(dir, "spawner")
+	require.NoError(t, exec.Command("go", "build", "-o", spawnerBin, spawnerSrc).Run())
+
+	cmd := exec.Command(spawnerBin, fakePython, "script.py")
+	cmd.Env = withPreloadEnv(libPath, fakeVeto)
+	require.NoError(t, cmd.Run())
+	_, err := os.Stat(marker)
+	require.NoError(t, err,
+		"fake python3.12 did not run — `python3.12 script.py` was incorrectly rewritten")
+}
+
+// TestInterposerEndToEnd_PassesThroughPython3Config proves the
+// versioned-python regex is strict enough to reject adjacent shapes
+// like python3-config. Without strict bounds, a benign developer tool
+// could get rewritten and break configure / pkg-config flows.
+func TestInterposerEndToEnd_PassesThroughPython3Config(t *testing.T) {
+	libPath := interposerLibPath(t)
+	if libPath == "" {
+		t.Skip("interposer artifact not built; run `make interposer`")
+	}
+
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	target := filepath.Join(dir, "python3-config")
+	require.NoError(t, os.WriteFile(target, []byte("#!/bin/sh\ntouch "+marker+"\nexit 0\n"), 0o755))
+
+	fakeVeto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(fakeVeto, []byte("#!/bin/sh\nexit 99\n"), 0o755))
+
+	spawnerSrc := filepath.Join("testdata", "interpose_spawner", "main.go")
+	spawnerBin := filepath.Join(dir, "spawner")
+	require.NoError(t, exec.Command("go", "build", "-o", spawnerBin, spawnerSrc).Run())
+
+	cmd := exec.Command(spawnerBin, target, "--cflags")
+	cmd.Env = withPreloadEnv(libPath, fakeVeto)
+	require.NoError(t, cmd.Run())
+	_, err := os.Stat(marker)
+	require.NoError(t, err,
+		"python3-config was incorrectly rewritten by the interposer — versioned-python regex is too loose")
+}
+
 // TestInterposerEndToEnd_PassesThroughPythonScript covers the
 // fast-path: a plain `python script.py` invocation MUST exec the real
 // interpreter, not get rewritten. Without this guarantee veto would
