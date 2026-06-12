@@ -770,9 +770,9 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		// Without --force, leave foreign wrappers in place — overwriting
 		// them silently could break whatever installed them. The skip
 		// emits a visible line with the target so the user can decide.
-		// With --force, fall through to the regular wrap path; the
-		// existing rename dance moves the foreign symlink to
-		// .veto-original.
+		// With --force, the safe-relink guard below handles migration
+		// without renaming a symlink onto an existing .veto-original
+		// (which would destroy the preserved real-binary trail).
 		if !force {
 			return wrapperActionSkipForeignWrapper, nil
 		}
@@ -780,51 +780,75 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 
 	original := c.path + wrapperSuffix
 
-	// Already wrapped? `c.path` is a symlink that resolves to the SAME
-	// physical file as vetoPath AND `<c.path>.veto-original` exists.
-	// Strict physical-path identity (not name substring) — see
-	// pointsAtVeto for rationale.
+	// Safe-relink guard: when c.path is ALREADY a symlink AND a
+	// `.veto-original` already exists alongside it, the rename-based
+	// wrap path below would replace `.veto-original` (which holds the
+	// preserved real-binary trail) with a symlink — destroying the
+	// only on-disk reference to the real PM binary.
 	//
-	// With --force the user is asking us to re-link even when nothing
-	// is broken: useful after moving the veto binary, or to recover
-	// confidence that nothing has rewritten the symlink. We delete the
-	// symlink and recreate it pointing at the current vetoPath.
+	// This covers two situations that the prior code conflated:
+	//
+	//  (a) Already ours: c.path → THIS veto. With --force, we just
+	//      re-point the symlink at the (possibly relocated) veto
+	//      binary, leaving `.veto-original` untouched.
+	//
+	//  (b) Foreign-veto wrap: c.path → a DIFFERENT veto binary (e.g.
+	//      the user wrapped earlier with /tmp/veto-old, then re-ran
+	//      install-wrappers --force with ~/.local/bin/veto). The
+	//      `.veto-original` still holds the real PM. The OLD code path
+	//      called `os.Rename(c.path, .veto-original)` here, atomically
+	//      overwriting the real binary with a stale symlink and
+	//      sending later execs into a tight veto→veto exec loop.
+	//
+	// Both (a) and (b) want exactly the same on-disk transition:
+	// drop the old symlink, install a new one pointing at the current
+	// vetoPath, leave `.veto-original` alone.
+	//
+	// Without --force, the existing state stays in place: ours →
+	// SkipAlreadyOurs, foreign → SkipForeignWrapper. (The foreign case
+	// is also intercepted up at the class switch when --force is
+	// unset; the branch here is only reachable for non-Foreign symlink
+	// states that aren't classified at discovery time, but the same
+	// no-touch policy applies.)
 	if existing, err := os.Lstat(c.path); err == nil && existing.Mode()&os.ModeSymlink != 0 {
-		if pointsAtVeto(c.path, vetoPath) {
-			if _, err := os.Lstat(original); err == nil {
-				if !force {
+		if _, err := os.Lstat(original); err == nil {
+			if !force {
+				if pointsAtVeto(c.path, vetoPath) {
 					return wrapperActionSkipAlreadyOurs, nil
 				}
-				if dryRun {
-					return wrapperActionSkipDryRun, nil
-				}
-				if err := os.Remove(c.path); err != nil {
-					if isReadOnlyFS(err) {
-						return wrapperActionSkipReadOnlyFS, nil
-					}
-					if os.IsPermission(err) {
-						return wrapperActionSkipUnwritable, nil
-					}
-					return wrapperActionWrapped, errors.With(err, "remove existing veto symlink for --force relink").Set("path", c.path)
-				}
-				if err := os.Symlink(vetoPath, c.path); err != nil {
-					if isReadOnlyFS(err) {
-						return wrapperActionSkipReadOnlyFS, nil
-					}
-					if os.IsPermission(err) {
-						return wrapperActionSkipUnwritable, nil
-					}
-					return wrapperActionWrapped, errors.With(err, "recreate veto symlink").Set("path", c.path)
-				}
-				return wrapperActionWrapped, nil
+				return wrapperActionSkipForeignWrapper, nil
 			}
+			if dryRun {
+				return wrapperActionSkipDryRun, nil
+			}
+			if err := os.Remove(c.path); err != nil {
+				if isReadOnlyFS(err) {
+					return wrapperActionSkipReadOnlyFS, nil
+				}
+				if os.IsPermission(err) {
+					return wrapperActionSkipUnwritable, nil
+				}
+				return wrapperActionWrapped, errors.With(err, "remove existing symlink for safe relink").Set("path", c.path)
+			}
+			if err := os.Symlink(vetoPath, c.path); err != nil {
+				if isReadOnlyFS(err) {
+					return wrapperActionSkipReadOnlyFS, nil
+				}
+				if os.IsPermission(err) {
+					return wrapperActionSkipUnwritable, nil
+				}
+				return wrapperActionWrapped, errors.With(err, "recreate veto symlink").Set("path", c.path)
+			}
+			return wrapperActionWrapped, nil
 		}
 	}
 
 	// Refuse to clobber if `.veto-original` already exists and we
 	// didn't ask for --force. This protects against the partial-state
 	// case where a previous wrap moved the original but failed to
-	// install the symlink.
+	// install the symlink. (Symlink + existing `.veto-original` is
+	// handled by the safe-relink guard above; this branch only fires
+	// when c.path is a regular file.)
 	if _, err := os.Lstat(original); err == nil && !force {
 		return wrapperActionWrapped, errors.WithNew(".veto-original already exists; pass --force to overwrite").
 			Set("path", original)

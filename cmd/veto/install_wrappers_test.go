@@ -146,6 +146,84 @@ func TestApplyWrapper_ForceRelinksAlreadyOurs(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestApplyWrapper_ForceMigrationFromForeignVeto_PreservesRealBinary is the
+// regression guard for the veto→veto exec loop bug: running install-wrappers
+// --force a second time with a DIFFERENT veto binary used to call
+// os.Rename(c.path, c.path+".veto-original"), which atomically replaced the
+// preserved real-binary trail with a stale symlink. After enough --force
+// runs, every wrapped PM became a chain of veto binaries with no escape,
+// producing an infinite exec loop on the next invocation. The safe-relink
+// guard added to applyWrapper now refuses to rename a symlink onto a
+// populated .veto-original; this test pins that contract.
+func TestApplyWrapper_ForceMigrationFromForeignVeto_PreservesRealBinary(t *testing.T) {
+	dir := t.TempDir()
+	vetoA := filepath.Join(dir, "vetoA")
+	require.NoError(t, os.WriteFile(vetoA, []byte("#!/bin/sh\n# vetoA\n"), 0o755))
+	vetoB := filepath.Join(dir, "vetoB")
+	require.NoError(t, os.WriteFile(vetoB, []byte("#!/bin/sh\n# vetoB\n"), 0o755))
+
+	// Set up as if a prior install-wrappers run (with vetoA) had wrapped npm:
+	//   npm                 -> vetoA           (the previous veto symlink)
+	//   npm.veto-original   = real binary file (the preserved real PM)
+	npm := filepath.Join(dir, "npm")
+	realContent := []byte("#!/bin/sh\nexec real-npm\n")
+	require.NoError(t, os.WriteFile(npm+wrapperSuffix, realContent, 0o755))
+	require.NoError(t, os.Symlink(vetoA, npm))
+
+	// Now wrap again with vetoB --force. The OLD code would rename the
+	// vetoA-pointing symlink onto npm.veto-original, destroying the real
+	// binary and replacing it with a symlink to vetoA. After this transition
+	// the symlink chain at npm would point at vetoB and the real binary
+	// would be unrecoverable.
+	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
+	action, err := applyWrapper(c, vetoB, false, true)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionWrapped, action)
+
+	// npm now points at vetoB (the new install target).
+	target, err := os.Readlink(npm)
+	require.NoError(t, err)
+	require.Equal(t, vetoB, target)
+
+	// npm.veto-original is STILL a regular file holding the real binary.
+	// Not a symlink to vetoA — that would mean the rename happened.
+	info, err := os.Lstat(npm + wrapperSuffix)
+	require.NoError(t, err)
+	require.Zero(t, info.Mode()&os.ModeSymlink, "veto-original must still be a regular file, not a symlink (rename would have replaced it)")
+	body, err := os.ReadFile(npm + wrapperSuffix)
+	require.NoError(t, err)
+	require.Equal(t, realContent, body, "the real PM binary content must be preserved across the --force migration")
+}
+
+// TestApplyWrapper_NoForceOnForeignVeto_SkipsAndDoesNotMutate guards the
+// inverse: without --force, a symlink-to-a-foreign-veto state must produce
+// a Skip and leave both c.path and .veto-original byte-identical.
+func TestApplyWrapper_NoForceOnForeignVeto_SkipsAndDoesNotMutate(t *testing.T) {
+	dir := t.TempDir()
+	vetoA := filepath.Join(dir, "vetoA")
+	require.NoError(t, os.WriteFile(vetoA, []byte("#!/bin/sh\n"), 0o755))
+	vetoB := filepath.Join(dir, "vetoB")
+	require.NoError(t, os.WriteFile(vetoB, []byte("#!/bin/sh\n"), 0o755))
+
+	npm := filepath.Join(dir, "npm")
+	realContent := []byte("#!/bin/sh\nexec real-npm\n")
+	require.NoError(t, os.WriteFile(npm+wrapperSuffix, realContent, 0o755))
+	require.NoError(t, os.Symlink(vetoA, npm))
+
+	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
+	action, err := applyWrapper(c, vetoB, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionSkipForeignWrapper, action)
+
+	// Both files exactly as they were.
+	target, err := os.Readlink(npm)
+	require.NoError(t, err)
+	require.Equal(t, vetoA, target)
+	body, err := os.ReadFile(npm + wrapperSuffix)
+	require.NoError(t, err)
+	require.Equal(t, realContent, body)
+}
+
 // TestApplyWrapper_ForceRelinksAlreadyOurs_DryRun: --force --dry-run on
 // an already-ours path should report a would-wrap, not silently succeed
 // and not actually touch the filesystem.
