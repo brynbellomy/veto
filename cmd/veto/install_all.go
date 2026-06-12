@@ -172,9 +172,13 @@ func wrapperStepArgs(opts installAllOpts) []string {
 //   - stats.failed == 0 && stats.skippedUnwritable > 0:
 //   - euid != 0 → needs-root (20). User can retry under sudo.
 //   - euid == 0 → wrappers fail (30). We ARE root and still can't
-//     write; the dir is read-only at the OS level
-//     (SIP-protected, immutable flag, etc.) so
-//     elevation will not help.
+//     write; the dir is root-owned but writable to root.
+//   - stats.skippedReadOnlyFS > 0 (no failures, no unwritable skips) →
+//     success (0). The candidate lives on a read-only filesystem
+//     (typically /usr/bin on macOS under SIP). Sudo would not help —
+//     SIP blocks writes regardless of euid. Layer 2 shims still cover
+//     the bare-name call path, so there's nothing to retry and no
+//     reason to abort install-all.
 //   - rc != 0 (no skipped, no failed) → wrappers fail (30). Defensive:
 //     install-wrappers should only return non-zero when stats.failed > 0,
 //     but if a future change adds another non-zero path we surface it
