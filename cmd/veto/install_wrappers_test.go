@@ -343,10 +343,13 @@ func TestDiscoverWrapCandidates_IncludesPyenvAndNvmInstalls(t *testing.T) {
 }
 
 // TestDiscoverWrapCandidates_IncludesUVCanonicalPython proves the
-// install-wrappers discovery path enumerates uv-managed cpython
-// binaries — the closing-the-uv-venv-bypass surface. Both the
-// canonical `python3` name AND a versioned `python3.12` alias must
-// surface as candidates so the rename-and-symlink dance reaches them.
+// install-wrappers discovery path enumerates the canonical versioned
+// python3.X binary from a uv-managed cpython store — the
+// closing-the-uv-venv-bypass surface. Only the canonical `python3.X`
+// regular file is a wrap candidate; the `python` / `python3` aliases
+// that live next to it are symlinks back to python3.X and inherit the
+// wrap via the existing chain. Wrapping the aliases independently
+// would corrupt the exec chain (see TestPathsForUVStoreFiltersAliasSymlinks).
 func TestDiscoverWrapCandidates_IncludesUVCanonicalPython(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -360,10 +363,11 @@ func TestDiscoverWrapCandidates_IncludesUVCanonicalPython(t *testing.T) {
 		"cpython-3.12.4-macos-aarch64-none", "bin")
 	uvPy3 := filepath.Join(uvBin, "python3")
 	uvPy312 := filepath.Join(uvBin, "python3.12")
-	for _, p := range []string{uvPy3, uvPy312} {
-		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
-		require.NoError(t, os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755))
-	}
+	// Real uv layout: python3.12 is the canonical regular file; python3
+	// is a symlink to it.
+	require.NoError(t, os.MkdirAll(uvBin, 0o755))
+	require.NoError(t, os.WriteFile(uvPy312, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	require.NoError(t, os.Symlink("python3.12", uvPy3))
 
 	candidates, err := discoverWrapCandidates(
 		wrapperFlags{only: map[string]struct{}{"python3": {}, "python3.12": {}}},
@@ -375,12 +379,11 @@ func TestDiscoverWrapCandidates_IncludesUVCanonicalPython(t *testing.T) {
 	for _, c := range candidates {
 		byPath[c.path] = c
 	}
-	require.Contains(t, byPath, uvPy3,
-		"uv canonical python3 must be surfaced for wrapping")
 	require.Contains(t, byPath, uvPy312,
 		"uv canonical python3.12 must be surfaced for wrapping")
-	require.Equal(t, "python3", byPath[uvPy3].pm)
 	require.Equal(t, "python3.12", byPath[uvPy312].pm)
+	require.NotContains(t, byPath, uvPy3,
+		"uv-store python3 alias symlink must NOT surface — inherits wrap via python3 → python3.12 → veto chain")
 }
 
 // TestRunInstallWrappers_WrapsUVCanonicalPython drives install-wrappers

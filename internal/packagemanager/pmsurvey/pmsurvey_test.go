@@ -141,9 +141,10 @@ func macOSOnly(t *testing.T) {
 }
 
 // TestPathsForIncludesUVCanonicalPython proves PathsFor walks the
-// uv-managed cpython store and surfaces python3.X binaries living
-// there, NOT on $PATH. Closes the uv-venv bypass at the source: a
-// venv that symlinks the canonical binary now resolves through veto.
+// uv-managed cpython store and surfaces the canonical python3.X
+// regular file living there, NOT on $PATH. Closes the uv-venv bypass
+// at the source: a venv that symlinks the canonical binary now
+// resolves through veto.
 func TestPathsForIncludesUVCanonicalPython(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -152,51 +153,31 @@ func TestPathsForIncludesUVCanonicalPython(t *testing.T) {
 	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
 		"cpython-3.12.4-macos-aarch64-none", "bin")
 	writeExec(t, filepath.Join(uvBin, "python3.12"))
-	writeExec(t, filepath.Join(uvBin, "python3"))
 
 	got312 := pmsurvey.PathsFor("python3.12")
 	require.Contains(t, got312, filepath.Join(uvBin, "python3.12"),
-		"uv canonical python3.X must be surfaced for the python family")
-
-	got3 := pmsurvey.PathsFor("python3")
-	require.Contains(t, got3, filepath.Join(uvBin, "python3"))
+		"uv canonical python3.X must be surfaced as a wrap candidate")
 }
 
 // TestPathsForSkipsUVStoreForNonPython confirms the uv-store walk is
-// gated on python-family names. A `PathsFor("npm")` must NOT poke the
-// uv store on every call — it's a cold path that doesn't earn its
-// keep for non-python requests.
+// gated on the versioned-python shape. A `PathsFor("npm")` must NOT
+// poke the uv store on every call — it's a cold path that doesn't
+// earn its keep for non-python requests.
 func TestPathsForSkipsUVStoreForNonPython(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("PATH", "")
 
 	// Plant an npm file inside the uv store path so any walker would
-	// find it. PathsFor must NOT surface it because the name isn't
-	// python-family.
+	// find it. PathsFor must NOT surface it because the name isn't a
+	// versioned-python alias.
 	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
 		"cpython-3.12.4-macos-aarch64-none", "bin")
 	writeExec(t, filepath.Join(uvBin, "npm"))
 
 	got := pmsurvey.PathsFor("npm")
 	require.NotContains(t, got, filepath.Join(uvBin, "npm"),
-		"uv-store dirs must only contribute candidates for the python family")
-}
-
-// TestPathsForIncludesUVCanonicalBareName covers the case where the
-// uv store has `python` / `python3` (no versioned alias) symlinks.
-// PathsFor must surface those too — venvs sometimes link the bare
-// names back through the store.
-func TestPathsForIncludesUVCanonicalBareName(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("PATH", "")
-	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
-		"cpython-3.11.9-macos-aarch64-none", "bin")
-	writeExec(t, filepath.Join(uvBin, "python"))
-
-	got := pmsurvey.PathsFor("python")
-	require.Contains(t, got, filepath.Join(uvBin, "python"))
+		"uv-store dirs must only contribute candidates for versioned python aliases")
 }
 
 // TestPathsForUVStoreFiltersNonCPythonDirs proves only `cpython-*`
