@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -768,6 +770,20 @@ func TestApplyWrapper_ReadOnlyDir_SkipsUnwritable(t *testing.T) {
 	require.Zero(t, info.Mode()&os.ModeSymlink)
 	_, err = os.Lstat(pip3 + wrapperSuffix)
 	require.True(t, os.IsNotExist(err), "no .veto-original should be left behind")
+}
+
+// TestIsReadOnlyFS confirms EROFS is unwrapped through fs.PathError (the
+// wrapper os.Rename returns) and through bare syscall errnos, and that
+// EACCES / EPERM do NOT match — those route to skippedUnwritable, not
+// skippedReadOnlyFS. Regression guard for the macOS SIP path where
+// /usr/bin/pip3 surfaced as a hard FAIL.
+func TestIsReadOnlyFS(t *testing.T) {
+	require.True(t, isReadOnlyFS(syscall.EROFS))
+	require.True(t, isReadOnlyFS(&fs.PathError{Op: "rename", Path: "/usr/bin/pip3", Err: syscall.EROFS}))
+	require.False(t, isReadOnlyFS(syscall.EACCES))
+	require.False(t, isReadOnlyFS(syscall.EPERM))
+	require.False(t, isReadOnlyFS(nil))
+	require.False(t, isReadOnlyFS(&fs.PathError{Op: "rename", Path: "/tmp/foo", Err: syscall.EACCES}))
 }
 
 // TestUnwritableRemediationCommands_GroupsByDir verifies the sudo hint:

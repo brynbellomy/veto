@@ -90,9 +90,9 @@ remediation without parsing human-readable output:
 
 | Exit | Meaning |
 |---|---|
-| `0` | every requested step succeeded |
+| `0` | every requested step succeeded. Candidates on a read-only filesystem (typically SIP-protected paths like `/usr/bin/pip3` on macOS) are reported as `SKIP read-only filesystem (SIP-protected)` and do not affect the exit code — sudo can't bypass SIP, so there's nothing to retry. |
 | `10` | a user-scoped layer failed (shims/shell/hook/preload/intel/doctor) |
-| `20` | the wrappers step skipped one or more candidate dirs because the current (non-root) user can't write to them — retry under sudo |
+| `20` | the wrappers step skipped one or more candidate dirs because the current (non-root) user can't write to them — retry under sudo. Distinct from the SIP case above, where elevation does not help. |
 | `30` | the wrappers step had write access (or we are already root) and still hit a real failure |
 
 If you want to install the layers one at a time, the equivalent commands are
@@ -631,7 +631,11 @@ these):
   veto's reach by design — it's a command-layer scanner, not a
   kernel-level interposer. Non-SIP python (mise, pyenv, homebrew) IS
   covered via the Layer 2 python shim — only the system interpreter
-  at `/usr/bin/python3` is unreachable.
+  at `/usr/bin/python3` is unreachable. `install-wrappers` emits a
+  clean `SKIP /usr/bin/<pm> — read-only filesystem (SIP-protected)`
+  line for these paths and exits 0 (a previous version reported them
+  as `FAIL`, aborting `install-all` even though no remediation
+  exists).
 - **Linux `execl*` / `fexecve` / `execveat` coverage**: best-effort.
   The interposer exports LD_PRELOAD shadows for execl/execlp/execle/
   execvpe/fexecve/execveat, but glibc's internal `__execve` calls and

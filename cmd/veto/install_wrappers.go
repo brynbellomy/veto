@@ -34,10 +34,12 @@ package main
 
 import (
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/brynbellomy/go-utils/errors"
 	"github.com/rs/zerolog"
@@ -45,6 +47,21 @@ import (
 	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
 	"github.com/brynbellomy/veto/internal/packagemanager/pmsurvey"
 )
+
+// isReadOnlyFS reports whether err originates from a write to a
+// read-only filesystem. On macOS this covers SIP-protected paths like
+// /usr/bin/pip3 — rename(2) returns EROFS, not EPERM, even when the
+// caller is root. We treat these as a distinct skip category from
+// unwritable-by-user so the user doesn't get a misleading "retry with
+// sudo" hint (sudo can't bypass SIP).
+//
+// stderrors.Is is used directly rather than the project's errors helper
+// because syscall.EROFS satisfies the stdlib unwrapping contract and we
+// need to peek through fs.PathError (os.Rename's wrapper) to the raw
+// errno.
+func isReadOnlyFS(err error) bool {
+	return stderrors.Is(err, syscall.EROFS)
+}
 
 // wrapperSuffix is the rename target. `.veto-original` is verbose on
 // purpose — a colleague who finds it during debugging needs to see
@@ -248,6 +265,19 @@ func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags
 						Msg("WAL rollback save failed; re-run install-wrappers to reconcile")
 				}
 			}
+		case action == wrapperActionSkipReadOnlyFS:
+			stats.skippedReadOnlyFS++
+			// Deliberately NOT appended to `skipped` — that list drives the
+			// sudo remediation hint, and sudo cannot bypass SIP. The honest
+			// message is "this can't be wrapped, full stop."
+			fmt.Fprintf(os.Stderr, "  %-10s  SKIP  %s — read-only filesystem (SIP-protected); cannot be wrapped (Layer 2 shims still cover bare-name calls)\n", c.pm, c.path)
+			if !alreadyHad && !opts.dryRun {
+				state.remove(c.path)
+				if rbErr := saveWrapperState(cfg, state); rbErr != nil {
+					logger.Warn().Err(rbErr).Str("path", c.path).
+						Msg("WAL rollback save failed; re-run install-wrappers to reconcile")
+				}
+			}
 		case action == wrapperActionSkipBrokenSymlink:
 			stats.skippedBroken++
 			fmt.Fprintf(os.Stderr, "  %-10s  SKIP  %s — broken symlink to %s (likely a previous wrapper tool's leftover; restore `<path>.veto-original` if present, then re-run)\n",
@@ -307,9 +337,9 @@ func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags
 		}
 	}
 
-	fmt.Printf("\nSummary: %d wrapped, %d reconciled, %d already-ours, %d would-wrap, %d skipped (needs sudo), %d skipped (broken symlink), %d skipped (foreign wrapper), %d failed\n",
+	fmt.Printf("\nSummary: %d wrapped, %d reconciled, %d already-ours, %d would-wrap, %d skipped (needs sudo), %d skipped (read-only FS / SIP), %d skipped (broken symlink), %d skipped (foreign wrapper), %d failed\n",
 		stats.wrapped, stats.reconciled, stats.alreadyOurs, stats.wouldWrap, stats.skippedUnwritable,
-		stats.skippedBroken, stats.skippedForeign, stats.failed)
+		stats.skippedReadOnlyFS, stats.skippedBroken, stats.skippedForeign, stats.failed)
 	printUnwritableRemediation(skipped)
 	if stats.failed > 0 {
 		return exitInternal, stats
@@ -445,6 +475,12 @@ type wrapperStats struct {
 	alreadyOurs       int
 	wouldWrap         int
 	skippedUnwritable int
+	// skippedReadOnlyFS counts candidates that live on a read-only
+	// filesystem (EROFS) — typically SIP-protected paths under /usr/bin
+	// on macOS. Distinct from skippedUnwritable because no amount of
+	// elevation can wrap them; the user can't fix it and install-all
+	// must not abort over it.
+	skippedReadOnlyFS int
 	skippedBroken     int
 	skippedForeign    int
 	failed            int
@@ -461,6 +497,12 @@ const (
 	// the user can finish under sudo. Reported as a skip with a
 	// copy-pasteable remediation command rather than aborting install-all.
 	wrapperActionSkipUnwritable
+	// wrapperActionSkipReadOnlyFS: the candidate lives on a read-only
+	// filesystem (EROFS) — typically a SIP-protected path under /usr/bin
+	// on macOS. Sudo would NOT help: SIP blocks writes regardless of
+	// euid. Reported as a SKIP with a honest message (no sudo hint) so
+	// install-all keeps going.
+	wrapperActionSkipReadOnlyFS
 	// wrapperActionSkipBrokenSymlink: discovery found a symlink whose
 	// target does not exist (typically a leftover from a previous
 	// wrapper tool whose binary was uninstalled). install-wrappers
@@ -757,12 +799,18 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 					return wrapperActionSkipDryRun, nil
 				}
 				if err := os.Remove(c.path); err != nil {
+					if isReadOnlyFS(err) {
+						return wrapperActionSkipReadOnlyFS, nil
+					}
 					if os.IsPermission(err) {
 						return wrapperActionSkipUnwritable, nil
 					}
 					return wrapperActionWrapped, errors.With(err, "remove existing veto symlink for --force relink").Set("path", c.path)
 				}
 				if err := os.Symlink(vetoPath, c.path); err != nil {
+					if isReadOnlyFS(err) {
+						return wrapperActionSkipReadOnlyFS, nil
+					}
 					if os.IsPermission(err) {
 						return wrapperActionSkipUnwritable, nil
 					}
@@ -786,12 +834,17 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		return wrapperActionSkipDryRun, nil
 	}
 
-	// 1) Move the real binary aside. A permission error here means the
-	// candidate dir is read-only to this user — classify it as a skip
-	// (not a failure) so the caller can emit a sudo remediation and
-	// install-all keeps going. Check the raw os error: os.IsPermission
-	// does not see through the errors.With wrapper.
+	// 1) Move the real binary aside. EROFS (read-only filesystem,
+	// typically SIP-protected dirs like /usr/bin on macOS) and permission
+	// errors are both environmental — classify them as skips (not
+	// failures) so install-all keeps going. The two cases route to
+	// different actions because sudo helps with one (permission) but not
+	// the other (SIP). Check raw os errors: os.IsPermission and
+	// stderrors.Is do not see through errors.With wrappers.
 	if err := os.Rename(c.path, original); err != nil {
+		if isReadOnlyFS(err) {
+			return wrapperActionSkipReadOnlyFS, nil
+		}
 		if os.IsPermission(err) {
 			return wrapperActionSkipUnwritable, nil
 		}
@@ -802,6 +855,9 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		// Best-effort rollback so we don't strand the user with a
 		// PM that's invisible.
 		_ = os.Rename(original, c.path)
+		if isReadOnlyFS(err) {
+			return wrapperActionSkipReadOnlyFS, nil
+		}
 		if os.IsPermission(err) {
 			return wrapperActionSkipUnwritable, nil
 		}

@@ -158,6 +158,32 @@ func TestExitCodeClassifier(t *testing.T) {
 			euid: 501,
 			want: exitInstallAllWrappersFail,
 		},
+		{
+			// SIP-protected /usr/bin/pip3 surfaces as skippedReadOnlyFS.
+			// Sudo cannot help, so the result must be success regardless
+			// of euid — install-all must NOT abort over it.
+			name: "read-only FS (SIP) skip is success for non-root",
+			rc:   exitOK,
+			st:   wrapperStats{wrapped: 3, skippedReadOnlyFS: 1},
+			euid: 501,
+			want: exitOK,
+		},
+		{
+			name: "read-only FS (SIP) skip is success for root too",
+			rc:   exitOK,
+			st:   wrapperStats{skippedReadOnlyFS: 2},
+			euid: 0,
+			want: exitOK,
+		},
+		{
+			// Mixed case: unwritable still dominates. If there are paths
+			// the user could fix under sudo, we still need to tell them.
+			name: "unwritable dominates read-only FS (non-root)",
+			rc:   exitOK,
+			st:   wrapperStats{skippedUnwritable: 1, skippedReadOnlyFS: 1},
+			euid: 501,
+			want: exitInstallAllNeedsRoot,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
