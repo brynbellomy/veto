@@ -579,6 +579,14 @@ func discoverWrapCandidates(opts wrapperFlags, vetoPath string) ([]wrapCandidate
 // (well-known roots plus $PATH minus shim dirs) and pmsurvey.ClassifySymlink
 // to pre-classify each candidate so applyWrapper can dispatch on
 // broken / foreign / ours without re-walking the disk.
+//
+// The PM name list is the static wrappedManagers slice PLUS every
+// `python3.X` alias currently on disk. The dynamic enumeration is
+// what closes the uv-venv bypass: a venv that resolves the canonical
+// uv cpython python3.X by absolute path must hit a veto wrapper at
+// the canonical store path. Without the dynamic list the wrap step
+// would only cover the static `python` / `python3` names and miss
+// the actual venv-target binary.
 func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([]wrapCandidate, error) {
 	candidates := []wrapCandidate{}
 	pmFilter := func(name string) bool {
@@ -598,7 +606,10 @@ func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([
 		candidates = append(candidates, c)
 	}
 
-	for _, pm := range wrappedManagers {
+	pmNames := append([]string{}, wrappedManagers...)
+	pmNames = append(pmNames, discoverVersionedPythons()...)
+
+	for _, pm := range pmNames {
 		if !pmFilter(pm) {
 			continue
 		}
