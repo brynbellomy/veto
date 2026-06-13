@@ -658,6 +658,44 @@ func TestFindWrappedOriginal_RejectsUnregisteredSibling(t *testing.T) {
 	require.Empty(t, got)
 }
 
+// TestFindWrappedOriginal_RejectsSelfReferentialSibling proves the
+// runtime self-reference guard: if a wrapper's `.veto-original`
+// sibling resolves through symlinks back to veto's own executable,
+// findWrappedOriginal must refuse to honor it. Without the guard,
+// execReal would exec the sibling, which IS veto — an immediate
+// infinite re-entry loop.
+//
+// Concretely we plant `npm` as a regular file in a registered tempdir
+// and make `npm.veto-original` a symlink to veto's own executable
+// (using the test binary as a stand-in for veto, the same trick the
+// PATH-walk tests use). EvalSymlinks(original) then equals
+// EvalSymlinks(self), and the guard fires.
+//
+// This is the belt-and-suspenders complement to the discovery-side
+// filter in pmsurvey.PathsFor; together they prevent the chain
+// corruption that surfaces when an alias symlink and its target both
+// get wrapped (alias.veto-original points at the target, which is
+// now a symlink to veto).
+func TestFindWrappedOriginal_RejectsSelfReferentialSibling(t *testing.T) {
+	dir := t.TempDir()
+	self, err := os.Executable()
+	require.NoError(t, err)
+
+	npm := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(npm, []byte(""), 0o755))
+
+	// Plant a self-referential .veto-original symlink: it resolves to
+	// the test binary, which IS veto's "self" inside this test.
+	original := npm + ".veto-original"
+	require.NoError(t, os.Symlink(self, original))
+
+	registered := func(p string) bool { return p == npm }
+	got, ok := findWrappedOriginal(npm, registered)
+	require.False(t, ok,
+		"self-referential .veto-original must be rejected — exec'ing it would loop veto into itself")
+	require.Empty(t, got)
+}
+
 // TestFindRealBinary_RejectsUnregisteredSiblingInPathWalk covers the
 // PATH-walk branch of B1. When veto walks PATH and a candidate is
 // `selfReal` (i.e. a wrapper at that PATH entry IS veto), the loop

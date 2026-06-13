@@ -1227,6 +1227,19 @@ func wrapperRegisteredFunc(cfg config) func(string) bool {
 // exec their payload. If wrappers.json is missing or unreadable the
 // caller supplies a predicate that returns false for everything; that
 // collapses to PATH-walk-only resolution (fail closed).
+//
+// Self-reference guard: after the sibling passes the registration and
+// executable checks, we resolve it through filepath.EvalSymlinks and
+// compare against veto's own resolved executable path. If they match,
+// the sibling chains back to this very binary — exec'ing it would
+// produce an infinite loop. This protects against (a) a manually-
+// planted self-referential .veto-original, and (b) a future discovery
+// bug that wraps both an alias and its target in the same uv cpython
+// bin dir (chain: python -> python3.X -> veto, with
+// python.veto-original -> python3.X -> veto). The discovery filter in
+// pmsurvey.PathsFor closes case (b) at the source; this runtime check
+// is belt-and-suspenders for case (a) and anything else that lands a
+// loop on disk.
 func findWrappedOriginal(argv0 string, registered func(string) bool) (string, bool) {
 	if argv0 == "" || !strings.ContainsRune(argv0, '/') {
 		return "", false
@@ -1243,7 +1256,32 @@ func findWrappedOriginal(argv0 string, registered func(string) bool) (string, bo
 	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
 		return "", false
 	}
+	if isSelfReferential(original) {
+		return "", false
+	}
 	return original, true
+}
+
+// isSelfReferential reports whether the given path resolves through
+// filepath.EvalSymlinks to the same physical file as veto's own
+// executable. Used by findWrappedOriginal as a belt-and-suspenders
+// guard against an exec loop where a .veto-original chains back into
+// veto itself. Returns false on any EvalSymlinks error — the caller's
+// PATH walk is the fail-safe.
+func isSelfReferential(path string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	selfReal, err := filepath.EvalSymlinks(self)
+	if err != nil {
+		return false
+	}
+	return resolved == selfReal
 }
 
 // findRealBinary returns the path veto should exec to satisfy a
