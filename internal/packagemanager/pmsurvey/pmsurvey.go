@@ -19,6 +19,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
 )
 
 // IsShimDir reports whether dir is a $PATH entry the host survey should
@@ -92,13 +94,32 @@ func WellKnownBinDirs() []string {
 
 // PathsFor returns every absolute path on this host where pm could live
 // and is a Layer-4 wrap candidate. Walks WellKnownBinDirs first, then
-// every $PATH entry that is not an IsShimDir. Each candidate is
-// verified to exist via os.Lstat; broken symlinks (Lstat succeeds,
-// Stat fails) are INCLUDED, because they're real on-disk entries that
-// install-wrappers and doctor both need to surface, not silently drop.
+// every $PATH entry that is not an IsShimDir, then — only for
+// versioned python aliases like `python3.12` — every uv canonical
+// cpython bin dir under ~/.local/share/uv/python/cpython-*/bin.
+//
+// Each candidate is verified to exist via os.Lstat; broken symlinks
+// (Lstat succeeds, Stat fails) are INCLUDED for PATH/WellKnownBinDirs
+// entries because they're real on-disk entries that install-wrappers
+// and doctor both need to surface, not silently drop. uv-store
+// candidates are subject to a stricter regular-file check — see the
+// comment on the uv branch inside the function body for why.
+//
+// Why uv canonical dirs matter: uv venvs symlink (or copy) the
+// canonical cpython binary out of that store. An `uv run python -c ...`
+// invocation reaches the venv python by an absolute path that bypasses
+// $PATH entirely; wrapping the canonical store binary closes the
+// bypass at the source so every venv that links from it sees the
+// wrapper, regardless of whether the user has python / python3 /
+// python3.X on PATH. Only the canonical `python3.X` regular file is
+// surfaced from a uv cpython bin dir — the `python` and `python3`
+// aliases living next to it are symlinks that inherit the wrap via
+// the existing chain (python → python3.X → veto) and must NOT be
+// wrapped independently (would loop veto back into itself).
 //
 // Results are deduplicated by absolute path and ordered: well-known
-// roots in declaration order first, then $PATH entries in $PATH order.
+// roots in declaration order first, then $PATH entries in $PATH order,
+// then uv canonical dirs in declaration order.
 func PathsFor(pm string) []string {
 	seen := map[string]struct{}{}
 	out := []string{}
@@ -129,6 +150,69 @@ func PathsFor(pm string) []string {
 			continue
 		}
 		add(filepath.Join(dir, pm))
+	}
+	// Gate the uv-canonical-store walk on the versioned-python shape
+	// (python3.X). The bare-name `python` / `python3` inside a uv
+	// cpython bin dir are aliases — symlinks pointing at the canonical
+	// `python3.X` in the same directory. They MUST NOT be surfaced as
+	// independent wrap candidates: if veto wraps the alias, its
+	// `.veto-original` sibling ends up being a symlink to the
+	// already-wrapped `python3.X`, which is itself a symlink to veto.
+	// The exec chain then loops veto back into itself on every
+	// invocation. The aliases inherit the wrap for free via the
+	// existing chain (`python` → `python3.X` → veto) so dropping them
+	// from discovery costs nothing and avoids the loop.
+	//
+	// Aliases on PATH outside the uv store (e.g. /opt/homebrew/bin/python3
+	// → Cellar's python3.14) still go through the WellKnownBinDirs and
+	// PATH branches above and remain wrap candidates there — that's a
+	// different layout where the symlink target is in a separate dir
+	// and won't get independently wrapped by this command.
+	if pmlist.IsVersionedPython(pm) {
+		for _, dir := range uvCanonicalPythonBinDirs() {
+			add(filepath.Join(dir, pm))
+		}
+	}
+	return out
+}
+
+// uvCanonicalPythonBinDirs returns every
+// ~/.local/share/uv/python/cpython-*/bin directory currently on disk.
+// uv installs each managed cpython under that root with a release-tagged
+// dir name (e.g. cpython-3.12.4-macos-aarch64-none); the bin/ subdir
+// holds the python3.X binaries veto needs to wrap so uv venvs that
+// symlink them resolve through veto.
+//
+// Returns empty when $HOME is unset or the uv store doesn't exist.
+// Filesystem errors are swallowed silently — PathsFor's caller handles
+// the empty case gracefully (no python3.X candidates surfaced).
+func uvCanonicalPythonBinDirs() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	root := filepath.Join(home, ".local", "share", "uv", "python")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		// The uv store names cpython installs `cpython-…`. Filter on
+		// the prefix so a stray dir (or a future pypy install) doesn't
+		// trigger a spurious bin walk.
+		if !strings.HasPrefix(e.Name(), "cpython-") {
+			continue
+		}
+		bin := filepath.Join(root, e.Name(), "bin")
+		// We don't pre-Stat the bin dir — PathsFor's `add` already
+		// Lstat's each candidate file, so a release dir missing a bin
+		// subdir contributes zero candidates without an extra syscall
+		// here.
+		out = append(out, bin)
 	}
 	return out
 }

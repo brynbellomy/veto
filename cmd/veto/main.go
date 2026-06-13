@@ -127,7 +127,7 @@ func main() {
 		// rewrite that lets the existing gate logic handle the PM lookup
 		// while still exec'ing python (not the PM directly) on the allow
 		// path.
-		if self == "python" || self == "python3" {
+		if isPythonBasename(self) {
 			if pm, ok := pythonDashMTarget(args); ok {
 				// `python -m pip install foo` → route through veto as if
 				// the user had typed `pip install foo`. We thread the
@@ -306,7 +306,7 @@ func run(args []string) int {
 
 // isShimName reports whether basename matches one of the package-manager
 // binaries veto shadows via PATH shims. Delegates to the canonical
-// pmlist.IsShimmed so this hot path and `veto install-shims` consume
+// pmlist.MatchesShim so this hot path and `veto install-shims` consume
 // one source of truth — see internal/packagemanager/pmlist for why.
 //
 // "python" and "python3" are in the canonical list because
@@ -316,8 +316,25 @@ func run(args []string) int {
 // hot-paths every non-`-m {pm}` python call straight to the real
 // interpreter so REPLs, `-V`, `-c`, scripts, and `-m http.server` etc.
 // stay fast and transparent.
+//
+// Versioned aliases ("python3.10", "python3.11.2", …) match through
+// pmlist.MatchesShim's regex too — install-shims creates per-version
+// symlinks for every uv-managed cpython on disk, and the dispatch
+// here recognises them so the same fast-path applies. Without this,
+// a venv that exec's python3.12 directly would dispatch as "unknown"
+// and route through the gate's `unknown package manager; passing
+// through` branch — slow and noisy.
 func isShimName(basename string) bool {
-	return pmlist.IsShimmed(basename)
+	return pmlist.MatchesShim(basename)
+}
+
+// isPythonBasename reports whether basename is one of the python
+// flavors veto fast-paths through the `-m <pm>` gate: the canonical
+// "python" / "python3" names OR a versioned `python3.X` alias.
+// Centralised so main()'s shim-dispatch + execReal lookup stay in
+// sync with the python-family classification in pmlist.
+func isPythonBasename(basename string) bool {
+	return basename == "python" || basename == "python3" || pmlist.IsVersionedPython(basename)
 }
 
 // runGate handles the `veto <pm> <args...>` path: parse the invocation,
@@ -1210,6 +1227,19 @@ func wrapperRegisteredFunc(cfg config) func(string) bool {
 // exec their payload. If wrappers.json is missing or unreadable the
 // caller supplies a predicate that returns false for everything; that
 // collapses to PATH-walk-only resolution (fail closed).
+//
+// Self-reference guard: after the sibling passes the registration and
+// executable checks, we resolve it through filepath.EvalSymlinks and
+// compare against veto's own resolved executable path. If they match,
+// the sibling chains back to this very binary — exec'ing it would
+// produce an infinite loop. This protects against (a) a manually-
+// planted self-referential .veto-original, and (b) a future discovery
+// bug that wraps both an alias and its target in the same uv cpython
+// bin dir (chain: python -> python3.X -> veto, with
+// python.veto-original -> python3.X -> veto). The discovery filter in
+// pmsurvey.PathsFor closes case (b) at the source; this runtime check
+// is belt-and-suspenders for case (a) and anything else that lands a
+// loop on disk.
 func findWrappedOriginal(argv0 string, registered func(string) bool) (string, bool) {
 	if argv0 == "" || !strings.ContainsRune(argv0, '/') {
 		return "", false
@@ -1226,7 +1256,32 @@ func findWrappedOriginal(argv0 string, registered func(string) bool) (string, bo
 	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
 		return "", false
 	}
+	if isSelfReferential(original) {
+		return "", false
+	}
 	return original, true
+}
+
+// isSelfReferential reports whether the given path resolves through
+// filepath.EvalSymlinks to the same physical file as veto's own
+// executable. Used by findWrappedOriginal as a belt-and-suspenders
+// guard against an exec loop where a .veto-original chains back into
+// veto itself. Returns false on any EvalSymlinks error — the caller's
+// PATH walk is the fail-safe.
+func isSelfReferential(path string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	selfReal, err := filepath.EvalSymlinks(self)
+	if err != nil {
+		return false
+	}
+	return resolved == selfReal
 }
 
 // findRealBinary returns the path veto should exec to satisfy a
@@ -1608,7 +1663,7 @@ Layer 1 — Claude Code hook (Bash tool interception):
                                decision to stdout if the command reaches a PM
 
 Layer 2 — PATH shims (any agent shell, Codex, CI):
-  veto install-shims [--dir DIR] [--force]
+  veto install-shims [--dir DIR] [--force] [--dry-run]
                                symlinks ~/.local/bin/{npm,pip,…} → veto
   veto uninstall-shims [--dir DIR]
                                remove veto-managed symlinks

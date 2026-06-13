@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/brynbellomy/veto/internal/packagemanager/pmsurvey"
 )
 
 // TestApplyWrapper_HappyPath_RegularFile is the canonical case: a real
@@ -340,6 +342,150 @@ func TestDiscoverWrapCandidates_IncludesPyenvAndNvmInstalls(t *testing.T) {
 	require.Equal(t, "npm", byPath[nvmNpm].pm)
 }
 
+// TestDiscoverWrapCandidates_IncludesUVCanonicalPython proves the
+// install-wrappers discovery path enumerates the canonical versioned
+// python3.X binary from a uv-managed cpython store — the
+// closing-the-uv-venv-bypass surface. Only the canonical `python3.X`
+// regular file is a wrap candidate; the `python` / `python3` aliases
+// that live next to it are symlinks back to python3.X and inherit the
+// wrap via the existing chain. Wrapping the aliases independently
+// would corrupt the exec chain (see TestPathsForUVStoreFiltersAliasSymlinks).
+func TestDiscoverWrapCandidates_IncludesUVCanonicalPython(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "") // isolate from the runner's PATH
+
+	veto := filepath.Join(home, ".local", "bin", "veto")
+	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
+	require.NoError(t, os.WriteFile(veto, []byte(""), 0o755))
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	uvPy3 := filepath.Join(uvBin, "python3")
+	uvPy312 := filepath.Join(uvBin, "python3.12")
+	// Real uv layout: python3.12 is the canonical regular file; python3
+	// is a symlink to it.
+	require.NoError(t, os.MkdirAll(uvBin, 0o755))
+	require.NoError(t, os.WriteFile(uvPy312, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	require.NoError(t, os.Symlink("python3.12", uvPy3))
+
+	candidates, err := discoverWrapCandidates(
+		wrapperFlags{only: map[string]struct{}{"python3": {}, "python3.12": {}}},
+		veto,
+	)
+	require.NoError(t, err)
+
+	byPath := map[string]wrapCandidate{}
+	for _, c := range candidates {
+		byPath[c.path] = c
+	}
+	require.Contains(t, byPath, uvPy312,
+		"uv canonical python3.12 must be surfaced for wrapping")
+	require.Equal(t, "python3.12", byPath[uvPy312].pm)
+	require.NotContains(t, byPath, uvPy3,
+		"uv-store python3 alias symlink must NOT surface — inherits wrap via python3 → python3.12 → veto chain")
+}
+
+// TestRunInstallWrappers_WrapsUVCanonicalPython drives install-wrappers
+// end-to-end against a faked uv store + tempdir cache, asserting the
+// canonical python3.12 binary gets symlink-replaced with veto and its
+// real bytes preserved at .veto-original.
+func TestRunInstallWrappers_WrapsUVCanonicalPython(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+	veto := filepath.Join(home, ".local", "bin", "veto")
+	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	uvPy312 := filepath.Join(uvBin, "python3.12")
+	require.NoError(t, os.MkdirAll(filepath.Dir(uvPy312), 0o755))
+	originalBody := []byte("#!/bin/sh\necho real-python3.12\n")
+	require.NoError(t, os.WriteFile(uvPy312, originalBody, 0o755))
+
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+	cfg := config{CacheDir: filepath.Join(home, ".cache", "veto")}
+	rc, stats := runInstallWrappersWith(
+		zerologNop(), cfg,
+		wrapperFlags{only: map[string]struct{}{"python3.12": {}}},
+		veto, id,
+	)
+	require.Equal(t, exitOK, rc)
+	require.GreaterOrEqual(t, stats.wrapped, 1)
+
+	// python3.12 is now a symlink to veto.
+	info, err := os.Lstat(uvPy312)
+	require.NoError(t, err)
+	require.NotZero(t, info.Mode()&os.ModeSymlink, "expected python3.12 to be a symlink")
+	tgt, err := os.Readlink(uvPy312)
+	require.NoError(t, err)
+	require.Equal(t, veto, tgt)
+
+	// Real bytes preserved at .veto-original.
+	body, err := os.ReadFile(uvPy312 + ".veto-original")
+	require.NoError(t, err)
+	require.Equal(t, originalBody, body)
+}
+
+// TestRunInstallWrappers_ReentrantOnUVCanonicalPython proves re-running
+// install-wrappers when python3.X is ALREADY wrapped (symlink to veto
+// + populated .veto-original) is a safe no-op. Regression for the
+// safe-relink guard added in 666c33e: a follow-up run must not rename
+// the symlink onto the existing .veto-original sibling.
+func TestRunInstallWrappers_ReentrantOnUVCanonicalPython(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+	veto := filepath.Join(home, ".local", "bin", "veto")
+	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	uvPy312 := filepath.Join(uvBin, "python3.12")
+	require.NoError(t, os.MkdirAll(filepath.Dir(uvPy312), 0o755))
+	originalBody := []byte("#!/bin/sh\necho real-python3.12\n")
+	require.NoError(t, os.WriteFile(uvPy312, originalBody, 0o755))
+
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+	cfg := config{CacheDir: filepath.Join(home, ".cache", "veto")}
+
+	// First run: wraps.
+	rc1, _ := runInstallWrappersWith(
+		zerologNop(), cfg,
+		wrapperFlags{only: map[string]struct{}{"python3.12": {}}},
+		veto, id,
+	)
+	require.Equal(t, exitOK, rc1)
+
+	// Second run: safe-relink guard makes this a no-op (alreadyOurs).
+	rc2, stats := runInstallWrappersWith(
+		zerologNop(), cfg,
+		wrapperFlags{only: map[string]struct{}{"python3.12": {}}},
+		veto, id,
+	)
+	require.Equal(t, exitOK, rc2)
+	require.Zero(t, stats.failed,
+		"re-running install-wrappers on an already-wrapped python3.X must not fail")
+	require.GreaterOrEqual(t, stats.alreadyOurs, 1,
+		"re-run must classify python3.X as already-ours")
+
+	// .veto-original is intact and still has the real bytes — the
+	// safe-relink guard did not overwrite it with a stale symlink.
+	body, err := os.ReadFile(uvPy312 + ".veto-original")
+	require.NoError(t, err)
+	require.Equal(t, originalBody, body,
+		".veto-original must hold the original real bytes after re-run")
+}
+
 func TestDiscoverWrapCandidates_ReconcilesAlreadyWrappedPyenvAndNvm(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -509,6 +655,44 @@ func TestFindWrappedOriginal_RejectsUnregisteredSibling(t *testing.T) {
 	// And with a nil predicate (defensive — e.g. caller forgot to pass one):
 	got, ok = findWrappedOriginal(npm, nil)
 	require.False(t, ok, "nil registry predicate must fail closed")
+	require.Empty(t, got)
+}
+
+// TestFindWrappedOriginal_RejectsSelfReferentialSibling proves the
+// runtime self-reference guard: if a wrapper's `.veto-original`
+// sibling resolves through symlinks back to veto's own executable,
+// findWrappedOriginal must refuse to honor it. Without the guard,
+// execReal would exec the sibling, which IS veto — an immediate
+// infinite re-entry loop.
+//
+// Concretely we plant `npm` as a regular file in a registered tempdir
+// and make `npm.veto-original` a symlink to veto's own executable
+// (using the test binary as a stand-in for veto, the same trick the
+// PATH-walk tests use). EvalSymlinks(original) then equals
+// EvalSymlinks(self), and the guard fires.
+//
+// This is the belt-and-suspenders complement to the discovery-side
+// filter in pmsurvey.PathsFor; together they prevent the chain
+// corruption that surfaces when an alias symlink and its target both
+// get wrapped (alias.veto-original points at the target, which is
+// now a symlink to veto).
+func TestFindWrappedOriginal_RejectsSelfReferentialSibling(t *testing.T) {
+	dir := t.TempDir()
+	self, err := os.Executable()
+	require.NoError(t, err)
+
+	npm := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(npm, []byte(""), 0o755))
+
+	// Plant a self-referential .veto-original symlink: it resolves to
+	// the test binary, which IS veto's "self" inside this test.
+	original := npm + ".veto-original"
+	require.NoError(t, os.Symlink(self, original))
+
+	registered := func(p string) bool { return p == npm }
+	got, ok := findWrappedOriginal(npm, registered)
+	require.False(t, ok,
+		"self-referential .veto-original must be rejected — exec'ing it would loop veto into itself")
 	require.Empty(t, got)
 }
 

@@ -139,3 +139,129 @@ func macOSOnly(t *testing.T) {
 		t.Skip("darwin-only test")
 	}
 }
+
+// TestPathsForIncludesUVCanonicalPython proves PathsFor walks the
+// uv-managed cpython store and surfaces the canonical python3.X
+// regular file living there, NOT on $PATH. Closes the uv-venv bypass
+// at the source: a venv that symlinks the canonical binary now
+// resolves through veto.
+func TestPathsForIncludesUVCanonicalPython(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "") // isolate from the runner's PATH
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	writeExec(t, filepath.Join(uvBin, "python3.12"))
+
+	got312 := pmsurvey.PathsFor("python3.12")
+	require.Contains(t, got312, filepath.Join(uvBin, "python3.12"),
+		"uv canonical python3.X must be surfaced as a wrap candidate")
+}
+
+// TestPathsForSkipsUVStoreForNonPython confirms the uv-store walk is
+// gated on the versioned-python shape. A `PathsFor("npm")` must NOT
+// poke the uv store on every call — it's a cold path that doesn't
+// earn its keep for non-python requests.
+func TestPathsForSkipsUVStoreForNonPython(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+
+	// Plant an npm file inside the uv store path so any walker would
+	// find it. PathsFor must NOT surface it because the name isn't a
+	// versioned-python alias.
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	writeExec(t, filepath.Join(uvBin, "npm"))
+
+	got := pmsurvey.PathsFor("npm")
+	require.NotContains(t, got, filepath.Join(uvBin, "npm"),
+		"uv-store dirs must only contribute candidates for versioned python aliases")
+}
+
+// TestPathsForUVStoreFiltersAliasSymlinks proves that `python` and
+// `python3` aliases inside a uv cpython bin dir are NOT surfaced as
+// wrap candidates, but the canonical `python3.X` IS. This is the
+// regression test for the chain-corruption bug: if the aliases were
+// wrapped independently, `python.veto-original` would remain a symlink
+// to the now-wrapped `python3.X`, looping veto back into itself on
+// every `python` invocation. The aliases inherit the wrap for free
+// via the existing symlink chain (python → python3.X → veto), so they
+// must be omitted from uv-store discovery entirely (the uv-store walk
+// is gated on the versioned-python shape).
+func TestPathsForUVStoreFiltersAliasSymlinks(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "") // isolate from the runner's PATH
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.11.13-macos-aarch64-none", "bin")
+	// Real uv layout: python3.11 is the canonical regular file;
+	// python and python3 are symlinks pointing at it.
+	canonical := filepath.Join(uvBin, "python3.11")
+	writeExec(t, canonical)
+	writeSymlink(t, filepath.Join(uvBin, "python"), "python3.11")
+	writeSymlink(t, filepath.Join(uvBin, "python3"), "python3.11")
+
+	got311 := pmsurvey.PathsFor("python3.11")
+	require.Contains(t, got311, canonical,
+		"canonical python3.X must be surfaced as a wrap candidate")
+
+	gotPython := pmsurvey.PathsFor("python")
+	require.NotContains(t, gotPython, filepath.Join(uvBin, "python"),
+		"uv-store python alias must not surface — would corrupt the exec chain after wrap")
+
+	gotPython3 := pmsurvey.PathsFor("python3")
+	require.NotContains(t, gotPython3, filepath.Join(uvBin, "python3"),
+		"uv-store python3 alias must not surface — would corrupt the exec chain after wrap")
+}
+
+// TestPathsForUVStoreReentrantOnWrappedCanonical proves the uv-store
+// walk surfaces an already-wrapped python3.X (now a symlink to veto)
+// on a re-run, so the reconciler can classify it as already-ours
+// instead of silently dropping it. Belt-and-suspenders against an
+// over-eager regular-file filter: the gating is on the versioned-name
+// shape only, not on the candidate's file type.
+func TestPathsForUVStoreReentrantOnWrappedCanonical(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "") // isolate from the runner's PATH
+
+	// Simulate an already-wrapped layout: python3.11 is a symlink to
+	// some `veto` binary, and python3.11.veto-original holds the real
+	// bytes.
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.11.13-macos-aarch64-none", "bin")
+	canonical := filepath.Join(uvBin, "python3.11")
+	fakeVeto := filepath.Join(home, ".local", "bin", "veto")
+	writeExec(t, fakeVeto)
+	writeSymlink(t, canonical, fakeVeto)
+	writeExec(t, canonical+".veto-original")
+
+	got := pmsurvey.PathsFor("python3.11")
+	require.Contains(t, got, canonical,
+		"already-wrapped python3.X (symlink to veto) must still surface for reconciliation")
+}
+
+// TestPathsForUVStoreFiltersNonCPythonDirs proves only `cpython-*`
+// dirs in the uv store contribute candidates. A future pypy/cython/etc.
+// dir alongside cpython must not get picked up — the prefix filter is
+// load-bearing for the python-family gating.
+func TestPathsForUVStoreFiltersNonCPythonDirs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+
+	pypyBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"pypy-3.10-macos-aarch64", "bin")
+	writeExec(t, filepath.Join(pypyBin, "python3.10"))
+	cpyBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.10.14-macos-aarch64-none", "bin")
+	writeExec(t, filepath.Join(cpyBin, "python3.10"))
+
+	got := pmsurvey.PathsFor("python3.10")
+	require.Contains(t, got, filepath.Join(cpyBin, "python3.10"))
+	require.NotContains(t, got, filepath.Join(pypyBin, "python3.10"),
+		"only cpython-* dirs in the uv store should contribute candidates")
+}

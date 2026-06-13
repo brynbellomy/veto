@@ -33,17 +33,35 @@ type Finding struct {
 }
 
 // isInterposerPM reports whether the basename is a PM name the hook /
-// Layer-3 interposer recognises. Backed by pmlist.IsInterposerPM so
-// the hook, the C interposer (via the generated pm_names.h), the
-// Layer-2 install-shims set, and the Layer-4 install-wrappers set all
-// consume one source of truth — see internal/packagemanager/pmlist.
+// Layer-3 interposer recognises. Backed by pmlist.MatchesInterposer so
+// the hook, the C interposer (via the generated pm_names.h + the
+// versioned-python regex), the Layer-2 install-shims set, and the
+// Layer-4 install-wrappers set all consume one source of truth — see
+// internal/packagemanager/pmlist.
 //
 // The hook's set is a superset of install-shims' (it also recognises
 // rush/rushx) because the hook just classifies "is this command
 // risky?"; we don't install shims/wrappers for rush, but if a user's
 // agent invokes rush directly we still want the install verbs gated.
+//
+// Versioned python aliases ("python3.10", "python3.12.1", …) match
+// through the regex side of MatchesInterposer too — a Claude-issued
+// `python3.12 -m pip install foo` must be classified as risky by the
+// Layer-1 hook just like a bare `python -m pip install foo`.
 func isInterposerPM(name string) bool {
-	return pmlist.IsInterposerPM(name)
+	return pmlist.MatchesInterposer(name)
+}
+
+// isPythonInterpreter reports whether name is one of the python
+// flavors the hook treats as a `-m <pm>` dispatcher. Includes the
+// canonical "python" / "python3" set AND every `python3.X` versioned
+// alias. Centralised so isRisky's python branch and the static map
+// pythonInterpreters stay consistent.
+func isPythonInterpreter(name string) bool {
+	if _, ok := pythonInterpreters[name]; ok {
+		return true
+	}
+	return pmlist.IsVersionedPython(name)
 }
 
 // pythonDashMTargets is the set of `-m <module>` names that, when
@@ -543,7 +561,7 @@ func isRisky(tokens []string) (string, bool) {
 	// unwrap by re-running isRisky on `<pm> …` so the existing per-PM
 	// logic (dangerous-verb lookup, exec-PM rule) decides risk. Other
 	// `-m` modules and non-`-m` python invocations are not risky.
-	if _, isPy := pythonInterpreters[b]; isPy {
+	if isPythonInterpreter(b) {
 		if len(tokens) >= 3 && tokens[1] == "-m" {
 			if _, ok := pythonDashMTargets[tokens[2]]; ok {
 				return isRisky(tokens[2:])
