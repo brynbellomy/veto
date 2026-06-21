@@ -67,7 +67,15 @@ build: $(INTERPOSER_HEADER)
 # which otherwise breaks `make install`'s test gate. The interposer's own
 # e2e tests build their preloaded child env explicitly, so clearing the
 # ambient preload here is safe.
-test: $(INTERPOSER_HEADER)
+#
+# We also depend on $(INTERPOSER_OUT) so a stale dylib left in the repo
+# root from a prior `make interposer` gets rebuilt before the e2e suite
+# loads it. interposer_e2e_test.go's interposerLibPath() picks up
+# whatever artifact exists in repo root; if it's older than
+# internal/interposer/csrc/veto_interpose.c, tests load a fossil and
+# silently fail in confusing ways. Listing it as a prereq here makes
+# the staleness check automatic.
+test: $(INTERPOSER_HEADER) $(INTERPOSER_OUT)
 	DYLD_INSERT_LIBRARIES= LD_PRELOAD= go test -race ./...
 
 vet:

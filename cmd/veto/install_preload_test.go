@@ -131,3 +131,40 @@ func TestParsePreloadFlags_AcceptsLongAndEqualsForms(t *testing.T) {
 		})
 	}
 }
+
+// TestPreloadShellRCTargets_ExplicitPathReturnsSingle: an explicit
+// --shell-rc PATH bypasses the auto-fan-out and only that one file gets
+// touched. Mirrors the contract install-shell already honors.
+func TestPreloadShellRCTargets_ExplicitPathReturnsSingle(t *testing.T) {
+	paths, err := preloadShellRCTargets(preloadOpts{shellRC: "/x/.myrc"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"/x/.myrc"}, paths)
+}
+
+// TestPreloadShellRCTargets_NoFlagsReturnsEmpty: with neither
+// --shell-rc nor --shell-rc auto, the caller is responsible for
+// printing the block — we return zero paths so no write happens.
+func TestPreloadShellRCTargets_NoFlagsReturnsEmpty(t *testing.T) {
+	paths, err := preloadShellRCTargets(preloadOpts{})
+	require.NoError(t, err)
+	require.Empty(t, paths)
+}
+
+// TestPreloadShellRCTargets_AutoFansOutLikeShellIntegration: this is
+// the regression guard. install-all calls install-preload with
+// --shell-rc auto; the resulting target set MUST match the shell
+// integration target set so a zsh+bash user gets the preload env vars
+// in every rc that install-shell already wrote to. Without parity,
+// `bash -c 'go build'` silently loses Layer 3.
+func TestPreloadShellRCTargets_AutoFansOutLikeShellIntegration(t *testing.T) {
+	want, err := defaultShellIntegrationTargets()
+	if err != nil {
+		t.Skipf("cannot determine default shell integration targets in this env: %v", err)
+	}
+	got, err := preloadShellRCTargets(preloadOpts{autoRC: true})
+	require.NoError(t, err)
+	require.Len(t, got, len(want), "preload fan-out must match shell-integration fan-out")
+	for i, target := range want {
+		require.Equal(t, target.path, got[i], "rc path %d must match shell-integration order", i)
+	}
+}
