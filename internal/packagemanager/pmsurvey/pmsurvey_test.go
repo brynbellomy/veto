@@ -122,6 +122,11 @@ func TestWellKnownBinDirsIncludesHomebrew(t *testing.T) {
 	got := pmsurvey.WellKnownBinDirs()
 	require.Contains(t, got, "/opt/homebrew/bin")
 	require.Contains(t, got, "/usr/local/bin")
+	// ~/.cargo/bin is a belt-and-suspenders addition so cargo surfaces
+	// even when $PATH happens not to include it (e.g. restricted envs).
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+	require.Contains(t, got, filepath.Join(home, ".cargo", "bin"))
 }
 
 func TestPathsForDeduplicates(t *testing.T) {

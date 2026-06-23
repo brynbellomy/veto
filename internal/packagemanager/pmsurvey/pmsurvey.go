@@ -58,7 +58,8 @@ func IsShimDir(dir string) bool {
 // WellKnownBinDirs returns every bin-dir pattern on this host where a
 // system or version-manager-installed PM could live: the homebrew
 // prefixes plus mise/asdf install bin dirs (one per installed
-// tool@version), plus pyenv/nvm versions, plus ~/.bun/bin.
+// tool@version), plus pyenv/nvm versions, plus ~/.bun/bin and
+// ~/.cargo/bin.
 //
 // Patterns that depend on $HOME silently return empty when $HOME is
 // unset; callers fall back to whatever WellKnownBinDirs returned plus
@@ -74,6 +75,7 @@ func WellKnownBinDirs() []string {
 	out = append(out, globVersionBinDirs(filepath.Join(home, ".pyenv", "versions"))...)
 	out = append(out, globVersionBinDirs(filepath.Join(home, ".nvm", "versions", "node"))...)
 	out = append(out, filepath.Join(home, ".bun", "bin"))
+	out = append(out, filepath.Join(home, ".cargo", "bin"))
 	return out
 }
 
