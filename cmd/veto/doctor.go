@@ -255,6 +255,58 @@ func checkShimDir() []checkResult {
 			detail: fmt.Sprintf("%s → %s", shimPath, target),
 		})
 	}
+
+	// Layer 2 invariant: no `*.veto-original` siblings allowed in the
+	// shim dir. Those belong to Layer 4 wrap sites and would never be
+	// registered with this shim dir as their parent. Each stray entry is
+	// at minimum a stale artifact; at worst (when it resolves back into
+	// veto itself) it can chain into an exec loop or stall when veto is
+	// invoked as a `python3` shim from an agent spawn context — the
+	// observed veto-dzk symptom.
+	out = append(out, checkStaleShimSiblings(shimDir)...)
+
+	return out
+}
+
+// checkStaleShimSiblings scans the Layer 2 shim dir for any
+// `*.veto-original` entries. Each one produces a FAIL row naming the
+// exact path; this matches the severity of other Layer 2 invariants
+// (shim-not-a-symlink also FAILs in checkShimDir above). The fix
+// suggestion routes through the new `veto repair-shims` command so
+// users have a single recovery surface independent of running
+// install-shims.
+func checkStaleShimSiblings(shimDir string) []checkResult {
+	entries, err := os.ReadDir(shimDir)
+	if err != nil {
+		// Missing shim dir is not a finding here; checkShimDir's own
+		// PATH check (above) handles "shim dir absent" explicitly.
+		// Any other read error means we cannot enforce the invariant —
+		// surface it as a WARN with the failure detail so the user
+		// can fix permissions, then re-run doctor.
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return []checkResult{{
+			status:   statusWarn,
+			label:    "shim-dir scan",
+			detail:   "read " + shimDir + ": " + err.Error(),
+			howToFix: "Fix perms on the shim dir, then re-run `veto doctor`.",
+		}}
+	}
+	var out []checkResult
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".veto-original") {
+			continue
+		}
+		full := filepath.Join(shimDir, name)
+		out = append(out, checkResult{
+			status:   statusFail,
+			label:    "shim sibling:" + name,
+			detail:   full + " exists but Layer 2 shim dirs must not have .veto-original siblings",
+			howToFix: "Run `veto repair-shims` (or `rm " + full + "`).",
+		})
+	}
 	return out
 }
 
