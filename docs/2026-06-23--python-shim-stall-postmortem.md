@@ -2,7 +2,7 @@
 
 Date: 2026-06-23
 Affected: any host where `install-wrappers` recorded `~/.local/bin/python*` paths AND `~/.local/bin/python*.veto-original` symlinks resolved back to `~/.local/bin/veto`.
-Resolved by: commit `12d832b` (install-shims scrub + `repair-shims`), commit `19e55c6` (doctor flag), commit `6d76cff` (exec-resolver self-reference guard).
+Resolved by: commit `12d832b` (install-shims scrub), commit `19e55c6` (doctor flag), commit `6d76cff` (exec-resolver self-reference guard). The follow-up convergence epic (veto-76f) folded the standalone `repair-shims` recovery command into `install-shims` and removed it as a top-level command.
 
 ## Symptom
 
@@ -74,21 +74,23 @@ The runtime guard (`isSelfReferential` in the PATH-walk branch) is what makes th
 
 So the response was three changes:
 
-1. **`install-shims` scrubs `*.veto-original` siblings** on every run, and a new `veto repair-shims` command exposes the scrub as a standalone recovery surface.
-2. **`veto doctor` flags any `*.veto-original` entry** in the shim dir as `FAIL`, naming the exact path and pointing at `repair-shims`.
+1. **`install-shims` scrubs `*.veto-original` siblings** on every run as part of its convergence pass.
+2. **`veto doctor` flags any `*.veto-original` entry** in the shim dir as `FAIL`, naming the exact path and pointing at `veto install-all`.
 3. **`findRealBinary`'s PATH-walk branch** runs `isSelfReferential` against any sibling it would otherwise return, mirroring `findWrappedOriginal`'s long-standing guard.
 
 (1) and (2) prevent the bad state from accumulating. (3) breaks the loop even if the bad state somehow exists.
 
+(An earlier iteration of veto shipped this fix alongside a standalone `veto repair-shims` command. The follow-up convergence epic (veto-76f) folded that recovery surface into `install-shims` itself — the scrub now runs every install pass — and removed `repair-shims` to keep `install-all` the single command users need.)
+
 ## Recovery (existing installs)
 
-If `veto doctor` reports stray `*.veto-original` siblings:
+If `veto doctor` reports stray `*.veto-original` siblings (or any other Layer 2 / Layer 4 drift), run:
 
 ```
-veto repair-shims
+veto install-all
 ```
 
-That removes them without touching real shim symlinks. Idempotent; safe to re-run.
+The convergence passes in `install-shims` (scrubs stale siblings, prunes shim-dir entries from `wrappers.json`) and `install-wrappers` (prunes stale entries whose path or sibling is gone, re-classifies candidates at wrap time) reconcile the layers in a single pass. Idempotent; safe to re-run.
 
 If a host already has a stuck `veto`-as-python3 process from before the fix:
 
@@ -100,7 +102,6 @@ Then upgrade and re-run install:
 
 ```
 make install
-veto repair-shims
 veto install-all
 veto doctor   # expect no stray-sibling FAILs
 ```

@@ -267,8 +267,6 @@ func run(args []string) int {
 		return runInstallShims(logger, cfg, args[1:])
 	case "uninstall-shims":
 		return runUninstallShims(logger, args[1:])
-	case "repair-shims":
-		return runRepairShims(logger, args[1:])
 	case "hook":
 		return runHook(logger, args[1:])
 	case "install-claude-hook":
@@ -1678,11 +1676,6 @@ Layer 2 — PATH shims (any agent shell, Codex, CI):
                                symlinks ~/.local/bin/{npm,pip,…} → veto
   veto uninstall-shims [--dir DIR]
                                remove veto-managed symlinks
-  veto repair-shims [--dir DIR] [--dry-run]
-                               scrub stale `+"`<name>.veto-original`"+` siblings
-                               that don't belong in a Layer 2 shim dir
-                               (those are Layer 4 wrap-site artifacts).
-                               Idempotent; safe to re-run.
   veto install-codex        install-shims + a ~/.codex/config.toml scan
                                for env-policy gotchas
   veto install-cursor [--project-dir DIR] [--shim-dir DIR] [--skip-shims] [--force]

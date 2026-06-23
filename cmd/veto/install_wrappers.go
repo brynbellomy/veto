@@ -193,9 +193,10 @@ func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags
 	// anything else. An entry is stale when either the recorded path no
 	// longer exists on disk (uninstalled, mise upgrade renamed the
 	// version dir, manual cleanup) OR the `.veto-original` sibling is
-	// missing (repair-shims removed it, manual delete). Without this
-	// reconcile pass install-wrappers only ADDS — drifted state stays
-	// drifted forever and doctor FAILs the entries indefinitely.
+	// missing (a prior install-shims convergence pass removed it,
+	// manual delete). Without this reconcile pass install-wrappers only
+	// ADDS — drifted state stays drifted forever and doctor FAILs the
+	// entries indefinitely.
 	prunedStale, dirty := pruneStaleWrapperEntries(&state)
 	for _, p := range prunedStale {
 		if opts.dryRun {

@@ -357,8 +357,8 @@ func TestScrubVetoOriginalSiblings_DryRunDoesNotMutate(t *testing.T) {
 }
 
 // TestScrubVetoOriginalSiblings_MissingDir proves an absent shim dir is
-// reported as "no siblings present" rather than an error. Mirrors
-// repair-shims's "nothing to do" branch.
+// reported as "no siblings present" rather than an error. Matches the
+// install-shims convergence pass's "nothing to scrub" branch.
 func TestScrubVetoOriginalSiblings_MissingDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "does-not-exist")
 	removed, errs := scrubVetoOriginalSiblings(dir, false)
@@ -394,48 +394,6 @@ func TestRunInstallShims_ScrubsStaleSiblings(t *testing.T) {
 		_, err := os.Lstat(p)
 		require.True(t, os.IsNotExist(err), "install-shims must scrub stale sibling %s", p)
 	}
-}
-
-// TestRunRepairShims_HappyPath proves the standalone `veto repair-shims`
-// command removes stale siblings without otherwise touching shim
-// symlinks.
-func TestRunRepairShims_HappyPath(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("PATH", "")
-	shimDir := filepath.Join(home, "repair-target")
-	require.NoError(t, os.MkdirAll(shimDir, 0o755))
-
-	// One real shim that must survive.
-	veto := filepath.Join(home, "fake-veto")
-	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
-	npm := filepath.Join(shimDir, "npm")
-	require.NoError(t, os.Symlink(veto, npm))
-
-	// One stale sibling that must be removed.
-	stale := filepath.Join(shimDir, "python3.veto-original")
-	require.NoError(t, os.Symlink(veto, stale))
-
-	rc := runRepairShims(zerologNop(), []string{"--dir", shimDir})
-	require.Equal(t, exitOK, rc)
-
-	_, err := os.Lstat(stale)
-	require.True(t, os.IsNotExist(err), "repair-shims must remove stale sibling")
-	_, err = os.Lstat(npm)
-	require.NoError(t, err, "repair-shims must NOT touch real shims")
-}
-
-// TestRunRepairShims_MissingDir proves repair-shims exits cleanly when
-// the shim dir does not exist (i.e. there is nothing to repair). The
-// command is operational glue and shouldn't fail in this case.
-func TestRunRepairShims_MissingDir(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("PATH", "")
-	shimDir := filepath.Join(home, "absent")
-
-	rc := runRepairShims(zerologNop(), []string{"--dir", shimDir})
-	require.Equal(t, exitOK, rc)
 }
 
 // TestRunInstallShims_DryRunDoesNotMutate proves --dry-run lists what

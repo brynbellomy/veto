@@ -674,7 +674,7 @@ func TestSIPPathIsNotApplicableInWrapperSurvey(t *testing.T) {
 // TestCheckStaleShimSiblings_FlagsPlanted plants the on-disk shape behind
 // the veto-dzk bead (self-referential `*.veto-original` symlinks in
 // ~/.local/bin) and asserts doctor returns one FAIL row per stale entry,
-// naming the exact path and pointing at `veto repair-shims`.
+// naming the exact path and pointing at `veto install-all`.
 func TestCheckStaleShimSiblings_FlagsPlanted(t *testing.T) {
 	shimDir := t.TempDir()
 	veto := filepath.Join(shimDir, "..", "fake-veto")
@@ -692,7 +692,7 @@ func TestCheckStaleShimSiblings_FlagsPlanted(t *testing.T) {
 	require.Len(t, got, len(planted))
 	for _, r := range got {
 		require.Equal(t, statusFail, r.status)
-		require.Contains(t, r.howToFix, "veto repair-shims")
+		require.Contains(t, r.howToFix, "veto install-all")
 	}
 
 	// Each planted path appears verbatim in exactly one row's detail.
@@ -731,26 +731,26 @@ func TestCheckStaleShimSiblings_MissingDirIsNoFinding(t *testing.T) {
 	require.Empty(t, got)
 }
 
-// TestCheckStaleShimSiblings_AfterRepairPasses proves the
-// `install-shims` / `repair-shims` recovery actually heals the
-// invariant: after the scrub runs, doctor reports zero stale-sibling
-// rows.
-func TestCheckStaleShimSiblings_AfterRepairPasses(t *testing.T) {
+// TestCheckStaleShimSiblings_AfterScrubPasses proves the
+// install-shims convergence pass actually heals the invariant: after
+// the scrub runs, doctor reports zero stale-sibling rows.
+func TestCheckStaleShimSiblings_AfterScrubPasses(t *testing.T) {
 	shimDir := t.TempDir()
 	veto := filepath.Join(shimDir, "..", "fake-veto")
 	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
 	stale := filepath.Join(shimDir, "python3.veto-original")
 	require.NoError(t, os.Symlink(veto, stale))
 
-	// Confirm doctor flags it BEFORE repair.
+	// Confirm doctor flags it BEFORE the scrub.
 	pre := checkStaleShimSiblings(shimDir)
 	require.Len(t, pre, 1)
 
-	// Run the scrub (the primitive both install-shims and repair-shims use).
+	// Run the scrub primitive that install-shims wires into its
+	// convergence pass.
 	_, errs := scrubVetoOriginalSiblings(shimDir, false)
 	require.Empty(t, errs)
 
-	// Doctor reports clean AFTER repair.
+	// Doctor reports clean AFTER scrub.
 	post := checkStaleShimSiblings(shimDir)
 	require.Empty(t, post)
 }

@@ -272,9 +272,9 @@ func checkShimDir() []checkResult {
 // `*.veto-original` entries. Each one produces a FAIL row naming the
 // exact path; this matches the severity of other Layer 2 invariants
 // (shim-not-a-symlink also FAILs in checkShimDir above). The fix
-// suggestion routes through the new `veto repair-shims` command so
-// users have a single recovery surface independent of running
-// install-shims.
+// suggestion routes through `veto install-all` (or `veto install-shims`)
+// because the convergence pass at the top of install-shims scrubs
+// these siblings every run — no separate recovery command needed.
 func checkStaleShimSiblings(shimDir string) []checkResult {
 	entries, err := os.ReadDir(shimDir)
 	if err != nil {
@@ -304,7 +304,7 @@ func checkStaleShimSiblings(shimDir string) []checkResult {
 			status:   statusFail,
 			label:    "shim sibling:" + name,
 			detail:   full + " exists but Layer 2 shim dirs must not have .veto-original siblings",
-			howToFix: "Run `veto repair-shims` (or `rm " + full + "`).",
+			howToFix: "Run `veto install-all` (or `veto install-shims`) to scrub stale siblings.",
 		})
 	}
 	return out
@@ -932,7 +932,7 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 				status:   statusFail,
 				label:    "wrapper:" + w.PM,
 				detail:   fmt.Sprintf("%s missing — wrapper would execute as veto with nothing to delegate to", w.OriginalPath),
-				howToFix: "Run `veto uninstall-wrappers` to clean state and `veto install-wrappers` to re-wrap.",
+				howToFix: "Run `veto install-all` (or `veto install-wrappers`) — the convergence pass at the top of install-wrappers prunes stale entries and re-wraps the live binary on the next run.",
 			})
 			continue
 		}

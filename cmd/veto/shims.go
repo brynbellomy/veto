@@ -185,51 +185,6 @@ func runInstallShims(logger zerolog.Logger, cfg config, args []string) int {
 	return exitOK
 }
 
-// runRepairShims implements `veto repair-shims [--dir DIR] [--dry-run]`.
-//
-// Recovery path for the Layer 2 invariant "no `.veto-original` siblings in
-// the shim dir." Mirrors install-shims's scrub pass without otherwise
-// touching the shim symlinks themselves. Use when doctor reports stale
-// siblings but a full install-shims run is undesirable (e.g. CI, or when
-// versioned-python discovery would create new shims you don't want).
-func runRepairShims(logger zerolog.Logger, args []string) int {
-	flags, err := parseShimFlags(args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "veto: %v\n", err)
-		return exitUsage
-	}
-	dir, dryRun := flags.dir, flags.dryRun
-
-	if _, err := os.Stat(dir); err != nil {
-		if os.IsNotExist(err) {
-			fmt.Fprintf(os.Stdout, "  %-12s  ok      shim dir %s does not exist; nothing to repair\n", "repair", dir)
-			return exitOK
-		}
-		logger.Error().Err(err).Str("dir", dir).Msg("stat shim dir")
-		return exitInternal
-	}
-
-	scrubbed, scrubErrs := scrubVetoOriginalSiblings(dir, dryRun)
-	if len(scrubbed) == 0 && len(scrubErrs) == 0 {
-		fmt.Fprintf(os.Stdout, "  %-12s  ok      no stale Layer 2 siblings under %s\n", "repair", dir)
-		return exitOK
-	}
-	for _, p := range scrubbed {
-		if dryRun {
-			fmt.Fprintf(os.Stdout, "  %-12s  ok      would remove stale Layer 2 sibling %s\n", "repair", p)
-		} else {
-			fmt.Fprintf(os.Stdout, "  %-12s  ok      removed stale Layer 2 sibling %s\n", "repair", p)
-		}
-	}
-	if len(scrubErrs) > 0 {
-		for _, e := range scrubErrs {
-			fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "repair", e)
-		}
-		return exitInternal
-	}
-	return exitOK
-}
-
 // scrubVetoOriginalSiblings removes every `*.veto-original` entry in dir.
 // Layer 2 shims (install-shims output) must NEVER have `.veto-original`
 // siblings — those are owned by Layer 4 wrap sites registered in
