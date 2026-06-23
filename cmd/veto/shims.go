@@ -127,6 +127,27 @@ func runInstallShims(logger zerolog.Logger, args []string) int {
 		}
 	}
 
+	// Scrub stale `.veto-original` siblings in the shim dir. Layer 2 shims
+	// MUST NOT have `.veto-original` siblings — those belong to Layer 4
+	// wrap sites that are registered in wrappers.json. If a previous
+	// install-shims (or a different veto build) ever left siblings here,
+	// they can chain back into veto itself and cause exec loops or stalls
+	// — most visibly when veto is invoked as a python3 shim from agent
+	// spawn contexts (see veto-dzk epic). Idempotent: no-op if none exist.
+	scrubbed, scrubErrs := scrubVetoOriginalSiblings(dir, dryRun)
+	for _, p := range scrubbed {
+		if dryRun {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      would remove stale Layer 2 sibling %s\n", "scrub", p)
+		} else {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      removed stale Layer 2 sibling %s\n", "scrub", p)
+		}
+		hadAction = true
+	}
+	for _, e := range scrubErrs {
+		hadFailure = true
+		fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "scrub", e)
+	}
+
 	if hadAction && !dryRun {
 		printPathOrderingHint(os.Stdout, dir)
 	}
@@ -135,6 +156,97 @@ func runInstallShims(logger zerolog.Logger, args []string) int {
 		return exitInternal
 	}
 	return exitOK
+}
+
+// runRepairShims implements `veto repair-shims [--dir DIR] [--dry-run]`.
+//
+// Recovery path for the Layer 2 invariant "no `.veto-original` siblings in
+// the shim dir." Mirrors install-shims's scrub pass without otherwise
+// touching the shim symlinks themselves. Use when doctor reports stale
+// siblings but a full install-shims run is undesirable (e.g. CI, or when
+// versioned-python discovery would create new shims you don't want).
+func runRepairShims(logger zerolog.Logger, args []string) int {
+	flags, err := parseShimFlags(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "veto: %v\n", err)
+		return exitUsage
+	}
+	dir, dryRun := flags.dir, flags.dryRun
+
+	if _, err := os.Stat(dir); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      shim dir %s does not exist; nothing to repair\n", "repair", dir)
+			return exitOK
+		}
+		logger.Error().Err(err).Str("dir", dir).Msg("stat shim dir")
+		return exitInternal
+	}
+
+	scrubbed, scrubErrs := scrubVetoOriginalSiblings(dir, dryRun)
+	if len(scrubbed) == 0 && len(scrubErrs) == 0 {
+		fmt.Fprintf(os.Stdout, "  %-12s  ok      no stale Layer 2 siblings under %s\n", "repair", dir)
+		return exitOK
+	}
+	for _, p := range scrubbed {
+		if dryRun {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      would remove stale Layer 2 sibling %s\n", "repair", p)
+		} else {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      removed stale Layer 2 sibling %s\n", "repair", p)
+		}
+	}
+	if len(scrubErrs) > 0 {
+		for _, e := range scrubErrs {
+			fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "repair", e)
+		}
+		return exitInternal
+	}
+	return exitOK
+}
+
+// scrubVetoOriginalSiblings removes every `*.veto-original` entry in dir.
+// Layer 2 shims (install-shims output) must NEVER have `.veto-original`
+// siblings — those are owned by Layer 4 wrap sites registered in
+// wrappers.json. If an older install-shims (or a hand-edit) left siblings
+// behind, they can chain back into veto itself, producing exec loops or
+// silent stalls in agent spawn contexts.
+//
+// Returns the paths actually removed (or that would be removed under
+// dryRun) plus any per-entry errors. The directory itself is not created;
+// callers handle that. Missing dir is treated as "no siblings present" by
+// returning (nil, nil).
+//
+// We do NOT consult wrappers.json here: by construction, Layer 2 shim dirs
+// are never registered as Layer 4 wrap sites, so any `.veto-original` here
+// is stale. Cross-layer collision would be a deeper invariant violation
+// and is detected by doctor, not by install-shims.
+func scrubVetoOriginalSiblings(dir string, dryRun bool) ([]string, []error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, []error{errors.With(err, "scrub: read shim dir").Set("dir", dir)}
+	}
+	var removed []string
+	var errsOut []error
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".veto-original") {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		if dryRun {
+			removed = append(removed, full)
+			continue
+		}
+		if err := os.Remove(full); err != nil {
+			errsOut = append(errsOut, errors.With(err, "scrub: remove stale sibling").Set("path", full))
+			continue
+		}
+		removed = append(removed, full)
+	}
+	sort.Strings(removed)
+	return removed, errsOut
 }
 
 // discoverVersionedPythons enumerates every `python3.X` (or

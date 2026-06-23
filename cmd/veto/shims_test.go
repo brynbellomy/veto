@@ -281,6 +281,160 @@ func TestRunInstallShims_CreatesVersionedPythonShims(t *testing.T) {
 	}
 }
 
+// TestScrubVetoOriginalSiblings_RemovesPlanted is the unit-level
+// guarantee behind the Layer 2 invariant "no .veto-original siblings in
+// the shim dir." We plant a mix of stale siblings (symlinks pointing at
+// a fake veto + a regular file with the suffix) alongside normal shim
+// symlinks, then assert the scrub removes only the .veto-original
+// entries and leaves real shims alone.
+func TestScrubVetoOriginalSiblings_RemovesPlanted(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "..", "fake-veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+
+	// Plant a normal shim that must survive.
+	npm := filepath.Join(dir, "npm")
+	require.NoError(t, os.Symlink(veto, npm))
+
+	// Plant a handful of stale .veto-original siblings: self-referential
+	// symlinks (the dzk-observed state) plus one regular file.
+	planted := []string{
+		filepath.Join(dir, "python3.veto-original"),
+		filepath.Join(dir, "python3.10.veto-original"),
+		filepath.Join(dir, "python3.11.veto-original"),
+		filepath.Join(dir, "python3.12.veto-original"),
+	}
+	for _, p := range planted {
+		require.NoError(t, os.Symlink(veto, p))
+	}
+	regular := filepath.Join(dir, "pip.veto-original")
+	require.NoError(t, os.WriteFile(regular, []byte("garbage"), 0o644))
+
+	removed, errs := scrubVetoOriginalSiblings(dir, false)
+	require.Empty(t, errs)
+	require.Len(t, removed, len(planted)+1)
+
+	// All planted siblings are gone.
+	for _, p := range append(planted, regular) {
+		_, err := os.Lstat(p)
+		require.True(t, os.IsNotExist(err), "scrub left behind %s", p)
+	}
+	// Normal shim survives.
+	_, err := os.Lstat(npm)
+	require.NoError(t, err, "scrub must not touch the npm shim")
+}
+
+// TestScrubVetoOriginalSiblings_NoOpWhenClean proves the scrub is
+// idempotent: re-running on an already-clean dir does nothing.
+func TestScrubVetoOriginalSiblings_NoOpWhenClean(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "..", "fake-veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.Symlink(veto, filepath.Join(dir, "npm")))
+
+	removed, errs := scrubVetoOriginalSiblings(dir, false)
+	require.Empty(t, errs)
+	require.Empty(t, removed)
+}
+
+// TestScrubVetoOriginalSiblings_DryRunDoesNotMutate proves dryRun
+// reports what would be removed without touching the filesystem.
+func TestScrubVetoOriginalSiblings_DryRunDoesNotMutate(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "..", "fake-veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+	planted := filepath.Join(dir, "python3.veto-original")
+	require.NoError(t, os.Symlink(veto, planted))
+
+	removed, errs := scrubVetoOriginalSiblings(dir, true)
+	require.Empty(t, errs)
+	require.Equal(t, []string{planted}, removed)
+	// Still on disk.
+	_, err := os.Lstat(planted)
+	require.NoError(t, err)
+}
+
+// TestScrubVetoOriginalSiblings_MissingDir proves an absent shim dir is
+// reported as "no siblings present" rather than an error. Mirrors
+// repair-shims's "nothing to do" branch.
+func TestScrubVetoOriginalSiblings_MissingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "does-not-exist")
+	removed, errs := scrubVetoOriginalSiblings(dir, false)
+	require.Empty(t, removed)
+	require.Empty(t, errs)
+}
+
+// TestRunInstallShims_ScrubsStaleSiblings drives runInstallShims through
+// a tempdir prepped with stale `<name>.veto-original` siblings and
+// asserts they are gone after the install completes.
+func TestRunInstallShims_ScrubsStaleSiblings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	shimDir := filepath.Join(home, "shimout")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	// Plant stale siblings BEFORE install-shims runs. These are the
+	// real-world bryn-box state: symlinks back into the veto binary.
+	planted := []string{
+		filepath.Join(shimDir, "python3.veto-original"),
+		filepath.Join(shimDir, "python3.12.veto-original"),
+	}
+	for _, p := range planted {
+		require.NoError(t, os.Symlink("/usr/local/bin/veto-fake", p))
+	}
+
+	rc := runInstallShims(zerologNop(), []string{"--dir", shimDir})
+	require.Equal(t, exitOK, rc)
+
+	for _, p := range planted {
+		_, err := os.Lstat(p)
+		require.True(t, os.IsNotExist(err), "install-shims must scrub stale sibling %s", p)
+	}
+}
+
+// TestRunRepairShims_HappyPath proves the standalone `veto repair-shims`
+// command removes stale siblings without otherwise touching shim
+// symlinks.
+func TestRunRepairShims_HappyPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	shimDir := filepath.Join(home, "repair-target")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	// One real shim that must survive.
+	veto := filepath.Join(home, "fake-veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+	npm := filepath.Join(shimDir, "npm")
+	require.NoError(t, os.Symlink(veto, npm))
+
+	// One stale sibling that must be removed.
+	stale := filepath.Join(shimDir, "python3.veto-original")
+	require.NoError(t, os.Symlink(veto, stale))
+
+	rc := runRepairShims(zerologNop(), []string{"--dir", shimDir})
+	require.Equal(t, exitOK, rc)
+
+	_, err := os.Lstat(stale)
+	require.True(t, os.IsNotExist(err), "repair-shims must remove stale sibling")
+	_, err = os.Lstat(npm)
+	require.NoError(t, err, "repair-shims must NOT touch real shims")
+}
+
+// TestRunRepairShims_MissingDir proves repair-shims exits cleanly when
+// the shim dir does not exist (i.e. there is nothing to repair). The
+// command is operational glue and shouldn't fail in this case.
+func TestRunRepairShims_MissingDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	shimDir := filepath.Join(home, "absent")
+
+	rc := runRepairShims(zerologNop(), []string{"--dir", shimDir})
+	require.Equal(t, exitOK, rc)
+}
+
 // TestRunInstallShims_DryRunDoesNotMutate proves --dry-run lists what
 // would be done without touching the filesystem.
 func TestRunInstallShims_DryRunDoesNotMutate(t *testing.T) {
