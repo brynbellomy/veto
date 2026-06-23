@@ -189,6 +189,28 @@ func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags
 		return exitInternal, wrapperStats{}
 	}
 
+	// Convergence: prune stale wrappers.json entries before doing
+	// anything else. An entry is stale when either the recorded path no
+	// longer exists on disk (uninstalled, mise upgrade renamed the
+	// version dir, manual cleanup) OR the `.veto-original` sibling is
+	// missing (repair-shims removed it, manual delete). Without this
+	// reconcile pass install-wrappers only ADDS — drifted state stays
+	// drifted forever and doctor FAILs the entries indefinitely.
+	prunedStale, dirty := pruneStaleWrapperEntries(&state)
+	for _, p := range prunedStale {
+		if opts.dryRun {
+			fmt.Printf("  %-10s  ok    would prune stale entry: %s — %s\n", "prune", p.Path, p.Reason)
+		} else {
+			fmt.Printf("  %-10s  ok    pruned stale entry: %s — %s\n", "prune", p.Path, p.Reason)
+		}
+	}
+	if dirty && !opts.dryRun {
+		if err := saveWrapperState(cfg, state); err != nil {
+			logger.Error().Err(err).Msg("save wrapper state (prune stale)")
+			return exitInternal, wrapperStats{}
+		}
+	}
+
 	// Discovery includes already-ours paths, so empty candidates now
 	// genuinely means nothing on disk — no PMs in known dirs at all.
 	if len(candidates) == 0 {
@@ -1031,6 +1053,63 @@ func (s *wrapperState) has(path string) bool {
 		}
 	}
 	return false
+}
+
+// stalePruneRecord describes one entry pruneStaleWrapperEntries removed
+// from state, so the caller can log a per-entry line. Reason is one of
+// "path missing" / "sibling missing" — the two failure modes that mean
+// "the registry is out of sync with disk."
+type stalePruneRecord struct {
+	Path   string
+	Reason string
+}
+
+// pruneStaleWrapperEntries drops every wrappers.json entry whose
+// on-disk anchors no longer exist. An entry survives only when BOTH
+// its `Path` exists AND its `<Path>.veto-original` sibling exists. If
+// either is missing, the entry no longer reflects reality and any
+// downstream operation that trusts it (notably uninstall-wrappers)
+// will mis-behave. Returns the list of pruned entries (for logging)
+// and a dirty flag indicating whether state was modified.
+//
+// Convergence semantics: this runs at the top of every install-wrappers
+// pass. It is the reconciliation step that lets a single
+// `veto install-all` recover from drift caused by repair-* runs, mise
+// upgrades, manual cleanup, or earlier veto versions. We do NOT attempt
+// to re-wrap missing entries — discovery will find any new live PM in
+// the same dir and wrap it on its own. Drop, don't heal.
+func pruneStaleWrapperEntries(state *wrapperState) ([]stalePruneRecord, bool) {
+	kept := make([]wrapperEntry, 0, len(state.Wrappers))
+	var pruned []stalePruneRecord
+	for _, w := range state.Wrappers {
+		reason := ""
+		if _, err := os.Lstat(w.Path); err != nil {
+			if os.IsNotExist(err) {
+				reason = "path missing"
+			}
+		}
+		if reason == "" {
+			sibling := w.OriginalPath
+			if sibling == "" {
+				sibling = w.Path + wrapperSuffix
+			}
+			if _, err := os.Lstat(sibling); err != nil {
+				if os.IsNotExist(err) {
+					reason = "sibling missing"
+				}
+			}
+		}
+		if reason != "" {
+			pruned = append(pruned, stalePruneRecord{Path: w.Path, Reason: reason})
+			continue
+		}
+		kept = append(kept, w)
+	}
+	if len(pruned) == 0 {
+		return nil, false
+	}
+	state.Wrappers = kept
+	return pruned, true
 }
 
 // loadWrapperState reads the state file. Missing file is not an error;

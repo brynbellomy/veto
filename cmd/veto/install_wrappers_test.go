@@ -1111,3 +1111,82 @@ func TestUnwritableRemediationCommands_GroupsByDir(t *testing.T) {
 		"sudo veto install-wrappers --dir /opt/locked/bin --only npm",
 	}, cmds)
 }
+
+// TestPruneStaleWrapperEntries_DropsMissingPathAndSibling proves the
+// convergence pass at the top of install-wrappers reconciles
+// wrappers.json against disk: any entry whose Path is missing OR whose
+// .veto-original sibling is missing gets dropped. Without this,
+// install-wrappers only ADDS — drifted state stays drifted forever and
+// doctor FAILs the entries indefinitely.
+func TestPruneStaleWrapperEntries_DropsMissingPathAndSibling(t *testing.T) {
+	dir := t.TempDir()
+
+	// Entry 1: legit, both path and sibling exist.
+	legitPath := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(legitPath, []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.WriteFile(legitPath+".veto-original", []byte("real"), 0o755))
+
+	// Entry 2: path is missing — pruned.
+	missingPath := filepath.Join(dir, "pnpm")
+
+	// Entry 3: path exists but sibling is missing — pruned.
+	noSibling := filepath.Join(dir, "yarn")
+	require.NoError(t, os.WriteFile(noSibling, []byte("#!/bin/sh\n"), 0o755))
+
+	state := wrapperState{Wrappers: []wrapperEntry{
+		{Path: legitPath, OriginalPath: legitPath + ".veto-original", PM: "npm"},
+		{Path: missingPath, OriginalPath: missingPath + ".veto-original", PM: "pnpm"},
+		{Path: noSibling, OriginalPath: noSibling + ".veto-original", PM: "yarn"},
+	}}
+
+	pruned, dirty := pruneStaleWrapperEntries(&state)
+	require.True(t, dirty)
+	require.Len(t, pruned, 2)
+	require.Len(t, state.Wrappers, 1)
+	require.Equal(t, legitPath, state.Wrappers[0].Path)
+
+	// Reasons are surfaced for logging.
+	reasonByPath := map[string]string{}
+	for _, p := range pruned {
+		reasonByPath[p.Path] = p.Reason
+	}
+	require.Equal(t, "path missing", reasonByPath[missingPath])
+	require.Equal(t, "sibling missing", reasonByPath[noSibling])
+}
+
+// TestPruneStaleWrapperEntries_NoOpWhenClean proves the prune leaves
+// state untouched (dirty=false, no records) when every entry is
+// reflected on disk.
+func TestPruneStaleWrapperEntries_NoOpWhenClean(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(path, []byte(""), 0o755))
+	require.NoError(t, os.WriteFile(path+".veto-original", []byte(""), 0o755))
+
+	state := wrapperState{Wrappers: []wrapperEntry{{
+		Path: path, OriginalPath: path + ".veto-original", PM: "npm",
+	}}}
+	before := state
+	pruned, dirty := pruneStaleWrapperEntries(&state)
+	require.False(t, dirty)
+	require.Nil(t, pruned)
+	require.Equal(t, before, state)
+}
+
+// TestPruneStaleWrapperEntries_FallsBackToImpliedSibling proves an
+// entry that omits OriginalPath (older registry entries didn't always
+// set it) still has its sibling checked at <Path>.veto-original.
+func TestPruneStaleWrapperEntries_FallsBackToImpliedSibling(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(path, []byte(""), 0o755))
+	// NO sibling file — implied <path>.veto-original is absent.
+
+	state := wrapperState{Wrappers: []wrapperEntry{{
+		Path: path, OriginalPath: "", PM: "npm",
+	}}}
+	pruned, dirty := pruneStaleWrapperEntries(&state)
+	require.True(t, dirty)
+	require.Len(t, pruned, 1)
+	require.Equal(t, "sibling missing", pruned[0].Reason)
+}
