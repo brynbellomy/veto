@@ -26,18 +26,19 @@ import (
 // IsShimDir reports whether dir is a $PATH entry the host survey should
 // skip when looking for PM binaries to wrap.
 //
-// Two reasons to skip:
+// It returns true only for directories that are the exclusive territory
+// of a known version-manager shim system: mise, asdf, pyenv, or nvm.
+// These managers own every entry in their shim dirs and re-create them
+// on activate; wrapping would fight the manager every time. The install
+// dirs the shims point AT are in WellKnownBinDirs and ARE wrap
+// candidates.
 //
-//   - veto's own Layer-2 shim dir (typically ~/.local/bin), recognised
-//     by containing a symlink whose physical target resolves to a
-//     "veto" binary. Surveying that dir would flag veto's own shim as
-//     a Layer-4 wrap candidate, which is wrong — Layer-2 and Layer-4
-//     are different defenses at different paths.
-//   - Version-manager shim dirs (mise/asdf/pyenv/nvm): their entries
-//     are wrapper scripts the version manager owns and re-creates on
-//     activate. Wrapping these would fight the manager every time the
-//     user runs `mise activate`. The install dirs the shims point AT
-//     are in WellKnownBinDirs and ARE wrap candidates.
+// Directories that merely contain a veto wrapper (from a prior
+// install-wrappers run) alongside unrelated binaries are NOT shim
+// dirs — veto's wrappers coexist with other content in normal bin dirs
+// like ~/.cargo/bin, and the remaining binaries there are still valid
+// wrap candidates. The distinguishing test is "whose exclusive
+// territory is this?", not "does this dir contain a veto symlink?".
 //
 // Path matching is substring-based to cover macOS and Linux layouts
 // uniformly.
@@ -51,29 +52,14 @@ func IsShimDir(dir string) bool {
 	if strings.Contains(dir, "/.nvm/versions/") || strings.Contains(dir, "/nvm/versions/node/") {
 		return true
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if e.Type()&os.ModeSymlink == 0 {
-			continue
-		}
-		resolved, err := filepath.EvalSymlinks(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		if strings.Contains(filepath.Base(resolved), "veto") {
-			return true
-		}
-	}
 	return false
 }
 
 // WellKnownBinDirs returns every bin-dir pattern on this host where a
 // system or version-manager-installed PM could live: the homebrew
 // prefixes plus mise/asdf install bin dirs (one per installed
-// tool@version), plus pyenv/nvm versions, plus ~/.bun/bin.
+// tool@version), plus pyenv/nvm versions, plus ~/.bun/bin and
+// ~/.cargo/bin.
 //
 // Patterns that depend on $HOME silently return empty when $HOME is
 // unset; callers fall back to whatever WellKnownBinDirs returned plus
@@ -89,6 +75,7 @@ func WellKnownBinDirs() []string {
 	out = append(out, globVersionBinDirs(filepath.Join(home, ".pyenv", "versions"))...)
 	out = append(out, globVersionBinDirs(filepath.Join(home, ".nvm", "versions", "node"))...)
 	out = append(out, filepath.Join(home, ".bun", "bin"))
+	out = append(out, filepath.Join(home, ".cargo", "bin"))
 	return out
 }
 

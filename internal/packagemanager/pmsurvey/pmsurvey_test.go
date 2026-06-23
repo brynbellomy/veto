@@ -31,13 +31,24 @@ func TestIsShimDirMatchesVersionManagerShimPaths(t *testing.T) {
 	require.True(t, pmsurvey.IsShimDir("/home/x/.nvm/versions/node/v20/bin"))
 }
 
-func TestIsShimDirDetectsVetoLayer2ShimDir(t *testing.T) {
+// TestIsShimDirRejectsDirWithVetoWrappers proves a normal bin dir that
+// contains veto wrappers alongside unrelated content is NOT a shim dir.
+// The veto-symlink heuristic was dropped because it was a false-positive
+// magnet: every dir where veto had previously wrapped one binary (e.g.
+// ~/.cargo/bin with a uvx→veto wrapper) was skipped entirely, hiding
+// real wrap candidates like cargo from PathsFor.
+func TestIsShimDirRejectsDirWithVetoWrappers(t *testing.T) {
 	dir := t.TempDir()
-	// Plant a fake "veto" binary somewhere and symlink an "npm" entry to it.
-	vetoBin := filepath.Join(dir, "..", "bin", "veto")
+	// Simulate ~/.cargo/bin after install-wrappers: uvx is a veto
+	// wrapper, uvx.veto-original is the real binary, and cargo is an
+	// unrelated (unwrapped) binary.
+	vetoBin := filepath.Join(t.TempDir(), "bin", "veto")
 	writeExec(t, vetoBin)
-	writeSymlink(t, filepath.Join(dir, "npm"), vetoBin)
-	require.True(t, pmsurvey.IsShimDir(dir), "veto-named symlink target should mark dir as a shim dir")
+	writeSymlink(t, filepath.Join(dir, "uvx"), vetoBin)
+	writeExec(t, filepath.Join(dir, "uvx.veto-original"))
+	writeExec(t, filepath.Join(dir, "cargo"))
+	require.False(t, pmsurvey.IsShimDir(dir),
+		"dir containing veto wrappers AND unrelated binaries must not be a shim dir")
 }
 
 func TestIsShimDirRejectsRegularBinDir(t *testing.T) {
@@ -111,6 +122,11 @@ func TestWellKnownBinDirsIncludesHomebrew(t *testing.T) {
 	got := pmsurvey.WellKnownBinDirs()
 	require.Contains(t, got, "/opt/homebrew/bin")
 	require.Contains(t, got, "/usr/local/bin")
+	// ~/.cargo/bin is a belt-and-suspenders addition so cargo surfaces
+	// even when $PATH happens not to include it (e.g. restricted envs).
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+	require.Contains(t, got, filepath.Join(home, ".cargo", "bin"))
 }
 
 func TestPathsForDeduplicates(t *testing.T) {
