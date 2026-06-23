@@ -264,7 +264,7 @@ func run(args []string) int {
 	case "status":
 		return runStatus(logger, cfg)
 	case "install-shims":
-		return runInstallShims(logger, args[1:])
+		return runInstallShims(logger, cfg, args[1:])
 	case "uninstall-shims":
 		return runUninstallShims(logger, args[1:])
 	case "repair-shims":
@@ -276,9 +276,9 @@ func run(args []string) int {
 	case "uninstall-claude-hook":
 		return runUninstallClaudeHook(logger, args[1:])
 	case "install-codex":
-		return runInstallCodex(logger, args[1:])
+		return runInstallCodex(logger, cfg, args[1:])
 	case "install-cursor":
-		return runInstallCursor(logger, args[1:])
+		return runInstallCursor(logger, cfg, args[1:])
 	case "install-shell":
 		return runInstallShell(logger, args[1:])
 	case "uninstall-shell":

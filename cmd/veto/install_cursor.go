@@ -43,7 +43,7 @@ import (
 )
 
 // runInstallCursor implements install-cursor for project rules and PATH shims.
-func runInstallCursor(logger zerolog.Logger, args []string) int {
+func runInstallCursor(logger zerolog.Logger, cfg config, args []string) int {
 	fs := flag.NewFlagSet("install-cursor", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	projectDir := fs.String("project-dir", "", "directory in which to write .cursor/rules/veto.mdc (default: current working directory)")
@@ -65,7 +65,7 @@ func runInstallCursor(logger zerolog.Logger, args []string) int {
 		if *force {
 			shimArgs = append(shimArgs, "--force")
 		}
-		if rc := runInstallShims(logger, shimArgs); rc != exitOK {
+		if rc := runInstallShims(logger, cfg, shimArgs); rc != exitOK {
 			return rc
 		}
 	} else {

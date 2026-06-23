@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -265,7 +266,8 @@ func TestRunInstallShims_CreatesVersionedPythonShims(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(uvBin, "python3.12"), []byte("#!/bin/sh\n"), 0o755))
 
 	logger := zerologNop()
-	rc := runInstallShims(logger, []string{"--dir", shimDir})
+	cfg := config{CacheDir: filepath.Join(home, ".cache", "veto")}
+	rc := runInstallShims(logger, cfg, []string{"--dir", shimDir})
 	require.Equal(t, exitOK, rc, "install-shims should succeed")
 
 	// python3.12 shim must exist and be a symlink to the resolved veto
@@ -384,7 +386,8 @@ func TestRunInstallShims_ScrubsStaleSiblings(t *testing.T) {
 		require.NoError(t, os.Symlink("/usr/local/bin/veto-fake", p))
 	}
 
-	rc := runInstallShims(zerologNop(), []string{"--dir", shimDir})
+	cfg := config{CacheDir: filepath.Join(home, ".cache", "veto")}
+	rc := runInstallShims(zerologNop(), cfg, []string{"--dir", shimDir})
 	require.Equal(t, exitOK, rc)
 
 	for _, p := range planted {
@@ -448,9 +451,155 @@ func TestRunInstallShims_DryRunDoesNotMutate(t *testing.T) {
 	require.NoError(t, os.MkdirAll(uvBin, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(uvBin, "python3.12"), []byte("#!/bin/sh\n"), 0o755))
 
-	rc := runInstallShims(zerologNop(), []string{"--dir", shimDir, "--dry-run"})
+	cfg := config{CacheDir: filepath.Join(home, ".cache", "veto")}
+	rc := runInstallShims(zerologNop(), cfg, []string{"--dir", shimDir, "--dry-run"})
 	require.Equal(t, exitOK, rc)
 	// Shim dir must NOT exist after dry-run.
 	_, err := os.Lstat(shimDir)
 	require.True(t, os.IsNotExist(err), "dry-run must not create the shim dir")
+}
+
+// TestPruneWrappersInShimDir_DropsShimDirEntries is the unit-level
+// guarantee behind the Layer 2/Layer 4 territory rule: install-shims
+// must reconcile wrappers.json against the shim dir and remove any
+// entry whose Path is inside it. Without this, a stale shim-dir entry
+// sends recovery commands (notably uninstall-wrappers) on a destructive
+// path through the Layer 2 shims themselves — the exact failure mode
+// that broke veto-dzk's recovery on bryn's machine.
+func TestPruneWrappersInShimDir_DropsShimDirEntries(t *testing.T) {
+	cacheDir := t.TempDir()
+	shimDir := t.TempDir()
+	cfg := config{CacheDir: cacheDir}
+
+	// One legit Layer 4 wrapper (homebrew layout) that MUST survive.
+	legit := wrapperEntry{
+		Path:         "/opt/homebrew/bin/npm",
+		OriginalPath: "/opt/homebrew/bin/npm.veto-original",
+		PM:           "npm",
+		Source:       "homebrew",
+	}
+	// Two bogus shim-dir entries that MUST be removed.
+	bogus := []wrapperEntry{
+		{
+			Path:         filepath.Join(shimDir, "python3"),
+			OriginalPath: filepath.Join(shimDir, "python3.veto-original"),
+			PM:           "python3",
+			Source:       "path",
+		},
+		{
+			Path:         filepath.Join(shimDir, "npm"),
+			OriginalPath: filepath.Join(shimDir, "npm.veto-original"),
+			PM:           "npm",
+			Source:       "path",
+		},
+	}
+	state := wrapperState{Wrappers: append([]wrapperEntry{legit}, bogus...)}
+	require.NoError(t, saveWrapperState(cfg, state))
+
+	pruned, err := pruneWrappersInShimDir(cfg, shimDir, false)
+	require.NoError(t, err)
+	require.Len(t, pruned, 2, "expected both shim-dir entries pruned")
+
+	// Reload state and check the legit entry survived.
+	got, err := loadWrapperState(cfg)
+	require.NoError(t, err)
+	require.Len(t, got.Wrappers, 1)
+	require.Equal(t, legit.Path, got.Wrappers[0].Path)
+}
+
+// TestPruneWrappersInShimDir_NoOpWhenClean proves the prune is idempotent
+// when no entries point into the shim dir.
+func TestPruneWrappersInShimDir_NoOpWhenClean(t *testing.T) {
+	cacheDir := t.TempDir()
+	shimDir := t.TempDir()
+	cfg := config{CacheDir: cacheDir}
+
+	state := wrapperState{Wrappers: []wrapperEntry{
+		{Path: "/opt/homebrew/bin/npm", PM: "npm", Source: "homebrew"},
+		{Path: "/usr/local/bin/pnpm", PM: "pnpm", Source: "homebrew"},
+	}}
+	require.NoError(t, saveWrapperState(cfg, state))
+
+	pruned, err := pruneWrappersInShimDir(cfg, shimDir, false)
+	require.NoError(t, err)
+	require.Empty(t, pruned)
+
+	got, err := loadWrapperState(cfg)
+	require.NoError(t, err)
+	require.Len(t, got.Wrappers, 2)
+}
+
+// TestPruneWrappersInShimDir_MissingStateFile proves prune is a clean
+// no-op when wrappers.json does not exist yet — install-shims must be
+// safe to run on a host that has never touched Layer 4.
+func TestPruneWrappersInShimDir_MissingStateFile(t *testing.T) {
+	cacheDir := t.TempDir()
+	shimDir := t.TempDir()
+	cfg := config{CacheDir: cacheDir}
+
+	pruned, err := pruneWrappersInShimDir(cfg, shimDir, false)
+	require.NoError(t, err)
+	require.Empty(t, pruned)
+}
+
+// TestPruneWrappersInShimDir_DryRunDoesNotMutate proves dryRun reports
+// what would be removed without rewriting wrappers.json.
+func TestPruneWrappersInShimDir_DryRunDoesNotMutate(t *testing.T) {
+	cacheDir := t.TempDir()
+	shimDir := t.TempDir()
+	cfg := config{CacheDir: cacheDir}
+
+	state := wrapperState{Wrappers: []wrapperEntry{
+		{Path: filepath.Join(shimDir, "python3"), PM: "python3"},
+	}}
+	require.NoError(t, saveWrapperState(cfg, state))
+
+	// Snapshot bytes before for byte-equality comparison after.
+	wantBytes, err := os.ReadFile(filepath.Join(cacheDir, "wrappers.json"))
+	require.NoError(t, err)
+
+	pruned, err := pruneWrappersInShimDir(cfg, shimDir, true)
+	require.NoError(t, err)
+	require.Len(t, pruned, 1)
+
+	gotBytes, err := os.ReadFile(filepath.Join(cacheDir, "wrappers.json"))
+	require.NoError(t, err)
+	require.Equal(t, wantBytes, gotBytes, "dry-run must not touch wrappers.json")
+}
+
+// TestRunInstallShims_PrunesShimDirWrappersJSON is the integration-level
+// guarantee for the veto-u6c fix: drive runInstallShims through a
+// tempdir where wrappers.json contains a bogus shim-dir entry alongside
+// a legit Layer 4 entry. After install-shims, only the legit one remains.
+func TestRunInstallShims_PrunesShimDirWrappersJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	shimDir := filepath.Join(home, "shimout")
+	cacheDir := filepath.Join(home, ".cache", "veto")
+	cfg := config{CacheDir: cacheDir}
+
+	// Plant a wrappers.json containing one legit entry + one bogus
+	// shim-dir entry (the exact disaster case from veto-dzk).
+	state := wrapperState{Wrappers: []wrapperEntry{
+		{Path: "/opt/homebrew/bin/npm", PM: "npm", Source: "homebrew"},
+		{Path: filepath.Join(shimDir, "python3"), PM: "python3", Source: "path"},
+	}}
+	require.NoError(t, saveWrapperState(cfg, state))
+
+	rc := runInstallShims(zerologNop(), cfg, []string{"--dir", shimDir})
+	require.Equal(t, exitOK, rc)
+
+	// Reload and assert only the legit entry survives.
+	got, err := loadWrapperState(cfg)
+	require.NoError(t, err)
+	require.Len(t, got.Wrappers, 1, "shim-dir entry must be pruned, legit entry must remain")
+	require.Equal(t, "/opt/homebrew/bin/npm", got.Wrappers[0].Path)
+
+	// Sanity: the persisted file is still valid JSON (no truncation).
+	data, err := os.ReadFile(filepath.Join(cacheDir, "wrappers.json"))
+	require.NoError(t, err)
+	var roundtrip wrapperState
+	require.NoError(t, json.Unmarshal(data, &roundtrip))
+	require.Len(t, roundtrip.Wrappers, 1)
 }

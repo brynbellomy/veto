@@ -63,9 +63,16 @@ var shimmedManagers = pmlist.Shimmed
 //     --force. Replacing real binaries silently is exactly the kind of
 //     surprise a security tool should not cause.
 //
+// Convergence: every run also reconciles wrappers.json against the shim
+// dir, removing any Layer 4 entry whose path lies inside DIR. The two
+// layers must never share territory — a stray shim-dir entry in
+// wrappers.json is the failure mode that broke recovery during the
+// veto-dzk debacle (uninstall-wrappers followed the bogus entries and
+// destroyed the Layer 2 shims themselves).
+//
 // --dry-run lists every shim that would be created / updated / left
 // alone without touching the filesystem.
-func runInstallShims(logger zerolog.Logger, args []string) int {
+func runInstallShims(logger zerolog.Logger, cfg config, args []string) int {
 	flags, err := parseShimFlags(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "veto: %v\n", err)
@@ -146,6 +153,26 @@ func runInstallShims(logger zerolog.Logger, args []string) int {
 	for _, e := range scrubErrs {
 		hadFailure = true
 		fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "scrub", e)
+	}
+
+	// Convergence: prune any wrappers.json entry whose path is inside the
+	// shim dir. Layer 2 and Layer 4 must not share territory; a Layer 4
+	// entry pointing into the shim dir is the bug that broke veto-dzk's
+	// recovery — uninstall-wrappers followed the bogus entries and
+	// destroyed the Layer 2 shims themselves. Idempotent: no-op if no
+	// shim-dir entries are recorded.
+	pruned, pruneErr := pruneWrappersInShimDir(cfg, dir, dryRun)
+	if pruneErr != nil {
+		hadFailure = true
+		fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "prune", pruneErr)
+	}
+	for _, p := range pruned {
+		if dryRun {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      would prune shim-dir wrapper entry %s\n", "prune", p)
+		} else {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      pruned shim-dir wrapper entry %s\n", "prune", p)
+		}
+		hadAction = true
 	}
 
 	if hadAction && !dryRun {
@@ -247,6 +274,52 @@ func scrubVetoOriginalSiblings(dir string, dryRun bool) ([]string, []error) {
 	}
 	sort.Strings(removed)
 	return removed, errsOut
+}
+
+// pruneWrappersInShimDir reconciles wrappers.json against the Layer 2
+// shim dir. Removes every entry whose `Path` is inside shimDir (after
+// path cleaning so trailing slashes and `~` expansions don't slip past).
+// Layer 2 shims (install-shims output) and Layer 4 wraps (install-wrappers
+// output) must never share territory: an install-wrappers entry pointing
+// into the shim dir is a write-once bug that turns recovery commands into
+// destroyers (uninstall-wrappers blindly follows the bogus entry and
+// removes the actual shim).
+//
+// Returns the paths actually pruned (or that would be pruned under
+// dryRun). Missing wrappers.json is not an error — pruning a non-existent
+// registry is a clean no-op. Save errors propagate so the caller can
+// surface a FAIL row.
+//
+// The check is conservative: only entries strictly inside shimDir are
+// dropped. An entry whose path EQUALS the shimDir itself (impossible by
+// construction, but harmless to defend against) is left alone.
+func pruneWrappersInShimDir(cfg config, shimDir string, dryRun bool) ([]string, error) {
+	state, err := loadWrapperState(cfg)
+	if err != nil {
+		return nil, errors.With(err, "prune: load wrappers.json").Set("cache_dir", cfg.CacheDir)
+	}
+	cleanShim := filepath.Clean(shimDir)
+	prefix := cleanShim + string(filepath.Separator)
+
+	kept := make([]wrapperEntry, 0, len(state.Wrappers))
+	var pruned []string
+	for _, w := range state.Wrappers {
+		cleanPath := filepath.Clean(w.Path)
+		if strings.HasPrefix(cleanPath, prefix) {
+			pruned = append(pruned, w.Path)
+			continue
+		}
+		kept = append(kept, w)
+	}
+	sort.Strings(pruned)
+	if len(pruned) == 0 || dryRun {
+		return pruned, nil
+	}
+	state.Wrappers = kept
+	if err := saveWrapperState(cfg, state); err != nil {
+		return pruned, errors.With(err, "prune: save wrappers.json").Set("cache_dir", cfg.CacheDir)
+	}
+	return pruned, nil
 }
 
 // discoverVersionedPythons enumerates every `python3.X` (or

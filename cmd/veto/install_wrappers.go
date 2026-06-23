@@ -597,9 +597,25 @@ func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([
 		return ok
 	}
 
+	// Defense in depth: refuse to enroll any candidate whose path lies
+	// inside the Layer 2 shim dir. Layer 2 and Layer 4 must not share
+	// territory; if a previous install-wrappers version walked $PATH and
+	// scooped up shim-dir entries (the bug that broke veto-dzk recovery),
+	// this guard prevents the regression even before install-shims
+	// reconciles the registry.
+	shimDirCanonical := filepath.Clean(defaultShimDir())
+	shimPrefix := shimDirCanonical + string(filepath.Separator)
+	inShimDir := func(p string) bool {
+		clean := filepath.Clean(p)
+		return strings.HasPrefix(clean, shimPrefix) || clean == shimDirCanonical
+	}
+
 	seen := map[string]struct{}{}
 	add := func(c wrapCandidate) {
 		if _, dup := seen[c.path]; dup {
+			return
+		}
+		if inShimDir(c.path) {
 			return
 		}
 		seen[c.path] = struct{}{}
