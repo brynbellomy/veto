@@ -64,6 +64,21 @@ veto doctor                        # confirm green
 case; the granular commands above let you skip layers that haven't
 changed.
 
+If `veto doctor` reports stray `*.veto-original` siblings in the
+Layer 2 shim dir (typically `~/.local/bin`), run:
+
+```sh
+veto repair-shims
+```
+
+That scrubs the stale entries without touching real shim symlinks. The
+siblings are an older-install artifact; older versions of veto could
+leave them behind, and at least one shape (self-referential symlinks)
+could trap `veto`-as-python3 in an exec loop on the next invocation.
+See [docs/2026-06-23--python-shim-stall-postmortem.md](docs/2026-06-23--python-shim-stall-postmortem.md)
+for the full failure mode and the runtime + on-disk fixes that ship
+together.
+
 ## What it actually blocks
 
 Tested end-to-end on a macOS / mise / homebrew dev machine against the
