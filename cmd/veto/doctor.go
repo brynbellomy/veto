@@ -625,6 +625,25 @@ func pathExists(path string) bool {
 	return err == nil
 }
 
+// isSIPProtectedPath returns true on macOS when path is under a
+// System Integrity Protection root (/usr/bin, /usr/sbin, /bin, /sbin,
+// /System/...). dyld strips DYLD_INSERT_LIBRARIES from SIP-protected
+// binaries and the directories themselves are read-only, so neither
+// Layer 3 (interposer) nor Layer 4 (wrappers) can cover them. On Linux
+// this always returns false — SIP does not exist there.
+func isSIPProtectedPath(path string) bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	clean := filepath.Clean(path)
+	for _, prefix := range []string{"/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/", "/System/"} {
+		if strings.HasPrefix(clean, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // checkInterposer validates the native-interposer layer. Three checks:
 //   - the preload env var (DYLD_INSERT_LIBRARIES / LD_PRELOAD) is set;
 //   - VETO_PATH is set and points at the veto binary;
@@ -937,6 +956,17 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 				})
 				continue
 			case pmsurvey.ClassReal:
+				if isSIPProtectedPath(path) {
+					out = append(out, checkResult{
+						status: statusNotApplicable,
+						label:  "wrapper:" + pm,
+						detail: fmt.Sprintf("%s (SIP-protected — no defense layer can cover this)", path),
+					})
+					// SIP paths are not "unwrapped" — they're
+					// unwrappable. Don't bump anyUnwrappedFound;
+					// the generic Layer-4 WARN must not count them.
+					continue
+				}
 				// Fall through to the WARN "NOT wrapped" emit below.
 			}
 			// Not wrapped: real binary. The absolute-path invocation skips
