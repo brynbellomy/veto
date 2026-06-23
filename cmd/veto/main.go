@@ -1338,8 +1338,17 @@ func findRealBinary(name string, registered func(string) bool) (string, error) {
 			// attacker planting `<dir>/<name>.veto-original` at any
 			// PATH entry would otherwise hijack execution. Unregistered
 			// siblings are ignored; the loop continues.
+			//
+			// Self-reference guard: mirrors findWrappedOriginal's
+			// isSelfReferential check. Without it, a sibling that
+			// resolves back to the veto binary itself (e.g. a stale
+			// `~/.local/bin/python3.veto-original` symlink pointing
+			// at `~/.local/bin/veto`) would be returned here and
+			// exec'd, producing an infinite re-entry loop — the root
+			// cause of the veto-dzk python-shim stall. PATH walk and
+			// argv[0] lookup must agree on which siblings to trust.
 			if registered != nil && registered(candidate) {
-				if sibling := candidate + ".veto-original"; isExecutableRegularOrSymlink(sibling) {
+				if sibling := candidate + ".veto-original"; isExecutableRegularOrSymlink(sibling) && !isSelfReferential(sibling) {
 					return sibling, nil
 				}
 			}

@@ -752,6 +752,52 @@ func TestFindRealBinary_HonorsRegisteredSibling(t *testing.T) {
 	require.Equal(t, original, got)
 }
 
+// TestFindRealBinary_RejectsSelfReferentialSiblingInPathWalk is the
+// regression guard for the veto-dzk python-shim stall (veto-dzk.2).
+//
+// Before the fix, the PATH-walk branch of findRealBinary honored ANY
+// `<candidate>.veto-original` sibling whose os.Stat said "executable,"
+// even when the sibling chained through symlinks back into veto
+// itself. That produced an immediate exec loop: veto-as-python3 →
+// findRealBinary → returns self-referential .veto-original → veto
+// exec's it → kernel runs veto again → repeat until the process is
+// killed. On bryn's box every ~/.local/bin/python3*.veto-original
+// symlink pointed at ~/.local/bin/veto, the wrap site was registered
+// in wrappers.json, and the loop pegged a CPU core indefinitely.
+//
+// The fix mirrors findWrappedOriginal's `isSelfReferential` guard here
+// so both the argv[0] lookup path and the PATH walk agree on which
+// siblings to reject.
+func TestFindRealBinary_RejectsSelfReferentialSiblingInPathWalk(t *testing.T) {
+	dir := t.TempDir()
+
+	self, err := os.Executable()
+	require.NoError(t, err)
+
+	// `dir/python3` is a symlink to "veto" (the test binary). This puts
+	// the PATH-walk on the branch where the candidate resolves to
+	// selfReal.
+	python3 := filepath.Join(dir, "python3")
+	require.NoError(t, os.Symlink(self, python3))
+
+	// `dir/python3.veto-original` is ALSO a symlink to "veto" — the
+	// exact bryn-box shape captured in the veto-dzk.1 bead.
+	staleOriginal := python3 + ".veto-original"
+	require.NoError(t, os.Symlink(self, staleOriginal))
+
+	t.Setenv("PATH", dir)
+
+	// And the wrap site IS registered (matching the on-disk wrappers.json
+	// on bryn's box — install-wrappers had recorded the ~/.local/bin
+	// python paths).
+	registered := func(p string) bool { return p == python3 }
+
+	_, err = findRealBinary("python3", registered)
+	require.Error(t, err,
+		"PATH-walk must refuse self-referential sibling — exec'ing it would loop veto into itself")
+	require.Contains(t, err.Error(), "not found in PATH")
+}
+
 // TestWrapperRegisteredFunc_MissingStateFailsClosed: when wrappers.json
 // is missing or unreadable, the predicate must report "not registered"
 // for every path. This collapses the resolver to PATH-walk-only,
