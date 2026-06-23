@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/brynbellomy/veto/internal/packagemanager/pmsurvey"
 )
 
 // TestHasVetoClaudeHook covers the matrix of settings.json shapes the
@@ -550,4 +552,121 @@ func TestPrintResults_NAMarkerRendered(t *testing.T) {
 	require.NotContains(t, out, "this should NOT print",
 		"N/A must not emit a how-to-fix arrow line")
 	require.NotContains(t, out, "→", "N/A must not emit the fix-arrow glyph")
+}
+
+// ---------------------------------------------------------------------------
+// SIP-protected path tests
+// ---------------------------------------------------------------------------
+
+func TestIsSIPProtectedPath(t *testing.T) {
+	cases := []struct {
+		path     string
+		wantSIP  bool
+	}{
+		// Canonical SIP roots — binaries inside them are SIP-protected.
+		{"/usr/bin/pip3", true},
+		{"/usr/bin/python3", true},
+		{"/usr/sbin/sysctl", true},
+		{"/bin/sh", true},
+		{"/sbin/launchd", true},
+		{"/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder", true},
+		// Edge cases: path cleanup.
+		{"/usr/bin/../bin/sh", true}, // rare but must not break
+		// Non-SIP paths.
+		{"/opt/homebrew/bin/python3", false},
+		{"/usr/local/bin/pip3", false},
+		{"/Users/x/.local/bin/pip3", false},
+		{"/tmp/pip3", false},
+		{"/", false},
+		{"/usr", false},        // prefix of SIP dir but not inside it
+		{"/System", false},     // ditto
+		{"/usr/bin", false},    // the directory itself, not a file inside
+		{"/usr/binary", false}, // false prefix
+		// Substring false-positive guards.
+		{"/usr/binfoo/pip3", false},
+		{"/usr/local/sbin/thing", false},
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			got := isSIPProtectedPath(c.path)
+			if c.wantSIP {
+				require.True(t, got, "%q should be SIP-protected", c.path)
+			} else {
+				require.False(t, got, "%q should NOT be SIP-protected", c.path)
+			}
+		})
+	}
+}
+
+// TestPrintResults_SIPNAMarker: a SIP-protected binary must render as
+// [N/A] with the SIP reason and must NOT emit a how-to-fix arrow or the
+// "run veto install-wrappers" recommendation.
+func TestPrintResults_SIPNAMarker(t *testing.T) {
+	var buf bytes.Buffer
+	results := []checkResult{
+		{
+			status: statusNotApplicable,
+			label:  "wrapper:pip3",
+			detail: "/usr/bin/pip3 (SIP-protected — no defense layer can cover this)",
+		},
+	}
+	printResults(&buf, results)
+	out := buf.String()
+	require.Contains(t, out, "N/A", "SIP-protected paths must render as N/A")
+	require.Contains(t, out, "wrapper:pip3", "label must appear")
+	require.Contains(t, out, "SIP-protected", "SIP reason must appear")
+	require.Contains(t, out, "no defense layer can cover this", "full reason must be visible")
+	require.NotContains(t, out, "→", "N/A must not emit the fix-arrow glyph")
+	require.NotContains(t, out, "install-wrappers", "SIP-protected binary must not recommend wrapping")
+}
+
+// TestSIPDoesNotCountAsUnwrapped: a SIP-protected real binary must NOT
+// increment anyUnwrappedFound, so the generic Layer-4 WARN does not
+// fire when the only "unwrapped" candidates are SIP-protected. We test
+// this by running checkWrappersWith against a fake vetoid with a
+// real binary at a tempdir path that is NOT in SIP territory — and
+// separately verify the SIP path would be classified as N/A.
+func TestSIPPathIsNotApplicableInWrapperSurvey(t *testing.T) {
+	if hostHasAbsolutePathPM(t) {
+		t.Skip("host has PM installs in /opt/homebrew/bin or /usr/local/bin; can't isolate survey")
+	}
+	if runtime.GOOS != "darwin" {
+		t.Skip("SIP classification only applies on macOS")
+	}
+
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+
+	// A fake veto binary for the survey.
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	// Plant a real binary at a non-SIP path that the survey can find.
+	// Use a known wrapped PM name so PathsFor discovery hits it.
+	pathDir := filepath.Join(tmp, "bin")
+	require.NoError(t, os.MkdirAll(pathDir, 0o755))
+	pmPath := filepath.Join(pathDir, "pip3")
+	require.NoError(t, os.WriteFile(pmPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	t.Setenv("HOME", tmp)
+	t.Setenv("PATH", pathDir)
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	// The tempdir pip3 is not SIP-protected, so it should WARN.
+	r := findResult(t, results, "wrapper:pip3", "NOT wrapped")
+	require.Equal(t, statusWarn, r.status)
+	require.Contains(t, r.howToFix, "install-wrappers")
+
+	// Now verify the classification helper itself on a real SIP path.
+	// We can't plant files in /usr/bin, but we can assert the helper
+	// returns true for well-known SIP paths regardless of whether the
+	// file exists — classification is by path prefix only.
+	require.True(t, isSIPProtectedPath("/usr/bin/pip3"))
+	require.True(t, isSIPProtectedPath("/usr/bin/python3"))
+	require.False(t, isSIPProtectedPath(pmPath))
 }
