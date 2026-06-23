@@ -901,6 +901,19 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 					howToFix: "Delete the symlink. If a sibling `<path>.veto-original` exists (e.g. `.bouncer-original`), restore it to the original name. Then re-run `veto install-wrappers`.",
 				})
 				continue
+			case pmsurvey.ClassPMLayoutSymlink:
+				// State says we wrapped this path, but the current
+				// symlink resolves to a package-manager install (Cellar,
+				// mise, etc.) — almost always the result of a brew /
+				// mise upgrade reinstalling the canonical layout on top
+				// of our wrap. Routine; install-all heals it.
+				out = append(out, checkResult{
+					status:   statusFail,
+					label:    "wrapper:" + w.PM,
+					detail:   fmt.Sprintf("%s now resolves to %s (canonical package-manager install) — wrapper was overwritten, likely by a package upgrade", w.Path, target),
+					howToFix: "Run `veto install-all` (or `veto install-wrappers`) to re-wrap.",
+				})
+				continue
 			case pmsurvey.ClassReal:
 				// info.Mode()&ModeSymlink == 0 already short-circuited above,
 				// so ClassReal should be unreachable here — but defend
@@ -1005,6 +1018,23 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 					label:    "wrapper:" + pm,
 					detail:   fmt.Sprintf("%s is a symlink to %s — foreign wrapper, not veto", path, target),
 					howToFix: "Delete the symlink. If a sibling `<path>.veto-original` exists, restore it. Then re-run `veto install-wrappers`.",
+				})
+				continue
+			case pmsurvey.ClassPMLayoutSymlink:
+				// Symlink into a known package-manager install dir
+				// (Homebrew Cellar, mise install tree, npm-cli.js, etc.).
+				// Wrappable by default — emit the same "NOT wrapped"
+				// WARN as a regular file: install-wrappers will wrap it
+				// without --force.
+				if !anyUnwrappedFound {
+					firstUnwrappedPM = pm
+				}
+				anyUnwrappedFound = true
+				out = append(out, checkResult{
+					status:   statusWarn,
+					label:    "wrapper:" + pm,
+					detail:   fmt.Sprintf("%s (canonical package-manager symlink → %s; NOT wrapped — run veto install-wrappers)", path, target),
+					howToFix: "Run `veto install-wrappers` (or `veto install-all`) to wrap this binary so absolute-path invocations route through veto.",
 				})
 				continue
 			case pmsurvey.ClassReal:

@@ -1234,3 +1234,181 @@ func TestApplyWrapper_ReClassifiesAtWrapTime(t *testing.T) {
 	require.Equal(t, wrapperActionSkipAlreadyOurs, action,
 		"applyWrapper must re-classify and see the live ours-by-path state")
 }
+
+// TestClassifySymlink_PMLayoutSymlink_AppleSiliconHomebrew is the
+// fixture-A guarantee from veto-2dg: a symlink whose target lives
+// inside a canonical Apple Silicon Homebrew Cellar path classifies as
+// ClassPMLayoutSymlink (wrappable by default), NOT ClassForeignWrapper.
+// Without this, every Homebrew-installed Mach-O on a dev machine would
+// be SKIPped as "foreign wrapper" and the user would have to
+// --force every install-wrappers run.
+func TestClassifySymlink_PMLayoutSymlink_AppleSiliconHomebrew(t *testing.T) {
+	root := t.TempDir()
+	// Plant a fake veto.
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto bin"), 0o755))
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// Plant a Cellar-like layout. The classifier matches on the
+	// substring "/homebrew/Cellar/" so a tempdir + that subpath is
+	// recognised exactly like /opt/homebrew/Cellar/.
+	cellarBin := filepath.Join(root, "homebrew", "Cellar", "python@3.14", "3.14.3_1", "bin")
+	require.NoError(t, os.MkdirAll(cellarBin, 0o755))
+	realPython := filepath.Join(cellarBin, "python3.14")
+	require.NoError(t, os.WriteFile(realPython, []byte("real python bytes"), 0o755))
+
+	// Plant the canonical bin/<pm> → Cellar/.../bin/python3.14 symlink.
+	binDir := filepath.Join(root, "homebrew", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	candidate := filepath.Join(binDir, "python3")
+	require.NoError(t, os.Symlink(realPython, candidate))
+
+	class, target, err := pmsurvey.ClassifySymlink(candidate, id)
+	require.NoError(t, err)
+	require.Equal(t, pmsurvey.ClassPMLayoutSymlink, class,
+		"Homebrew Cellar layout must classify as PMLayoutSymlink, not ForeignWrapper; got %s", class)
+	resolved, _ := filepath.EvalSymlinks(realPython)
+	require.Equal(t, resolved, target)
+}
+
+// TestClassifySymlink_PMLayoutSymlink_NpmCliJs proves the npm-cli.js
+// case: /opt/homebrew/bin/npm → /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js
+// classifies as ClassPMLayoutSymlink. The classifier accepts the
+// node_modules subpath as a PM install location.
+func TestClassifySymlink_PMLayoutSymlink_NpmCliJs(t *testing.T) {
+	root := t.TempDir()
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// Plant a Homebrew node_modules layout.
+	cliBin := filepath.Join(root, "homebrew", "lib", "node_modules", "npm", "bin")
+	require.NoError(t, os.MkdirAll(cliBin, 0o755))
+	cliJs := filepath.Join(cliBin, "npm-cli.js")
+	require.NoError(t, os.WriteFile(cliJs, []byte("#!/usr/bin/env node\n"), 0o755))
+
+	binDir := filepath.Join(root, "homebrew", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	candidate := filepath.Join(binDir, "npm")
+	require.NoError(t, os.Symlink(cliJs, candidate))
+
+	class, _, err := pmsurvey.ClassifySymlink(candidate, id)
+	require.NoError(t, err)
+	require.Equal(t, pmsurvey.ClassPMLayoutSymlink, class)
+}
+
+// TestClassifySymlink_ForeignWrapper_OutsideAllPMDirs is the fixture-B
+// guarantee: a symlink to an executable whose target is NOT in any
+// known PM install dir keeps the ClassForeignWrapper verdict.
+// Reserves the --force gate for genuinely user-planted custom
+// wrappers — the security boundary stays intact.
+func TestClassifySymlink_ForeignWrapper_OutsideAllPMDirs(t *testing.T) {
+	root := t.TempDir()
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// Plant a random executable that is NOT in any known PM dir.
+	randomDir := filepath.Join(root, "random", "place")
+	require.NoError(t, os.MkdirAll(randomDir, 0o755))
+	target := filepath.Join(randomDir, "my-custom-python")
+	require.NoError(t, os.WriteFile(target, []byte("custom"), 0o755))
+
+	// Symlink to it from another random path.
+	binDir := filepath.Join(root, "user", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	candidate := filepath.Join(binDir, "python3")
+	require.NoError(t, os.Symlink(target, candidate))
+
+	class, _, err := pmsurvey.ClassifySymlink(candidate, id)
+	require.NoError(t, err)
+	require.Equal(t, pmsurvey.ClassForeignWrapper, class,
+		"non-PM-dir target must remain ClassForeignWrapper; got %s", class)
+}
+
+// TestApplyWrapper_PMLayoutSymlinkWrapsWithoutForce is the end-to-end
+// guarantee that the classifier change reaches install-wrappers: a
+// candidate carrying ClassPMLayoutSymlink wraps without --force, the
+// rename + symlink dance preserves the original at .veto-original, and
+// the new symlink at the candidate path points at veto.
+func TestApplyWrapper_PMLayoutSymlinkWrapsWithoutForce(t *testing.T) {
+	root := t.TempDir()
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+
+	// Real Cellar-style binary the symlink points at.
+	cellarBin := filepath.Join(root, "homebrew", "Cellar", "python@3.14", "3.14.3_1", "bin")
+	require.NoError(t, os.MkdirAll(cellarBin, 0o755))
+	realPython := filepath.Join(cellarBin, "python3.14")
+	require.NoError(t, os.WriteFile(realPython, []byte("real-python"), 0o755))
+
+	// Candidate: bin/python3 → Cellar/.../python3.14.
+	binDir := filepath.Join(root, "homebrew", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	candidate := filepath.Join(binDir, "python3")
+	require.NoError(t, os.Symlink(realPython, candidate))
+
+	c := wrapCandidate{
+		path:   candidate,
+		pm:     "python3",
+		source: "homebrew",
+		class:  pmsurvey.ClassPMLayoutSymlink,
+		target: realPython,
+	}
+
+	// Pass nil identity so the re-classify pass is skipped and the
+	// dispatch hinges on c.class alone. NO --force.
+	action, err := applyWrapper(c, veto, nil, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionWrapped, action,
+		"ClassPMLayoutSymlink must wrap without --force")
+
+	// candidate is now a symlink to veto.
+	resolved, err := filepath.EvalSymlinks(candidate)
+	require.NoError(t, err)
+	resolvedVeto, err := filepath.EvalSymlinks(veto)
+	require.NoError(t, err)
+	require.Equal(t, resolvedVeto, resolved)
+
+	// The original symlink (→ Cellar python3.14) is preserved at
+	// .veto-original.
+	original := candidate + ".veto-original"
+	got, err := os.Readlink(original)
+	require.NoError(t, err, "expected .veto-original to be the moved-aside symlink")
+	require.Equal(t, realPython, got)
+}
+
+// TestApplyWrapper_ForeignWrapperStillSkipsWithoutForce proves the
+// --force gate is still in force for genuinely-foreign symlinks. The
+// security boundary did not loosen: only symlinks into known PM dirs
+// get the permissive verdict; everything else stays gated.
+func TestApplyWrapper_ForeignWrapperStillSkipsWithoutForce(t *testing.T) {
+	root := t.TempDir()
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+
+	// Target outside any known PM dir.
+	target := filepath.Join(root, "custom", "my-python")
+	require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o755))
+	require.NoError(t, os.WriteFile(target, []byte("custom-python"), 0o755))
+
+	candidate := filepath.Join(root, "user", "bin", "python3")
+	require.NoError(t, os.MkdirAll(filepath.Dir(candidate), 0o755))
+	require.NoError(t, os.Symlink(target, candidate))
+
+	c := wrapCandidate{
+		path:   candidate,
+		pm:     "python3",
+		source: "user",
+		class:  pmsurvey.ClassForeignWrapper,
+		target: target,
+	}
+
+	action, err := applyWrapper(c, veto, nil, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionSkipForeignWrapper, action,
+		"non-PM-dir foreign wrapper must still SKIP without --force")
+}

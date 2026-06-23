@@ -831,7 +831,10 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 	}
 
 	// Classification-driven short-circuits for the broken / foreign
-	// cases.
+	// cases. ClassPMLayoutSymlink (Homebrew Cellar, mise, npm-cli.js,
+	// rustup, etc.) is the canonical install layout and falls through
+	// to the regular wrap path — applyWrapper's rename + symlink works
+	// uniformly on a symlink whose target is a regular file.
 	switch c.class {
 	case pmsurvey.ClassBrokenSymlink:
 		return wrapperActionSkipBrokenSymlink, nil
