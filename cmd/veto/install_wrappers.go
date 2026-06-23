@@ -256,7 +256,7 @@ func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags
 				continue
 			}
 		}
-		switch action, err := applyWrapper(c, vetoPath, opts.dryRun, opts.force); {
+		switch action, err := applyWrapper(c, vetoPath, vetoID, opts.dryRun, opts.force); {
 		case err != nil:
 			stats.failed++
 			fmt.Fprintf(os.Stderr, "  %-10s  FAIL  %s — %v\n", c.pm, c.path, err)
@@ -807,11 +807,31 @@ func isWrappableTarget(p, vetoPath string) bool {
 // the symlink-create step fails we've still left the system in a
 // recoverable state: the user can move .veto-original back manually,
 // or re-run install-wrappers to retry.
-func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAction, error) {
+//
+// vetoID may be nil — callers that don't have one yet (typically older
+// tests) skip the re-classify pass and trust the cached c.class.
+// Production callers pass the same identity discovery used.
+func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentity, dryRun, force bool) (wrapAction, error) {
+	// Re-classify at wrap time. Discovery (discoverWrapCandidatesWith)
+	// runs ClassifySymlink once on every candidate, but the candidates
+	// are processed in a loop and an earlier wrap can change a later
+	// candidate's effective target — the cached verdict goes stale.
+	// Concrete case from veto-ynv.4: bun is Mach-O at discovery, gets
+	// wrapped, becomes a veto symlink. bunx (relative symlink `./bun`
+	// in the same dir) now resolves through veto. Its cached
+	// ClassForeignWrapper verdict is stale; the live classification
+	// would say "ours-by-path" — a different action entirely. Calling
+	// ClassifySymlink again here is cheap (a few stats + a hash that
+	// is sync.Once'd on vetoID) and eliminates the staleness footgun.
+	if vetoID != nil {
+		if class, target, err := pmsurvey.ClassifySymlink(c.path, vetoID); err == nil {
+			c.class = class
+			c.target = target
+		}
+	}
+
 	// Classification-driven short-circuits for the broken / foreign
-	// cases. Discovery (discoverWrapCandidatesWith) pre-classifies
-	// every candidate via pmsurvey.ClassifySymlink, so applyWrapper
-	// can dispatch without re-walking the disk.
+	// cases.
 	switch c.class {
 	case pmsurvey.ClassBrokenSymlink:
 		return wrapperActionSkipBrokenSymlink, nil
@@ -824,6 +844,16 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		// (which would destroy the preserved real-binary trail).
 		if !force {
 			return wrapperActionSkipForeignWrapper, nil
+		}
+	case pmsurvey.ClassOursByPath, pmsurvey.ClassOursByHash:
+		// Re-classify saw a veto-identity symlink. If the
+		// `.veto-original` sibling exists, this is the canonical
+		// "already-ours" state — early-return as a skip so the wrap-loop
+		// below does not race to rename a symlink onto an existing
+		// sibling. If the sibling is missing, fall through to the
+		// regular wrap path which handles the broken-state case.
+		if _, err := os.Lstat(c.path + wrapperSuffix); err == nil {
+			return wrapperActionSkipAlreadyOurs, nil
 		}
 	}
 

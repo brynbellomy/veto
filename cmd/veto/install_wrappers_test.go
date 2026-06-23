@@ -25,7 +25,7 @@ func TestApplyWrapper_HappyPath_RegularFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(npm, []byte("#!/bin/sh\nexec real-npm\n"), 0o755))
 
 	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
-	action, err := applyWrapper(c, veto, false, false)
+	action, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionWrapped, action)
 
@@ -58,7 +58,7 @@ func TestApplyWrapper_HappyPath_SymlinkSource(t *testing.T) {
 	require.NoError(t, os.Symlink(cellar, binNpm))
 
 	c := wrapCandidate{path: binNpm, pm: "npm", source: "homebrew"}
-	action, err := applyWrapper(c, veto, false, false)
+	action, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionWrapped, action)
 
@@ -83,10 +83,10 @@ func TestApplyWrapper_IdempotentOnSecondCall(t *testing.T) {
 	require.NoError(t, os.WriteFile(pip, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 
 	c := wrapCandidate{path: pip, pm: "pip", source: "user"}
-	_, err := applyWrapper(c, veto, false, false)
+	_, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 
-	action, err := applyWrapper(c, veto, false, false)
+	action, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipAlreadyOurs, action)
 }
@@ -103,12 +103,12 @@ func TestApplyWrapper_RefusesToClobberPartialState(t *testing.T) {
 	require.NoError(t, os.WriteFile(pnpm+".veto-original", []byte("stale"), 0o644))
 
 	c := wrapCandidate{path: pnpm, pm: "pnpm", source: "user"}
-	_, err := applyWrapper(c, veto, false, false)
+	_, err := applyWrapper(c, veto, nil, false, false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "already exists")
 
 	// --force overrides.
-	_, err = applyWrapper(c, veto, false, true)
+	_, err = applyWrapper(c, veto, nil, false, true)
 	require.NoError(t, err)
 }
 
@@ -126,16 +126,16 @@ func TestApplyWrapper_ForceRelinksAlreadyOurs(t *testing.T) {
 	require.NoError(t, os.WriteFile(npm, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 
 	// First wrap to get into the already-ours state.
-	_, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, false, false)
+	_, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, false, false)
 	require.NoError(t, err)
 
 	// Without --force, a second call short-circuits.
-	action, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, false, false)
+	action, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipAlreadyOurs, action)
 
 	// With --force, the symlink gets recreated.
-	action, err = applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, false, true)
+	action, err = applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, false, true)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionWrapped, action, "--force should recreate the symlink, not skip")
 
@@ -178,7 +178,7 @@ func TestApplyWrapper_ForceMigrationFromForeignVeto_PreservesRealBinary(t *testi
 	// the symlink chain at npm would point at vetoB and the real binary
 	// would be unrecoverable.
 	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
-	action, err := applyWrapper(c, vetoB, false, true)
+	action, err := applyWrapper(c, vetoB, nil, false, true)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionWrapped, action)
 
@@ -213,7 +213,7 @@ func TestApplyWrapper_NoForceOnForeignVeto_SkipsAndDoesNotMutate(t *testing.T) {
 	require.NoError(t, os.Symlink(vetoA, npm))
 
 	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
-	action, err := applyWrapper(c, vetoB, false, false)
+	action, err := applyWrapper(c, vetoB, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipForeignWrapper, action)
 
@@ -235,13 +235,13 @@ func TestApplyWrapper_ForceRelinksAlreadyOurs_DryRun(t *testing.T) {
 	require.NoError(t, os.WriteFile(veto, []byte(""), 0o755))
 	npm := filepath.Join(dir, "npm")
 	require.NoError(t, os.WriteFile(npm, []byte("#!/bin/sh\n"), 0o755))
-	_, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, false, false)
+	_, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, false, false)
 	require.NoError(t, err)
 
 	before, err := os.Readlink(npm)
 	require.NoError(t, err)
 
-	action, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, true, true)
+	action, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, true, true)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipDryRun, action)
 
@@ -523,7 +523,7 @@ func TestApplyWrapper_DryRun_TouchesNothing(t *testing.T) {
 	require.NoError(t, os.WriteFile(pip, originalBody, 0o755))
 
 	c := wrapCandidate{path: pip, pm: "pip", source: "user"}
-	action, err := applyWrapper(c, veto, true, false)
+	action, err := applyWrapper(c, veto, nil, true, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipDryRun, action)
 
@@ -545,7 +545,7 @@ func TestUnwrap_RestoresOriginal(t *testing.T) {
 	require.NoError(t, os.WriteFile(npm, realBody, 0o755))
 
 	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
-	_, err := applyWrapper(c, veto, false, false)
+	_, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 
 	entry := wrapperEntry{
@@ -1010,7 +1010,7 @@ func TestRunInstallWrappers_EndToEnd(t *testing.T) {
 	}
 	state := wrapperState{}
 	for _, c := range candidates {
-		_, err := applyWrapper(c, vetoBin, false, false)
+		_, err := applyWrapper(c, vetoBin, nil, false, false)
 		require.NoError(t, err)
 		state.add(wrapperEntry{Path: c.path, OriginalPath: c.path + wrapperSuffix, PM: c.pm, Source: c.source})
 	}
@@ -1067,7 +1067,7 @@ func TestApplyWrapper_ReadOnlyDir_SkipsUnwritable(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(roDir, 0o755) })
 
 	c := wrapCandidate{path: pip3, pm: "pip3", source: "user"}
-	action, err := applyWrapper(c, veto, false, false)
+	action, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipUnwritable, action)
 
@@ -1189,4 +1189,48 @@ func TestPruneStaleWrapperEntries_FallsBackToImpliedSibling(t *testing.T) {
 	require.True(t, dirty)
 	require.Len(t, pruned, 1)
 	require.Equal(t, "sibling missing", pruned[0].Reason)
+}
+
+// TestApplyWrapper_ReClassifiesAtWrapTime is the veto-3z6 guarantee.
+// Discovery (discoverWrapCandidatesWith) classifies every candidate
+// once at the top, but the candidates are processed in a loop and an
+// earlier wrap can change a later candidate's effective target.
+// Concrete case: a sibling-symlink multiplexer like bunx ("./bun") in
+// the same dir as bun. After bun gets wrapped, bunx — still cached as
+// ClassForeignWrapper from discovery — now resolves through veto. Live
+// classification would say "ours-by-path". applyWrapper must use the
+// live verdict, not the stale one.
+func TestApplyWrapper_ReClassifiesAtWrapTime(t *testing.T) {
+	dir := t.TempDir()
+
+	// Plant a "veto" binary and a `.veto-original` so the existence
+	// check in applyWrapper's already-ours short-circuit is satisfied.
+	veto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+
+	// Plant a candidate that IS already wrapped (symlink → veto +
+	// existing .veto-original sibling).
+	candidate := filepath.Join(dir, "bunx")
+	require.NoError(t, os.Symlink(veto, candidate))
+	require.NoError(t, os.WriteFile(candidate+".veto-original", []byte("real-bunx"), 0o755))
+
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// Pass a STALE classification (ClassForeignWrapper) — discovery
+	// would have set this before bun was wrapped. With re-classify
+	// enabled, applyWrapper looks at the actual on-disk state and
+	// returns AlreadyOurs instead of trying to overwrite a wrapped
+	// candidate.
+	c := wrapCandidate{
+		path:   candidate,
+		pm:     "bunx",
+		source: "bun",
+		class:  pmsurvey.ClassForeignWrapper,
+		target: "./bun",
+	}
+	action, err := applyWrapper(c, veto, id, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionSkipAlreadyOurs, action,
+		"applyWrapper must re-classify and see the live ours-by-path state")
 }
