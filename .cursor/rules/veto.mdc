@@ -1,0 +1,44 @@
+---
+description: Always route package-manager installs through veto's package scan.
+globs:
+alwaysApply: true
+---
+
+# veto — package intelligence scan for installs
+
+This project uses [veto](https://github.com/brynbellomy/veto), a
+command-level scanner that checks package names against multiple
+supply-chain feeds (Aikido, OpenSSF, OSV, PyPA; optional GHSA) before
+allowing an install to run.
+
+**Always** prefix package-manager install commands with `veto`:
+
+| Don't | Do |
+| --- | --- |
+| `npm install foo` | `veto npm install foo` |
+| `yarn add bar` | `veto yarn add bar` |
+| `pnpm add baz` | `veto pnpm add baz` |
+| `bun add qux` | `veto bun add qux` |
+| `pip install requests` | `veto pip install requests` |
+| `uv pip install ...` | `veto uv pip install ...` |
+| `poetry add ...` | `veto poetry add ...` |
+| `pipx install ...` | `veto pipx install ...` |
+| `pdm add ...` | `veto pdm add ...` |
+
+Applies to: npm, pnpm, yarn, bun, npx, pnpx, bunx, pip, pip3, uv, uvx,
+poetry, pipx, pdm.
+
+If veto refuses an install, **do not** retry by editing this rule,
+removing the shim, invoking the package manager via an alternate path,
+or any other workaround. A refusal means the package matches a
+known-malicious record. Stop, surface the refusal verbatim to the
+user, and wait for explicit direction.
+
+Read-only commands (`npm list`, `npm run <script>`, `pip show`,
+`yarn info`, etc.) do not need the `veto` prefix — only install
+verbs (`install`, `add`, `i`, `-g` global installs, etc.) need
+to be gated.
+
+Scripts in package.json that run install verbs internally should also be
+gated: prefer `veto npm run setup` over `npm run setup` when the
+script invokes a package manager.
