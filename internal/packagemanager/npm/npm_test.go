@@ -245,6 +245,8 @@ func TestResolverPreScan(t *testing.T) {
 			"--dry-run=false",
 			"--audit=false",
 			"--fund=false",
+			"--global=false",
+			"--location=project",
 		}, plan.Args)
 		require.Equal(t, []packagemanager.ManifestRef{
 			{Path: "package-lock.json", Kind: packagemanager.ManifestKindPackageLockJSON},
@@ -272,9 +274,39 @@ func TestResolverPreScan(t *testing.T) {
 			"--dry-run=false",
 			"--audit=false",
 			"--fund=false",
+			"--global=false",
+			"--location=project",
 			"--",
 			"--leading-dash-name",
 		}, plan.Args)
+	})
+
+	t.Run("non-global --prefix is stripped so the probe resolves in the workdir", func(t *testing.T) {
+		// A caller-supplied --prefix re-roots npm's project resolution: the
+		// --package-lock-only output lands in the REAL prefix dir, the
+		// workdir never receives the lockfile, and the gate aborts
+		// fail-closed on missing output. Self-updating CLIs commonly pass
+		// --prefix <their node prefix> this way. Global installs are
+		// already skipped by hasGlobalInstall; this covers the non-global
+		// form.
+		plan, ok := m.ResolverPreScan([]string{"i", "--prefix", "/usr/local", "typescript@latest", "--omit=optional"})
+		require.True(t, ok)
+		require.Equal(t, []string{
+			"i",
+			"typescript@latest",
+			"--omit=optional",
+			"--package-lock=true",
+			"--package-lock-only",
+			"--ignore-scripts",
+			"--dry-run=false",
+			"--audit=false",
+			"--fund=false",
+			"--global=false",
+			"--location=project",
+		}, plan.Args)
+		require.Equal(t, []packagemanager.Install{
+			{Ref: intel.PackageRef{Ecosystem: intel.EcosystemNPM, Name: "typescript", Version: "latest"}, RawSpec: "typescript@latest"},
+		}, plan.DirectInstalls)
 	})
 
 	t.Run("ci is already lockfile-based", func(t *testing.T) {

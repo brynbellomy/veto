@@ -48,10 +48,15 @@ func isNpmFamily(eco intel.Ecosystem) bool {
 // install for a permissions quirk. Critical findings — the actual worm
 // signature — always refuse.
 func gypPreflight(logger zerolog.Logger, w io.Writer, cwd string) bool {
-	return gypPreflightRoots(logger, w, []string{cwd})
+	return gypPreflightRoots(logger, w, gypScanRootsForInstall("", nil, cwd), nil)
 }
 
-func gypPreflightRoots(logger zerolog.Logger, w io.Writer, roots []string) bool {
+// allowed is the operator-acknowledged binding.gyp content-hash set (see
+// gyp_allowlist.go); nil/empty means nothing is acknowledged.
+func gypPreflightRoots(logger zerolog.Logger, w io.Writer, roots []string, allowed map[string]struct{}) bool {
+	if len(roots) == 0 {
+		return false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), gypPreflightTimeout)
 	defer cancel()
 
@@ -61,6 +66,7 @@ func gypPreflightRoots(logger zerolog.Logger, w io.Writer, roots []string) bool 
 	}
 
 	critical := dedupeGypFindings(criticalGypFindings(result.Findings))
+	critical = filterAllowedGypFindings(logger, critical, allowed)
 	if len(critical) == 0 {
 		return false
 	}
@@ -122,7 +128,7 @@ func printGypRefusal(w io.Writer, findings []scan.Finding) {
 // runGypPreflightIfNpmFamily runs the gyp preflight when the package manager
 // resolves npm packages. Returns true when the install must be refused. cwd is
 // the process working directory.
-func runGypPreflightIfNpmFamily(logger zerolog.Logger, pm packagemanager.PackageManager, pmArgs []string) bool {
+func runGypPreflightIfNpmFamily(logger zerolog.Logger, cfg config, pm packagemanager.PackageManager, pmArgs []string) bool {
 	if !isNpmFamily(pm.Ecosystem()) {
 		return false
 	}
@@ -131,9 +137,20 @@ func runGypPreflightIfNpmFamily(logger zerolog.Logger, pm packagemanager.Package
 		logger.Warn().Err(err).Msg("gyp preflight: resolve cwd failed; skipping")
 		return false
 	}
-	return gypPreflightRoots(logger, os.Stderr, gypScanRootsForInstall(pm.Name(), pmArgs, cwd))
+	allowed := loadGypAllowlist(logger, cfg.CacheDir)
+	return gypPreflightRoots(logger, os.Stderr, gypScanRootsForInstall(pm.Name(), pmArgs, cwd), allowed)
 }
 
+// gypScanRootsForInstall returns the node_modules trees the preflight must
+// walk. node-gyp runs over the install tree's node_modules — that is the
+// only place an already-present worm can detonate from — so each candidate
+// root is scoped to its node_modules subtree (matching gypPreflight's
+// documented contract). Scoping also keeps a cwd like $HOME from dragging
+// the walker through Documents/caches/Trash for the full preflight timeout
+// and flagging trees no node-gyp run will ever touch. Roots without a
+// node_modules dir are skipped entirely. Workspace-nested node_modules
+// (packages/*/node_modules) are not walked here; the tarball preflight
+// still inspects everything THIS install fetches.
 func gypScanRootsForInstall(pmName string, pmArgs []string, cwd string) []string {
 	seen := map[string]struct{}{}
 	roots := make([]string, 0, 2)
@@ -141,12 +158,15 @@ func gypScanRootsForInstall(pmName string, pmArgs []string, cwd string) []string
 		if root == "" {
 			return
 		}
-		clean := filepath.Clean(root)
-		if _, ok := seen[clean]; ok {
+		nm := filepath.Join(filepath.Clean(root), "node_modules")
+		if _, ok := seen[nm]; ok {
 			return
 		}
-		seen[clean] = struct{}{}
-		roots = append(roots, clean)
+		seen[nm] = struct{}{}
+		if info, err := os.Stat(nm); err != nil || !info.IsDir() {
+			return
+		}
+		roots = append(roots, nm)
 	}
 
 	add(installTargetDir(pmName, pmArgs, cwd))

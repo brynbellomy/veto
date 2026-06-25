@@ -6,6 +6,8 @@
 package npm
 
 import (
+	"strings"
+
 	"github.com/brynbellomy/veto/internal/intel"
 	"github.com/brynbellomy/veto/internal/packagemanager"
 	"github.com/brynbellomy/veto/internal/packagemanager/argv"
@@ -42,6 +44,7 @@ var alwaysReadsManifest = map[string]struct{}{
 // to model the full npm flag surface.
 var flagsWithValues = argv.FlagsWithValues{
 	"--prefix":       {},
+	"--location":     {},
 	"--registry":     {},
 	"--userconfig":   {},
 	"--globalconfig": {},
@@ -156,13 +159,27 @@ func (Manager) ResolverPreScan(args []string) (packagemanager.ResolverPreScanPla
 		return packagemanager.ResolverPreScanPlan{}, false
 	}
 	return packagemanager.ResolverPreScanPlan{
-		Args: appendResolverFlags(args,
+		// The probe must resolve inside its isolated temp workdir. Global
+		// installs are short-circuited above (hasGlobalInstall: npm cannot
+		// generate a lockfile for them at all), but a caller-supplied
+		// --prefix on a non-global install re-roots the
+		// --package-lock-only resolution into the REAL tree, leaving the
+		// workdir without the lockfile the gate inspects — the probe "runs
+		// fine" and the gate aborts fail-closed on missing output. Strip
+		// every project-re-rooting token and force project-local mode; the
+		// appended last-wins overrides also beat an inherited
+		// npm_config_global / npm_config_location env. The resolved
+		// dependency tree is identical either way, and the real install
+		// still runs with the caller's original argv.
+		Args: appendResolverFlags(stripProjectRootFlags(args),
 			"--package-lock=true",
 			"--package-lock-only",
 			"--ignore-scripts",
 			"--dry-run=false",
 			"--audit=false",
 			"--fund=false",
+			"--global=false",
+			"--location=project",
 		),
 		ManifestRefs: []packagemanager.ManifestRef{
 			{Path: "package-lock.json", Kind: packagemanager.ManifestKindPackageLockJSON},
@@ -205,6 +222,34 @@ func hasUnsafeResolverPreScanSpec(installs []packagemanager.Install) bool {
 		}
 	}
 	return false
+}
+
+// stripProjectRootFlags removes the argv tokens that re-root npm's project
+// resolution: -g/--global, --location, --prefix. See the ResolverPreScan
+// comment for why the probe must not inherit them. The global forms are
+// normally short-circuited earlier by hasGlobalInstall; stripping them here
+// too keeps this helper correct under future reordering. Tokens after `--`
+// are positional and copied through untouched.
+func stripProjectRootFlags(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			out = append(out, args[i:]...)
+			break
+		}
+		switch {
+		case arg == "-g" || arg == "--global" || strings.HasPrefix(arg, "--global="):
+			continue
+		case arg == "--location" || arg == "--prefix":
+			i++ // the next token is the flag's value; drop both
+			continue
+		case strings.HasPrefix(arg, "--location=") || strings.HasPrefix(arg, "--prefix="):
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 func appendResolverFlags(args []string, flags ...string) []string {
