@@ -34,16 +34,34 @@ package main
 
 import (
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/brynbellomy/go-utils/errors"
 	"github.com/rs/zerolog"
 
 	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
+	"github.com/brynbellomy/veto/internal/packagemanager/pmsurvey"
 )
+
+// isReadOnlyFS reports whether err originates from a write to a
+// read-only filesystem. On macOS this covers SIP-protected paths like
+// /usr/bin/pip3 — rename(2) returns EROFS, not EPERM, even when the
+// caller is root. We treat these as a distinct skip category from
+// unwritable-by-user so the user doesn't get a misleading "retry with
+// sudo" hint (sudo can't bypass SIP).
+//
+// stderrors.Is is used directly rather than the project's errors helper
+// because syscall.EROFS satisfies the stdlib unwrapping contract and we
+// need to peek through fs.PathError (os.Rename's wrapper) to the raw
+// errno.
+func isReadOnlyFS(err error) bool {
+	return stderrors.Is(err, syscall.EROFS)
+}
 
 // wrapperSuffix is the rename target. `.veto-original` is verbose on
 // purpose — a colleague who finds it during debugging needs to see
@@ -125,6 +143,10 @@ func runInstallWrappers(logger zerolog.Logger, cfg config, args []string) int {
 // vs. just unwritable-dir skips. The public runInstallWrappers wraps this
 // and discards the stats — preserves the existing standalone-command exit
 // contract (non-zero only on stats.failed > 0, per the original logic).
+//
+// Thin shim: resolves the veto binary identity then delegates to
+// runInstallWrappersWith. Tests plant their own veto binary in a tempdir
+// and call the *With variant directly.
 func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []string) (int, wrapperStats) {
 	opts, err := parseWrapperFlags(args)
 	if err != nil {
@@ -137,8 +159,19 @@ func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []strin
 		logger.Error().Err(err).Msg("locate veto binary")
 		return exitInternal, wrapperStats{}
 	}
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoPath)
+	if err != nil {
+		logger.Error().Err(err).Msg("build veto identity")
+		return exitInternal, wrapperStats{}
+	}
+	return runInstallWrappersWith(logger, cfg, opts, vetoPath, vetoID)
+}
 
-	candidates, err := discoverWrapCandidates(opts, vetoPath)
+// runInstallWrappersWith is the install-wrappers worker. It takes a
+// pre-built VetoIdentity so tests can drive it against a planted veto
+// binary in a tempdir without going through os.Executable.
+func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags, vetoPath string, vetoID *pmsurvey.VetoIdentity) (int, wrapperStats) {
+	candidates, err := discoverWrapCandidatesWith(opts, vetoID)
 	if err != nil {
 		logger.Error().Err(err).Msg("discover wrap candidates")
 		return exitInternal, wrapperStats{}
@@ -154,6 +187,29 @@ func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []strin
 			Str("path", filepath.Join(cfg.CacheDir, "wrappers.json")).
 			Msg("wrappers.json is malformed; refusing to overwrite a load-bearing registry. Inspect or move the file aside and re-run.")
 		return exitInternal, wrapperStats{}
+	}
+
+	// Convergence: prune stale wrappers.json entries before doing
+	// anything else. An entry is stale when either the recorded path no
+	// longer exists on disk (uninstalled, mise upgrade renamed the
+	// version dir, manual cleanup) OR the `.veto-original` sibling is
+	// missing (a prior install-shims convergence pass removed it,
+	// manual delete). Without this reconcile pass install-wrappers only
+	// ADDS — drifted state stays drifted forever and doctor FAILs the
+	// entries indefinitely.
+	prunedStale, dirty := pruneStaleWrapperEntries(&state)
+	for _, p := range prunedStale {
+		if opts.dryRun {
+			fmt.Printf("  %-10s  ok    would prune stale entry: %s — %s\n", "prune", p.Path, p.Reason)
+		} else {
+			fmt.Printf("  %-10s  ok    pruned stale entry: %s — %s\n", "prune", p.Path, p.Reason)
+		}
+	}
+	if dirty && !opts.dryRun {
+		if err := saveWrapperState(cfg, state); err != nil {
+			logger.Error().Err(err).Msg("save wrapper state (prune stale)")
+			return exitInternal, wrapperStats{}
+		}
 	}
 
 	// Discovery includes already-ours paths, so empty candidates now
@@ -201,7 +257,7 @@ func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []strin
 				continue
 			}
 		}
-		switch action, err := applyWrapper(c, vetoPath, opts.dryRun, opts.force); {
+		switch action, err := applyWrapper(c, vetoPath, vetoID, opts.dryRun, opts.force); {
 		case err != nil:
 			stats.failed++
 			fmt.Fprintf(os.Stderr, "  %-10s  FAIL  %s — %v\n", c.pm, c.path, err)
@@ -230,6 +286,39 @@ func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []strin
 				if rbErr := saveWrapperState(cfg, state); rbErr != nil {
 					logger.Warn().Err(rbErr).Str("path", c.path).
 						Msg("WAL rollback save failed; re-run install-wrappers to reconcile")
+				}
+			}
+		case action == wrapperActionSkipReadOnlyFS:
+			stats.skippedReadOnlyFS++
+			// Deliberately NOT appended to `skipped` — that list drives the
+			// sudo remediation hint, and sudo cannot bypass SIP. The honest
+			// message is "this can't be wrapped, full stop."
+			fmt.Fprintf(os.Stderr, "  %-10s  SKIP  %s — read-only filesystem (SIP-protected); cannot be wrapped (Layer 2 shims still cover bare-name calls)\n", c.pm, c.path)
+			if !alreadyHad && !opts.dryRun {
+				state.remove(c.path)
+				if rbErr := saveWrapperState(cfg, state); rbErr != nil {
+					logger.Warn().Err(rbErr).Str("path", c.path).
+						Msg("WAL rollback save failed; re-run install-wrappers to reconcile")
+				}
+			}
+		case action == wrapperActionSkipBrokenSymlink:
+			stats.skippedBroken++
+			fmt.Fprintf(os.Stderr, "  %-10s  SKIP  %s — broken symlink to %s (likely a previous wrapper tool's leftover; restore `<path>.veto-original` if present, then re-run)\n",
+				c.pm, c.path, c.target)
+			if !alreadyHad && !opts.dryRun {
+				state.remove(c.path)
+				if rbErr := saveWrapperState(cfg, state); rbErr != nil {
+					logger.Warn().Err(rbErr).Str("path", c.path).Msg("WAL rollback save failed")
+				}
+			}
+		case action == wrapperActionSkipForeignWrapper:
+			stats.skippedForeign++
+			fmt.Fprintf(os.Stderr, "  %-10s  SKIP  %s — symlink to %s, which is not the veto binary (foreign wrapper; pass --force to overwrite)\n",
+				c.pm, c.path, c.target)
+			if !alreadyHad && !opts.dryRun {
+				state.remove(c.path)
+				if rbErr := saveWrapperState(cfg, state); rbErr != nil {
+					logger.Warn().Err(rbErr).Str("path", c.path).Msg("WAL rollback save failed")
 				}
 			}
 		case action == wrapperActionSkipAlreadyOurs:
@@ -271,8 +360,9 @@ func runInstallWrappersWithStats(logger zerolog.Logger, cfg config, args []strin
 		}
 	}
 
-	fmt.Printf("\nSummary: %d wrapped, %d reconciled, %d already-ours, %d would-wrap, %d skipped (needs sudo), %d failed\n",
-		stats.wrapped, stats.reconciled, stats.alreadyOurs, stats.wouldWrap, stats.skippedUnwritable, stats.failed)
+	fmt.Printf("\nSummary: %d wrapped, %d reconciled, %d already-ours, %d would-wrap, %d skipped (needs sudo), %d skipped (read-only FS / SIP), %d skipped (broken symlink), %d skipped (foreign wrapper), %d failed\n",
+		stats.wrapped, stats.reconciled, stats.alreadyOurs, stats.wouldWrap, stats.skippedUnwritable,
+		stats.skippedReadOnlyFS, stats.skippedBroken, stats.skippedForeign, stats.failed)
 	printUnwritableRemediation(skipped)
 	if stats.failed > 0 {
 		return exitInternal, stats
@@ -408,6 +498,14 @@ type wrapperStats struct {
 	alreadyOurs       int
 	wouldWrap         int
 	skippedUnwritable int
+	// skippedReadOnlyFS counts candidates that live on a read-only
+	// filesystem (EROFS) — typically SIP-protected paths under /usr/bin
+	// on macOS. Distinct from skippedUnwritable because no amount of
+	// elevation can wrap them; the user can't fix it and install-all
+	// must not abort over it.
+	skippedReadOnlyFS int
+	skippedBroken     int
+	skippedForeign    int
 	failed            int
 }
 
@@ -422,6 +520,25 @@ const (
 	// the user can finish under sudo. Reported as a skip with a
 	// copy-pasteable remediation command rather than aborting install-all.
 	wrapperActionSkipUnwritable
+	// wrapperActionSkipReadOnlyFS: the candidate lives on a read-only
+	// filesystem (EROFS) — typically a SIP-protected path under /usr/bin
+	// on macOS. Sudo would NOT help: SIP blocks writes regardless of
+	// euid. Reported as a SKIP with a honest message (no sudo hint) so
+	// install-all keeps going.
+	wrapperActionSkipReadOnlyFS
+	// wrapperActionSkipBrokenSymlink: discovery found a symlink whose
+	// target does not exist (typically a leftover from a previous
+	// wrapper tool whose binary was uninstalled). install-wrappers
+	// emits a visible SKIP line so the user can decide whether to
+	// delete the orphan rather than silently dropping the candidate.
+	wrapperActionSkipBrokenSymlink
+	// wrapperActionSkipForeignWrapper: discovery found a symlink to a
+	// binary whose SHA-256 does not match the running veto. Without
+	// --force, install-wrappers emits a visible SKIP line and leaves
+	// the symlink in place — overwriting could break whatever tool
+	// installed it. With --force, applyWrapper falls through to the
+	// regular wrap path.
+	wrapperActionSkipForeignWrapper
 	wrapperActionWrapped
 )
 
@@ -461,19 +578,39 @@ func parseWrapperFlags(args []string) (wrapperFlags, error) {
 
 // wrapCandidate is one (dir, pm) pair discovery surfaced.
 type wrapCandidate struct {
-	path   string // absolute path to the existing PM file
-	pm     string // basename (e.g. "npm")
-	source string // "homebrew", "mise", "asdf", "user"
+	path   string                  // absolute path to the existing PM file
+	pm     string                  // basename (e.g. "npm")
+	source string                  // "homebrew", "mise", "asdf", "user"
+	class  pmsurvey.Classification // result of pmsurvey.ClassifySymlink at discovery time
+	target string                  // resolved symlink target when class != ClassReal; "" otherwise
 }
 
 // discoverWrapCandidates walks the well-known install-dir patterns
-// looking for files whose basename matches one of wrappedManagers. We
-// emit a candidate for any path that is either (a) wrappable
-// (executable real binary, not yet ours) or (b) already a veto wrapper
-// (symlink-to-veto with a `.veto-original` sibling). The latter look
-// like no-ops to applyWrapper but let runInstallWrappers reconcile them
-// into wrappers.json when state has drifted from filesystem reality.
+// AND $PATH looking for files whose basename matches one of
+// wrappedManagers. Thin shim over discoverWrapCandidatesWith; tests use
+// the latter directly with a pre-built VetoIdentity.
 func discoverWrapCandidates(opts wrapperFlags, vetoPath string) ([]wrapCandidate, error) {
+	id, err := pmsurvey.VetoIdentityFor(vetoPath)
+	if err != nil {
+		return nil, errors.With(err, "discover wrap candidates")
+	}
+	return discoverWrapCandidatesWith(opts, id)
+}
+
+// discoverWrapCandidatesWith uses pmsurvey.PathsFor to enumerate every
+// absolute path on this host where each wrapped PM could live
+// (well-known roots plus $PATH minus shim dirs) and pmsurvey.ClassifySymlink
+// to pre-classify each candidate so applyWrapper can dispatch on
+// broken / foreign / ours without re-walking the disk.
+//
+// The PM name list is the static wrappedManagers slice PLUS every
+// `python3.X` alias currently on disk. The dynamic enumeration is
+// what closes the uv-venv bypass: a venv that resolves the canonical
+// uv cpython python3.X by absolute path must hit a veto wrapper at
+// the canonical store path. Without the dynamic list the wrap step
+// would only cover the static `python` / `python3` names and miss
+// the actual venv-target binary.
+func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([]wrapCandidate, error) {
 	candidates := []wrapCandidate{}
 	pmFilter := func(name string) bool {
 		if len(opts.only) == 0 {
@@ -482,131 +619,100 @@ func discoverWrapCandidates(opts wrapperFlags, vetoPath string) ([]wrapCandidate
 		_, ok := opts.only[name]
 		return ok
 	}
-	include := func(p string) bool {
-		return isWrappableTarget(p, vetoPath) || isAlreadyOursWrap(p, vetoPath)
+
+	// Defense in depth: refuse to enroll any candidate whose path lies
+	// inside the Layer 2 shim dir. Layer 2 and Layer 4 must not share
+	// territory; if a previous install-wrappers version walked $PATH and
+	// scooped up shim-dir entries (the bug that broke veto-dzk recovery),
+	// this guard prevents the regression even before install-shims
+	// reconciles the registry.
+	shimDirCanonical := filepath.Clean(defaultShimDir())
+	shimPrefix := shimDirCanonical + string(filepath.Separator)
+	inShimDir := func(p string) bool {
+		clean := filepath.Clean(p)
+		return strings.HasPrefix(clean, shimPrefix) || clean == shimDirCanonical
 	}
 
-	// 1) Homebrew prefix dirs. On Apple Silicon, /opt/homebrew/bin; on
-	//    Intel, /usr/local/bin. We check both — the wrong one will be
-	//    a no-op rather than a failure.
-	for _, dir := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
-		for _, pm := range wrappedManagers {
-			if !pmFilter(pm) {
+	seen := map[string]struct{}{}
+	add := func(c wrapCandidate) {
+		if _, dup := seen[c.path]; dup {
+			return
+		}
+		if inShimDir(c.path) {
+			return
+		}
+		seen[c.path] = struct{}{}
+		candidates = append(candidates, c)
+	}
+
+	pmNames := append([]string{}, wrappedManagers...)
+	pmNames = append(pmNames, discoverVersionedPythons()...)
+
+	for _, pm := range pmNames {
+		if !pmFilter(pm) {
+			continue
+		}
+		for _, path := range pmsurvey.PathsFor(pm) {
+			class, target, classErr := pmsurvey.ClassifySymlink(path, id)
+			if classErr != nil {
+				// I/O failure on a candidate is not a discovery error —
+				// applyWrapper will surface it per-candidate. Include
+				// the path with ClassReal so the regular path runs and
+				// the FAIL line emits if rename fails.
+				add(wrapCandidate{path: path, pm: pm, source: sourceFor(path), class: pmsurvey.ClassReal, target: ""})
 				continue
 			}
-			p := filepath.Join(dir, pm)
-			if include(p) {
-				candidates = append(candidates, wrapCandidate{path: p, pm: pm, source: "homebrew"})
-			}
+			add(wrapCandidate{path: path, pm: pm, source: sourceFor(path), class: class, target: target})
 		}
 	}
 
-	// 2) mise install dirs: ~/.local/share/mise/installs/<tool>/<v>/bin/<pm>.
-	if home, err := os.UserHomeDir(); err == nil {
-		miseRoot := filepath.Join(home, ".local", "share", "mise", "installs")
-		candidates = appendWrapCandidates(candidates, globToolVersionBinDirs(miseRoot), wrappedManagers, pmFilter, include, "mise")
-		// 3) asdf: ~/.asdf/installs/<tool>/<v>/bin/<pm>.
-		asdfRoot := filepath.Join(home, ".asdf", "installs")
-		candidates = appendWrapCandidates(candidates, globToolVersionBinDirs(asdfRoot), wrappedManagers, pmFilter, include, "asdf")
-		// 4) pyenv: ~/.pyenv/versions/<v>/bin/<pm>.
-		pyenvRoot := filepath.Join(home, ".pyenv", "versions")
-		candidates = appendWrapCandidates(candidates, globVersionBinDirs(pyenvRoot), wrappedManagers, pmFilter, include, "pyenv")
-		// 5) nvm: ~/.nvm/versions/node/<v>/bin/<pm>.
-		nvmRoot := filepath.Join(home, ".nvm", "versions", "node")
-		candidates = appendWrapCandidates(candidates, globVersionBinDirs(nvmRoot), wrappedManagers, pmFilter, include, "nvm")
-		// 6) Direct bun install: ~/.bun/bin
-		bunDir := filepath.Join(home, ".bun", "bin")
-		for _, pm := range []string{"bun", "bunx"} {
-			if !pmFilter(pm) {
-				continue
-			}
-			p := filepath.Join(bunDir, pm)
-			if include(p) {
-				candidates = append(candidates, wrapCandidate{path: p, pm: pm, source: "bun"})
-			}
-		}
-	}
-
-	// 7) User-supplied --dir entries.
+	// User-supplied --dir entries. These are NOT discovered via
+	// pmsurvey (the user knows where they live), but they still
+	// benefit from classification so applyWrapper handles broken /
+	// foreign cases uniformly.
 	for _, dir := range opts.dirs {
 		for _, pm := range wrappedManagers {
 			if !pmFilter(pm) {
 				continue
 			}
 			p := filepath.Join(dir, pm)
-			if include(p) {
-				candidates = append(candidates, wrapCandidate{path: p, pm: pm, source: "user"})
+			class, target, classErr := pmsurvey.ClassifySymlink(p, id)
+			if classErr != nil {
+				// A --dir entry that doesn't exist is a no-op, not an error.
+				continue
 			}
+			add(wrapCandidate{path: p, pm: pm, source: "user", class: class, target: target})
 		}
 	}
 
 	return candidates, nil
 }
 
-func appendWrapCandidates(candidates []wrapCandidate, binDirs []string, managers []string, pmFilter func(string) bool, include func(string) bool, source string) []wrapCandidate {
-	for _, binDir := range binDirs {
-		for _, pm := range managers {
-			if !pmFilter(pm) {
-				continue
-			}
-			p := filepath.Join(binDir, pm)
-			if include(p) {
-				candidates = append(candidates, wrapCandidate{path: p, pm: pm, source: source})
-			}
-		}
+// sourceFor returns a short label describing where a path was
+// discovered, used for diagnostic output ("homebrew" / "mise" / etc.).
+// Heuristic based on path substrings — exact match is impossible since
+// pmsurvey returns flat paths.
+func sourceFor(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/opt/homebrew/"), strings.HasPrefix(path, "/usr/local/bin/"):
+		return "homebrew"
+	case strings.Contains(path, "/.local/share/mise/installs/"):
+		return "mise"
+	case strings.Contains(path, "/.asdf/installs/"):
+		return "asdf"
+	case strings.Contains(path, "/.pyenv/versions/"):
+		return "pyenv"
+	case strings.Contains(path, "/.nvm/versions/node/"):
+		return "nvm"
+	case strings.Contains(path, "/.bun/bin"):
+		return "bun"
+	case strings.Contains(path, "/.cargo/bin"):
+		return "cargo"
+	case strings.HasPrefix(path, "/usr/bin/"), strings.HasPrefix(path, "/usr/sbin/"):
+		return "system"
+	default:
+		return "path"
 	}
-	return candidates
-}
-
-// globToolVersionBinDirs returns every `<tool>/<version>/bin` directory under
-// a version-manager root such as mise's installs root or asdf's installs root.
-func globToolVersionBinDirs(root string) []string {
-	out := []string{}
-	tools, err := os.ReadDir(root)
-	if err != nil {
-		return out
-	}
-	for _, tool := range tools {
-		if !tool.IsDir() {
-			continue
-		}
-		toolDir := filepath.Join(root, tool.Name())
-		versions, err := os.ReadDir(toolDir)
-		if err != nil {
-			continue
-		}
-		for _, v := range versions {
-			if !v.IsDir() {
-				continue
-			}
-			binDir := filepath.Join(toolDir, v.Name(), "bin")
-			if info, err := os.Stat(binDir); err == nil && info.IsDir() {
-				out = append(out, binDir)
-			}
-		}
-	}
-	return out
-}
-
-// globVersionBinDirs returns every `<version>/bin` directory under a
-// version-manager root such as pyenv's versions root or nvm's node versions
-// root.
-func globVersionBinDirs(root string) []string {
-	out := []string{}
-	versions, err := os.ReadDir(root)
-	if err != nil {
-		return out
-	}
-	for _, v := range versions {
-		if !v.IsDir() {
-			continue
-		}
-		binDir := filepath.Join(root, v.Name(), "bin")
-		if info, err := os.Stat(binDir); err == nil && info.IsDir() {
-			out = append(out, binDir)
-		}
-	}
-	return out
 }
 
 // pointsAtVeto reports whether linkPath (a symlink) resolves to the
@@ -702,48 +808,130 @@ func isWrappableTarget(p, vetoPath string) bool {
 // the symlink-create step fails we've still left the system in a
 // recoverable state: the user can move .veto-original back manually,
 // or re-run install-wrappers to retry.
-func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAction, error) {
+//
+// vetoID may be nil — callers that don't have one yet (typically older
+// tests) skip the re-classify pass and trust the cached c.class.
+// Production callers pass the same identity discovery used.
+func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentity, dryRun, force bool) (wrapAction, error) {
+	// Re-classify at wrap time. Discovery (discoverWrapCandidatesWith)
+	// runs ClassifySymlink once on every candidate, but the candidates
+	// are processed in a loop and an earlier wrap can change a later
+	// candidate's effective target — the cached verdict goes stale.
+	// Concrete case from veto-ynv.4: bun is Mach-O at discovery, gets
+	// wrapped, becomes a veto symlink. bunx (relative symlink `./bun`
+	// in the same dir) now resolves through veto. Its cached
+	// ClassForeignWrapper verdict is stale; the live classification
+	// would say "ours-by-path" — a different action entirely. Calling
+	// ClassifySymlink again here is cheap (a few stats + a hash that
+	// is sync.Once'd on vetoID) and eliminates the staleness footgun.
+	if vetoID != nil {
+		if class, target, err := pmsurvey.ClassifySymlink(c.path, vetoID); err == nil {
+			c.class = class
+			c.target = target
+		}
+	}
+
+	// Classification-driven short-circuits for the broken / foreign
+	// cases. ClassPMLayoutSymlink (Homebrew Cellar, mise, npm-cli.js,
+	// rustup, etc.) is the canonical install layout and falls through
+	// to the regular wrap path — applyWrapper's rename + symlink works
+	// uniformly on a symlink whose target is a regular file.
+	switch c.class {
+	case pmsurvey.ClassBrokenSymlink:
+		return wrapperActionSkipBrokenSymlink, nil
+	case pmsurvey.ClassForeignWrapper:
+		// Without --force, leave foreign wrappers in place — overwriting
+		// them silently could break whatever installed them. The skip
+		// emits a visible line with the target so the user can decide.
+		// With --force, the safe-relink guard below handles migration
+		// without renaming a symlink onto an existing .veto-original
+		// (which would destroy the preserved real-binary trail).
+		if !force {
+			return wrapperActionSkipForeignWrapper, nil
+		}
+	case pmsurvey.ClassOursByPath, pmsurvey.ClassOursByHash:
+		// Re-classify saw a veto-identity symlink. If the
+		// `.veto-original` sibling exists, this is the canonical
+		// "already-ours" state — early-return as a skip so the wrap-loop
+		// below does not race to rename a symlink onto an existing
+		// sibling. If the sibling is missing, fall through to the
+		// regular wrap path which handles the broken-state case.
+		if _, err := os.Lstat(c.path + wrapperSuffix); err == nil {
+			return wrapperActionSkipAlreadyOurs, nil
+		}
+	}
+
 	original := c.path + wrapperSuffix
 
-	// Already wrapped? `c.path` is a symlink that resolves to the SAME
-	// physical file as vetoPath AND `<c.path>.veto-original` exists.
-	// Strict physical-path identity (not name substring) — see
-	// pointsAtVeto for rationale.
+	// Safe-relink guard: when c.path is ALREADY a symlink AND a
+	// `.veto-original` already exists alongside it, the rename-based
+	// wrap path below would replace `.veto-original` (which holds the
+	// preserved real-binary trail) with a symlink — destroying the
+	// only on-disk reference to the real PM binary.
 	//
-	// With --force the user is asking us to re-link even when nothing
-	// is broken: useful after moving the veto binary, or to recover
-	// confidence that nothing has rewritten the symlink. We delete the
-	// symlink and recreate it pointing at the current vetoPath.
+	// This covers two situations that the prior code conflated:
+	//
+	//  (a) Already ours: c.path → THIS veto. With --force, we just
+	//      re-point the symlink at the (possibly relocated) veto
+	//      binary, leaving `.veto-original` untouched.
+	//
+	//  (b) Foreign-veto wrap: c.path → a DIFFERENT veto binary (e.g.
+	//      the user wrapped earlier with /tmp/veto-old, then re-ran
+	//      install-wrappers --force with ~/.local/bin/veto). The
+	//      `.veto-original` still holds the real PM. The OLD code path
+	//      called `os.Rename(c.path, .veto-original)` here, atomically
+	//      overwriting the real binary with a stale symlink and
+	//      sending later execs into a tight veto→veto exec loop.
+	//
+	// Both (a) and (b) want exactly the same on-disk transition:
+	// drop the old symlink, install a new one pointing at the current
+	// vetoPath, leave `.veto-original` alone.
+	//
+	// Without --force, the existing state stays in place: ours →
+	// SkipAlreadyOurs, foreign → SkipForeignWrapper. (The foreign case
+	// is also intercepted up at the class switch when --force is
+	// unset; the branch here is only reachable for non-Foreign symlink
+	// states that aren't classified at discovery time, but the same
+	// no-touch policy applies.)
 	if existing, err := os.Lstat(c.path); err == nil && existing.Mode()&os.ModeSymlink != 0 {
-		if pointsAtVeto(c.path, vetoPath) {
-			if _, err := os.Lstat(original); err == nil {
-				if !force {
+		if _, err := os.Lstat(original); err == nil {
+			if !force {
+				if pointsAtVeto(c.path, vetoPath) {
 					return wrapperActionSkipAlreadyOurs, nil
 				}
-				if dryRun {
-					return wrapperActionSkipDryRun, nil
-				}
-				if err := os.Remove(c.path); err != nil {
-					if os.IsPermission(err) {
-						return wrapperActionSkipUnwritable, nil
-					}
-					return wrapperActionWrapped, errors.With(err, "remove existing veto symlink for --force relink").Set("path", c.path)
-				}
-				if err := os.Symlink(vetoPath, c.path); err != nil {
-					if os.IsPermission(err) {
-						return wrapperActionSkipUnwritable, nil
-					}
-					return wrapperActionWrapped, errors.With(err, "recreate veto symlink").Set("path", c.path)
-				}
-				return wrapperActionWrapped, nil
+				return wrapperActionSkipForeignWrapper, nil
 			}
+			if dryRun {
+				return wrapperActionSkipDryRun, nil
+			}
+			if err := os.Remove(c.path); err != nil {
+				if isReadOnlyFS(err) {
+					return wrapperActionSkipReadOnlyFS, nil
+				}
+				if os.IsPermission(err) {
+					return wrapperActionSkipUnwritable, nil
+				}
+				return wrapperActionWrapped, errors.With(err, "remove existing symlink for safe relink").Set("path", c.path)
+			}
+			if err := os.Symlink(vetoPath, c.path); err != nil {
+				if isReadOnlyFS(err) {
+					return wrapperActionSkipReadOnlyFS, nil
+				}
+				if os.IsPermission(err) {
+					return wrapperActionSkipUnwritable, nil
+				}
+				return wrapperActionWrapped, errors.With(err, "recreate veto symlink").Set("path", c.path)
+			}
+			return wrapperActionWrapped, nil
 		}
 	}
 
 	// Refuse to clobber if `.veto-original` already exists and we
 	// didn't ask for --force. This protects against the partial-state
 	// case where a previous wrap moved the original but failed to
-	// install the symlink.
+	// install the symlink. (Symlink + existing `.veto-original` is
+	// handled by the safe-relink guard above; this branch only fires
+	// when c.path is a regular file.)
 	if _, err := os.Lstat(original); err == nil && !force {
 		return wrapperActionWrapped, errors.WithNew(".veto-original already exists; pass --force to overwrite").
 			Set("path", original)
@@ -753,12 +941,17 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		return wrapperActionSkipDryRun, nil
 	}
 
-	// 1) Move the real binary aside. A permission error here means the
-	// candidate dir is read-only to this user — classify it as a skip
-	// (not a failure) so the caller can emit a sudo remediation and
-	// install-all keeps going. Check the raw os error: os.IsPermission
-	// does not see through the errors.With wrapper.
+	// 1) Move the real binary aside. EROFS (read-only filesystem,
+	// typically SIP-protected dirs like /usr/bin on macOS) and permission
+	// errors are both environmental — classify them as skips (not
+	// failures) so install-all keeps going. The two cases route to
+	// different actions because sudo helps with one (permission) but not
+	// the other (SIP). Check raw os errors: os.IsPermission and
+	// stderrors.Is do not see through errors.With wrappers.
 	if err := os.Rename(c.path, original); err != nil {
+		if isReadOnlyFS(err) {
+			return wrapperActionSkipReadOnlyFS, nil
+		}
 		if os.IsPermission(err) {
 			return wrapperActionSkipUnwritable, nil
 		}
@@ -769,6 +962,9 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		// Best-effort rollback so we don't strand the user with a
 		// PM that's invisible.
 		_ = os.Rename(original, c.path)
+		if isReadOnlyFS(err) {
+			return wrapperActionSkipReadOnlyFS, nil
+		}
 		if os.IsPermission(err) {
 			return wrapperActionSkipUnwritable, nil
 		}
@@ -891,6 +1087,63 @@ func (s *wrapperState) has(path string) bool {
 		}
 	}
 	return false
+}
+
+// stalePruneRecord describes one entry pruneStaleWrapperEntries removed
+// from state, so the caller can log a per-entry line. Reason is one of
+// "path missing" / "sibling missing" — the two failure modes that mean
+// "the registry is out of sync with disk."
+type stalePruneRecord struct {
+	Path   string
+	Reason string
+}
+
+// pruneStaleWrapperEntries drops every wrappers.json entry whose
+// on-disk anchors no longer exist. An entry survives only when BOTH
+// its `Path` exists AND its `<Path>.veto-original` sibling exists. If
+// either is missing, the entry no longer reflects reality and any
+// downstream operation that trusts it (notably uninstall-wrappers)
+// will mis-behave. Returns the list of pruned entries (for logging)
+// and a dirty flag indicating whether state was modified.
+//
+// Convergence semantics: this runs at the top of every install-wrappers
+// pass. It is the reconciliation step that lets a single
+// `veto install-all` recover from drift caused by repair-* runs, mise
+// upgrades, manual cleanup, or earlier veto versions. We do NOT attempt
+// to re-wrap missing entries — discovery will find any new live PM in
+// the same dir and wrap it on its own. Drop, don't heal.
+func pruneStaleWrapperEntries(state *wrapperState) ([]stalePruneRecord, bool) {
+	kept := make([]wrapperEntry, 0, len(state.Wrappers))
+	var pruned []stalePruneRecord
+	for _, w := range state.Wrappers {
+		reason := ""
+		if _, err := os.Lstat(w.Path); err != nil {
+			if os.IsNotExist(err) {
+				reason = "path missing"
+			}
+		}
+		if reason == "" {
+			sibling := w.OriginalPath
+			if sibling == "" {
+				sibling = w.Path + wrapperSuffix
+			}
+			if _, err := os.Lstat(sibling); err != nil {
+				if os.IsNotExist(err) {
+					reason = "sibling missing"
+				}
+			}
+		}
+		if reason != "" {
+			pruned = append(pruned, stalePruneRecord{Path: w.Path, Reason: reason})
+			continue
+		}
+		kept = append(kept, w)
+	}
+	if len(pruned) == 0 {
+		return nil, false
+	}
+	state.Wrappers = kept
+	return pruned, true
 }
 
 // loadWrapperState reads the state file. Missing file is not an error;

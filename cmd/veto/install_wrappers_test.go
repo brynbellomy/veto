@@ -2,11 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/brynbellomy/veto/internal/packagemanager/pmsurvey"
 )
 
 // TestApplyWrapper_HappyPath_RegularFile is the canonical case: a real
@@ -21,7 +25,7 @@ func TestApplyWrapper_HappyPath_RegularFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(npm, []byte("#!/bin/sh\nexec real-npm\n"), 0o755))
 
 	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
-	action, err := applyWrapper(c, veto, false, false)
+	action, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionWrapped, action)
 
@@ -54,7 +58,7 @@ func TestApplyWrapper_HappyPath_SymlinkSource(t *testing.T) {
 	require.NoError(t, os.Symlink(cellar, binNpm))
 
 	c := wrapCandidate{path: binNpm, pm: "npm", source: "homebrew"}
-	action, err := applyWrapper(c, veto, false, false)
+	action, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionWrapped, action)
 
@@ -79,10 +83,10 @@ func TestApplyWrapper_IdempotentOnSecondCall(t *testing.T) {
 	require.NoError(t, os.WriteFile(pip, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 
 	c := wrapCandidate{path: pip, pm: "pip", source: "user"}
-	_, err := applyWrapper(c, veto, false, false)
+	_, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 
-	action, err := applyWrapper(c, veto, false, false)
+	action, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipAlreadyOurs, action)
 }
@@ -99,12 +103,12 @@ func TestApplyWrapper_RefusesToClobberPartialState(t *testing.T) {
 	require.NoError(t, os.WriteFile(pnpm+".veto-original", []byte("stale"), 0o644))
 
 	c := wrapCandidate{path: pnpm, pm: "pnpm", source: "user"}
-	_, err := applyWrapper(c, veto, false, false)
+	_, err := applyWrapper(c, veto, nil, false, false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "already exists")
 
 	// --force overrides.
-	_, err = applyWrapper(c, veto, false, true)
+	_, err = applyWrapper(c, veto, nil, false, true)
 	require.NoError(t, err)
 }
 
@@ -122,16 +126,16 @@ func TestApplyWrapper_ForceRelinksAlreadyOurs(t *testing.T) {
 	require.NoError(t, os.WriteFile(npm, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 
 	// First wrap to get into the already-ours state.
-	_, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, false, false)
+	_, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, false, false)
 	require.NoError(t, err)
 
 	// Without --force, a second call short-circuits.
-	action, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, false, false)
+	action, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipAlreadyOurs, action)
 
 	// With --force, the symlink gets recreated.
-	action, err = applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, false, true)
+	action, err = applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, false, true)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionWrapped, action, "--force should recreate the symlink, not skip")
 
@@ -144,6 +148,84 @@ func TestApplyWrapper_ForceRelinksAlreadyOurs(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestApplyWrapper_ForceMigrationFromForeignVeto_PreservesRealBinary is the
+// regression guard for the veto→veto exec loop bug: running install-wrappers
+// --force a second time with a DIFFERENT veto binary used to call
+// os.Rename(c.path, c.path+".veto-original"), which atomically replaced the
+// preserved real-binary trail with a stale symlink. After enough --force
+// runs, every wrapped PM became a chain of veto binaries with no escape,
+// producing an infinite exec loop on the next invocation. The safe-relink
+// guard added to applyWrapper now refuses to rename a symlink onto a
+// populated .veto-original; this test pins that contract.
+func TestApplyWrapper_ForceMigrationFromForeignVeto_PreservesRealBinary(t *testing.T) {
+	dir := t.TempDir()
+	vetoA := filepath.Join(dir, "vetoA")
+	require.NoError(t, os.WriteFile(vetoA, []byte("#!/bin/sh\n# vetoA\n"), 0o755))
+	vetoB := filepath.Join(dir, "vetoB")
+	require.NoError(t, os.WriteFile(vetoB, []byte("#!/bin/sh\n# vetoB\n"), 0o755))
+
+	// Set up as if a prior install-wrappers run (with vetoA) had wrapped npm:
+	//   npm                 -> vetoA           (the previous veto symlink)
+	//   npm.veto-original   = real binary file (the preserved real PM)
+	npm := filepath.Join(dir, "npm")
+	realContent := []byte("#!/bin/sh\nexec real-npm\n")
+	require.NoError(t, os.WriteFile(npm+wrapperSuffix, realContent, 0o755))
+	require.NoError(t, os.Symlink(vetoA, npm))
+
+	// Now wrap again with vetoB --force. The OLD code would rename the
+	// vetoA-pointing symlink onto npm.veto-original, destroying the real
+	// binary and replacing it with a symlink to vetoA. After this transition
+	// the symlink chain at npm would point at vetoB and the real binary
+	// would be unrecoverable.
+	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
+	action, err := applyWrapper(c, vetoB, nil, false, true)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionWrapped, action)
+
+	// npm now points at vetoB (the new install target).
+	target, err := os.Readlink(npm)
+	require.NoError(t, err)
+	require.Equal(t, vetoB, target)
+
+	// npm.veto-original is STILL a regular file holding the real binary.
+	// Not a symlink to vetoA — that would mean the rename happened.
+	info, err := os.Lstat(npm + wrapperSuffix)
+	require.NoError(t, err)
+	require.Zero(t, info.Mode()&os.ModeSymlink, "veto-original must still be a regular file, not a symlink (rename would have replaced it)")
+	body, err := os.ReadFile(npm + wrapperSuffix)
+	require.NoError(t, err)
+	require.Equal(t, realContent, body, "the real PM binary content must be preserved across the --force migration")
+}
+
+// TestApplyWrapper_NoForceOnForeignVeto_SkipsAndDoesNotMutate guards the
+// inverse: without --force, a symlink-to-a-foreign-veto state must produce
+// a Skip and leave both c.path and .veto-original byte-identical.
+func TestApplyWrapper_NoForceOnForeignVeto_SkipsAndDoesNotMutate(t *testing.T) {
+	dir := t.TempDir()
+	vetoA := filepath.Join(dir, "vetoA")
+	require.NoError(t, os.WriteFile(vetoA, []byte("#!/bin/sh\n"), 0o755))
+	vetoB := filepath.Join(dir, "vetoB")
+	require.NoError(t, os.WriteFile(vetoB, []byte("#!/bin/sh\n"), 0o755))
+
+	npm := filepath.Join(dir, "npm")
+	realContent := []byte("#!/bin/sh\nexec real-npm\n")
+	require.NoError(t, os.WriteFile(npm+wrapperSuffix, realContent, 0o755))
+	require.NoError(t, os.Symlink(vetoA, npm))
+
+	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
+	action, err := applyWrapper(c, vetoB, nil, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionSkipForeignWrapper, action)
+
+	// Both files exactly as they were.
+	target, err := os.Readlink(npm)
+	require.NoError(t, err)
+	require.Equal(t, vetoA, target)
+	body, err := os.ReadFile(npm + wrapperSuffix)
+	require.NoError(t, err)
+	require.Equal(t, realContent, body)
+}
+
 // TestApplyWrapper_ForceRelinksAlreadyOurs_DryRun: --force --dry-run on
 // an already-ours path should report a would-wrap, not silently succeed
 // and not actually touch the filesystem.
@@ -153,13 +235,13 @@ func TestApplyWrapper_ForceRelinksAlreadyOurs_DryRun(t *testing.T) {
 	require.NoError(t, os.WriteFile(veto, []byte(""), 0o755))
 	npm := filepath.Join(dir, "npm")
 	require.NoError(t, os.WriteFile(npm, []byte("#!/bin/sh\n"), 0o755))
-	_, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, false, false)
+	_, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, false, false)
 	require.NoError(t, err)
 
 	before, err := os.Readlink(npm)
 	require.NoError(t, err)
 
-	action, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, true, true)
+	action, err := applyWrapper(wrapCandidate{path: npm, pm: "npm", source: "user"}, veto, nil, true, true)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipDryRun, action)
 
@@ -260,6 +342,150 @@ func TestDiscoverWrapCandidates_IncludesPyenvAndNvmInstalls(t *testing.T) {
 	require.Equal(t, "npm", byPath[nvmNpm].pm)
 }
 
+// TestDiscoverWrapCandidates_IncludesUVCanonicalPython proves the
+// install-wrappers discovery path enumerates the canonical versioned
+// python3.X binary from a uv-managed cpython store — the
+// closing-the-uv-venv-bypass surface. Only the canonical `python3.X`
+// regular file is a wrap candidate; the `python` / `python3` aliases
+// that live next to it are symlinks back to python3.X and inherit the
+// wrap via the existing chain. Wrapping the aliases independently
+// would corrupt the exec chain (see TestPathsForUVStoreFiltersAliasSymlinks).
+func TestDiscoverWrapCandidates_IncludesUVCanonicalPython(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "") // isolate from the runner's PATH
+
+	veto := filepath.Join(home, ".local", "bin", "veto")
+	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
+	require.NoError(t, os.WriteFile(veto, []byte(""), 0o755))
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	uvPy3 := filepath.Join(uvBin, "python3")
+	uvPy312 := filepath.Join(uvBin, "python3.12")
+	// Real uv layout: python3.12 is the canonical regular file; python3
+	// is a symlink to it.
+	require.NoError(t, os.MkdirAll(uvBin, 0o755))
+	require.NoError(t, os.WriteFile(uvPy312, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	require.NoError(t, os.Symlink("python3.12", uvPy3))
+
+	candidates, err := discoverWrapCandidates(
+		wrapperFlags{only: map[string]struct{}{"python3": {}, "python3.12": {}}},
+		veto,
+	)
+	require.NoError(t, err)
+
+	byPath := map[string]wrapCandidate{}
+	for _, c := range candidates {
+		byPath[c.path] = c
+	}
+	require.Contains(t, byPath, uvPy312,
+		"uv canonical python3.12 must be surfaced for wrapping")
+	require.Equal(t, "python3.12", byPath[uvPy312].pm)
+	require.NotContains(t, byPath, uvPy3,
+		"uv-store python3 alias symlink must NOT surface — inherits wrap via python3 → python3.12 → veto chain")
+}
+
+// TestRunInstallWrappers_WrapsUVCanonicalPython drives install-wrappers
+// end-to-end against a faked uv store + tempdir cache, asserting the
+// canonical python3.12 binary gets symlink-replaced with veto and its
+// real bytes preserved at .veto-original.
+func TestRunInstallWrappers_WrapsUVCanonicalPython(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+	veto := filepath.Join(home, ".local", "bin", "veto")
+	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	uvPy312 := filepath.Join(uvBin, "python3.12")
+	require.NoError(t, os.MkdirAll(filepath.Dir(uvPy312), 0o755))
+	originalBody := []byte("#!/bin/sh\necho real-python3.12\n")
+	require.NoError(t, os.WriteFile(uvPy312, originalBody, 0o755))
+
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+	cfg := config{CacheDir: filepath.Join(home, ".cache", "veto")}
+	rc, stats := runInstallWrappersWith(
+		zerologNop(), cfg,
+		wrapperFlags{only: map[string]struct{}{"python3.12": {}}},
+		veto, id,
+	)
+	require.Equal(t, exitOK, rc)
+	require.GreaterOrEqual(t, stats.wrapped, 1)
+
+	// python3.12 is now a symlink to veto.
+	info, err := os.Lstat(uvPy312)
+	require.NoError(t, err)
+	require.NotZero(t, info.Mode()&os.ModeSymlink, "expected python3.12 to be a symlink")
+	tgt, err := os.Readlink(uvPy312)
+	require.NoError(t, err)
+	require.Equal(t, veto, tgt)
+
+	// Real bytes preserved at .veto-original.
+	body, err := os.ReadFile(uvPy312 + ".veto-original")
+	require.NoError(t, err)
+	require.Equal(t, originalBody, body)
+}
+
+// TestRunInstallWrappers_ReentrantOnUVCanonicalPython proves re-running
+// install-wrappers when python3.X is ALREADY wrapped (symlink to veto
+// + populated .veto-original) is a safe no-op. Regression for the
+// safe-relink guard added in 666c33e: a follow-up run must not rename
+// the symlink onto the existing .veto-original sibling.
+func TestRunInstallWrappers_ReentrantOnUVCanonicalPython(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+	veto := filepath.Join(home, ".local", "bin", "veto")
+	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+
+	uvBin := filepath.Join(home, ".local", "share", "uv", "python",
+		"cpython-3.12.4-macos-aarch64-none", "bin")
+	uvPy312 := filepath.Join(uvBin, "python3.12")
+	require.NoError(t, os.MkdirAll(filepath.Dir(uvPy312), 0o755))
+	originalBody := []byte("#!/bin/sh\necho real-python3.12\n")
+	require.NoError(t, os.WriteFile(uvPy312, originalBody, 0o755))
+
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+	cfg := config{CacheDir: filepath.Join(home, ".cache", "veto")}
+
+	// First run: wraps.
+	rc1, _ := runInstallWrappersWith(
+		zerologNop(), cfg,
+		wrapperFlags{only: map[string]struct{}{"python3.12": {}}},
+		veto, id,
+	)
+	require.Equal(t, exitOK, rc1)
+
+	// Second run: safe-relink guard makes this a no-op (alreadyOurs).
+	rc2, stats := runInstallWrappersWith(
+		zerologNop(), cfg,
+		wrapperFlags{only: map[string]struct{}{"python3.12": {}}},
+		veto, id,
+	)
+	require.Equal(t, exitOK, rc2)
+	require.Zero(t, stats.failed,
+		"re-running install-wrappers on an already-wrapped python3.X must not fail")
+	require.GreaterOrEqual(t, stats.alreadyOurs, 1,
+		"re-run must classify python3.X as already-ours")
+
+	// .veto-original is intact and still has the real bytes — the
+	// safe-relink guard did not overwrite it with a stale symlink.
+	body, err := os.ReadFile(uvPy312 + ".veto-original")
+	require.NoError(t, err)
+	require.Equal(t, originalBody, body,
+		".veto-original must hold the original real bytes after re-run")
+}
+
 func TestDiscoverWrapCandidates_ReconcilesAlreadyWrappedPyenvAndNvm(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -297,7 +523,7 @@ func TestApplyWrapper_DryRun_TouchesNothing(t *testing.T) {
 	require.NoError(t, os.WriteFile(pip, originalBody, 0o755))
 
 	c := wrapCandidate{path: pip, pm: "pip", source: "user"}
-	action, err := applyWrapper(c, veto, true, false)
+	action, err := applyWrapper(c, veto, nil, true, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipDryRun, action)
 
@@ -319,7 +545,7 @@ func TestUnwrap_RestoresOriginal(t *testing.T) {
 	require.NoError(t, os.WriteFile(npm, realBody, 0o755))
 
 	c := wrapCandidate{path: npm, pm: "npm", source: "user"}
-	_, err := applyWrapper(c, veto, false, false)
+	_, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 
 	entry := wrapperEntry{
@@ -432,6 +658,44 @@ func TestFindWrappedOriginal_RejectsUnregisteredSibling(t *testing.T) {
 	require.Empty(t, got)
 }
 
+// TestFindWrappedOriginal_RejectsSelfReferentialSibling proves the
+// runtime self-reference guard: if a wrapper's `.veto-original`
+// sibling resolves through symlinks back to veto's own executable,
+// findWrappedOriginal must refuse to honor it. Without the guard,
+// execReal would exec the sibling, which IS veto — an immediate
+// infinite re-entry loop.
+//
+// Concretely we plant `npm` as a regular file in a registered tempdir
+// and make `npm.veto-original` a symlink to veto's own executable
+// (using the test binary as a stand-in for veto, the same trick the
+// PATH-walk tests use). EvalSymlinks(original) then equals
+// EvalSymlinks(self), and the guard fires.
+//
+// This is the belt-and-suspenders complement to the discovery-side
+// filter in pmsurvey.PathsFor; together they prevent the chain
+// corruption that surfaces when an alias symlink and its target both
+// get wrapped (alias.veto-original points at the target, which is
+// now a symlink to veto).
+func TestFindWrappedOriginal_RejectsSelfReferentialSibling(t *testing.T) {
+	dir := t.TempDir()
+	self, err := os.Executable()
+	require.NoError(t, err)
+
+	npm := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(npm, []byte(""), 0o755))
+
+	// Plant a self-referential .veto-original symlink: it resolves to
+	// the test binary, which IS veto's "self" inside this test.
+	original := npm + ".veto-original"
+	require.NoError(t, os.Symlink(self, original))
+
+	registered := func(p string) bool { return p == npm }
+	got, ok := findWrappedOriginal(npm, registered)
+	require.False(t, ok,
+		"self-referential .veto-original must be rejected — exec'ing it would loop veto into itself")
+	require.Empty(t, got)
+}
+
 // TestFindRealBinary_RejectsUnregisteredSiblingInPathWalk covers the
 // PATH-walk branch of B1. When veto walks PATH and a candidate is
 // `selfReal` (i.e. a wrapper at that PATH entry IS veto), the loop
@@ -486,6 +750,52 @@ func TestFindRealBinary_HonorsRegisteredSibling(t *testing.T) {
 	got, err := findRealBinary("npm", registered)
 	require.NoError(t, err)
 	require.Equal(t, original, got)
+}
+
+// TestFindRealBinary_RejectsSelfReferentialSiblingInPathWalk is the
+// regression guard for the veto-dzk python-shim stall (veto-dzk.2).
+//
+// Before the fix, the PATH-walk branch of findRealBinary honored ANY
+// `<candidate>.veto-original` sibling whose os.Stat said "executable,"
+// even when the sibling chained through symlinks back into veto
+// itself. That produced an immediate exec loop: veto-as-python3 →
+// findRealBinary → returns self-referential .veto-original → veto
+// exec's it → kernel runs veto again → repeat until the process is
+// killed. On bryn's box every ~/.local/bin/python3*.veto-original
+// symlink pointed at ~/.local/bin/veto, the wrap site was registered
+// in wrappers.json, and the loop pegged a CPU core indefinitely.
+//
+// The fix mirrors findWrappedOriginal's `isSelfReferential` guard here
+// so both the argv[0] lookup path and the PATH walk agree on which
+// siblings to reject.
+func TestFindRealBinary_RejectsSelfReferentialSiblingInPathWalk(t *testing.T) {
+	dir := t.TempDir()
+
+	self, err := os.Executable()
+	require.NoError(t, err)
+
+	// `dir/python3` is a symlink to "veto" (the test binary). This puts
+	// the PATH-walk on the branch where the candidate resolves to
+	// selfReal.
+	python3 := filepath.Join(dir, "python3")
+	require.NoError(t, os.Symlink(self, python3))
+
+	// `dir/python3.veto-original` is ALSO a symlink to "veto" — the
+	// exact bryn-box shape captured in the veto-dzk.1 bead.
+	staleOriginal := python3 + ".veto-original"
+	require.NoError(t, os.Symlink(self, staleOriginal))
+
+	t.Setenv("PATH", dir)
+
+	// And the wrap site IS registered (matching the on-disk wrappers.json
+	// on bryn's box — install-wrappers had recorded the ~/.local/bin
+	// python paths).
+	registered := func(p string) bool { return p == python3 }
+
+	_, err = findRealBinary("python3", registered)
+	require.Error(t, err,
+		"PATH-walk must refuse self-referential sibling — exec'ing it would loop veto into itself")
+	require.Contains(t, err.Error(), "not found in PATH")
 }
 
 // TestWrapperRegisteredFunc_MissingStateFailsClosed: when wrappers.json
@@ -700,7 +1010,7 @@ func TestRunInstallWrappers_EndToEnd(t *testing.T) {
 	}
 	state := wrapperState{}
 	for _, c := range candidates {
-		_, err := applyWrapper(c, vetoBin, false, false)
+		_, err := applyWrapper(c, vetoBin, nil, false, false)
 		require.NoError(t, err)
 		state.add(wrapperEntry{Path: c.path, OriginalPath: c.path + wrapperSuffix, PM: c.pm, Source: c.source})
 	}
@@ -757,7 +1067,7 @@ func TestApplyWrapper_ReadOnlyDir_SkipsUnwritable(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(roDir, 0o755) })
 
 	c := wrapCandidate{path: pip3, pm: "pip3", source: "user"}
-	action, err := applyWrapper(c, veto, false, false)
+	action, err := applyWrapper(c, veto, nil, false, false)
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipUnwritable, action)
 
@@ -768,6 +1078,20 @@ func TestApplyWrapper_ReadOnlyDir_SkipsUnwritable(t *testing.T) {
 	require.Zero(t, info.Mode()&os.ModeSymlink)
 	_, err = os.Lstat(pip3 + wrapperSuffix)
 	require.True(t, os.IsNotExist(err), "no .veto-original should be left behind")
+}
+
+// TestIsReadOnlyFS confirms EROFS is unwrapped through fs.PathError (the
+// wrapper os.Rename returns) and through bare syscall errnos, and that
+// EACCES / EPERM do NOT match — those route to skippedUnwritable, not
+// skippedReadOnlyFS. Regression guard for the macOS SIP path where
+// /usr/bin/pip3 surfaced as a hard FAIL.
+func TestIsReadOnlyFS(t *testing.T) {
+	require.True(t, isReadOnlyFS(syscall.EROFS))
+	require.True(t, isReadOnlyFS(&fs.PathError{Op: "rename", Path: "/usr/bin/pip3", Err: syscall.EROFS}))
+	require.False(t, isReadOnlyFS(syscall.EACCES))
+	require.False(t, isReadOnlyFS(syscall.EPERM))
+	require.False(t, isReadOnlyFS(nil))
+	require.False(t, isReadOnlyFS(&fs.PathError{Op: "rename", Path: "/tmp/foo", Err: syscall.EACCES}))
 }
 
 // TestUnwritableRemediationCommands_GroupsByDir verifies the sudo hint:
@@ -786,4 +1110,305 @@ func TestUnwritableRemediationCommands_GroupsByDir(t *testing.T) {
 		"sudo veto install-wrappers --dir /usr/local/bin --only pip3 --only pip",
 		"sudo veto install-wrappers --dir /opt/locked/bin --only npm",
 	}, cmds)
+}
+
+// TestPruneStaleWrapperEntries_DropsMissingPathAndSibling proves the
+// convergence pass at the top of install-wrappers reconciles
+// wrappers.json against disk: any entry whose Path is missing OR whose
+// .veto-original sibling is missing gets dropped. Without this,
+// install-wrappers only ADDS — drifted state stays drifted forever and
+// doctor FAILs the entries indefinitely.
+func TestPruneStaleWrapperEntries_DropsMissingPathAndSibling(t *testing.T) {
+	dir := t.TempDir()
+
+	// Entry 1: legit, both path and sibling exist.
+	legitPath := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(legitPath, []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.WriteFile(legitPath+".veto-original", []byte("real"), 0o755))
+
+	// Entry 2: path is missing — pruned.
+	missingPath := filepath.Join(dir, "pnpm")
+
+	// Entry 3: path exists but sibling is missing — pruned.
+	noSibling := filepath.Join(dir, "yarn")
+	require.NoError(t, os.WriteFile(noSibling, []byte("#!/bin/sh\n"), 0o755))
+
+	state := wrapperState{Wrappers: []wrapperEntry{
+		{Path: legitPath, OriginalPath: legitPath + ".veto-original", PM: "npm"},
+		{Path: missingPath, OriginalPath: missingPath + ".veto-original", PM: "pnpm"},
+		{Path: noSibling, OriginalPath: noSibling + ".veto-original", PM: "yarn"},
+	}}
+
+	pruned, dirty := pruneStaleWrapperEntries(&state)
+	require.True(t, dirty)
+	require.Len(t, pruned, 2)
+	require.Len(t, state.Wrappers, 1)
+	require.Equal(t, legitPath, state.Wrappers[0].Path)
+
+	// Reasons are surfaced for logging.
+	reasonByPath := map[string]string{}
+	for _, p := range pruned {
+		reasonByPath[p.Path] = p.Reason
+	}
+	require.Equal(t, "path missing", reasonByPath[missingPath])
+	require.Equal(t, "sibling missing", reasonByPath[noSibling])
+}
+
+// TestPruneStaleWrapperEntries_NoOpWhenClean proves the prune leaves
+// state untouched (dirty=false, no records) when every entry is
+// reflected on disk.
+func TestPruneStaleWrapperEntries_NoOpWhenClean(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(path, []byte(""), 0o755))
+	require.NoError(t, os.WriteFile(path+".veto-original", []byte(""), 0o755))
+
+	state := wrapperState{Wrappers: []wrapperEntry{{
+		Path: path, OriginalPath: path + ".veto-original", PM: "npm",
+	}}}
+	before := state
+	pruned, dirty := pruneStaleWrapperEntries(&state)
+	require.False(t, dirty)
+	require.Nil(t, pruned)
+	require.Equal(t, before, state)
+}
+
+// TestPruneStaleWrapperEntries_FallsBackToImpliedSibling proves an
+// entry that omits OriginalPath (older registry entries didn't always
+// set it) still has its sibling checked at <Path>.veto-original.
+func TestPruneStaleWrapperEntries_FallsBackToImpliedSibling(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "npm")
+	require.NoError(t, os.WriteFile(path, []byte(""), 0o755))
+	// NO sibling file — implied <path>.veto-original is absent.
+
+	state := wrapperState{Wrappers: []wrapperEntry{{
+		Path: path, OriginalPath: "", PM: "npm",
+	}}}
+	pruned, dirty := pruneStaleWrapperEntries(&state)
+	require.True(t, dirty)
+	require.Len(t, pruned, 1)
+	require.Equal(t, "sibling missing", pruned[0].Reason)
+}
+
+// TestApplyWrapper_ReClassifiesAtWrapTime is the veto-3z6 guarantee.
+// Discovery (discoverWrapCandidatesWith) classifies every candidate
+// once at the top, but the candidates are processed in a loop and an
+// earlier wrap can change a later candidate's effective target.
+// Concrete case: a sibling-symlink multiplexer like bunx ("./bun") in
+// the same dir as bun. After bun gets wrapped, bunx — still cached as
+// ClassForeignWrapper from discovery — now resolves through veto. Live
+// classification would say "ours-by-path". applyWrapper must use the
+// live verdict, not the stale one.
+func TestApplyWrapper_ReClassifiesAtWrapTime(t *testing.T) {
+	dir := t.TempDir()
+
+	// Plant a "veto" binary and a `.veto-original` so the existence
+	// check in applyWrapper's already-ours short-circuit is satisfied.
+	veto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+
+	// Plant a candidate that IS already wrapped (symlink → veto +
+	// existing .veto-original sibling).
+	candidate := filepath.Join(dir, "bunx")
+	require.NoError(t, os.Symlink(veto, candidate))
+	require.NoError(t, os.WriteFile(candidate+".veto-original", []byte("real-bunx"), 0o755))
+
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// Pass a STALE classification (ClassForeignWrapper) — discovery
+	// would have set this before bun was wrapped. With re-classify
+	// enabled, applyWrapper looks at the actual on-disk state and
+	// returns AlreadyOurs instead of trying to overwrite a wrapped
+	// candidate.
+	c := wrapCandidate{
+		path:   candidate,
+		pm:     "bunx",
+		source: "bun",
+		class:  pmsurvey.ClassForeignWrapper,
+		target: "./bun",
+	}
+	action, err := applyWrapper(c, veto, id, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionSkipAlreadyOurs, action,
+		"applyWrapper must re-classify and see the live ours-by-path state")
+}
+
+// TestClassifySymlink_PMLayoutSymlink_AppleSiliconHomebrew is the
+// fixture-A guarantee from veto-2dg: a symlink whose target lives
+// inside a canonical Apple Silicon Homebrew Cellar path classifies as
+// ClassPMLayoutSymlink (wrappable by default), NOT ClassForeignWrapper.
+// Without this, every Homebrew-installed Mach-O on a dev machine would
+// be SKIPped as "foreign wrapper" and the user would have to
+// --force every install-wrappers run.
+func TestClassifySymlink_PMLayoutSymlink_AppleSiliconHomebrew(t *testing.T) {
+	root := t.TempDir()
+	// Plant a fake veto.
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto bin"), 0o755))
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// Plant a Cellar-like layout. The classifier matches on the
+	// substring "/homebrew/Cellar/" so a tempdir + that subpath is
+	// recognised exactly like /opt/homebrew/Cellar/.
+	cellarBin := filepath.Join(root, "homebrew", "Cellar", "python@3.14", "3.14.3_1", "bin")
+	require.NoError(t, os.MkdirAll(cellarBin, 0o755))
+	realPython := filepath.Join(cellarBin, "python3.14")
+	require.NoError(t, os.WriteFile(realPython, []byte("real python bytes"), 0o755))
+
+	// Plant the canonical bin/<pm> → Cellar/.../bin/python3.14 symlink.
+	binDir := filepath.Join(root, "homebrew", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	candidate := filepath.Join(binDir, "python3")
+	require.NoError(t, os.Symlink(realPython, candidate))
+
+	class, target, err := pmsurvey.ClassifySymlink(candidate, id)
+	require.NoError(t, err)
+	require.Equal(t, pmsurvey.ClassPMLayoutSymlink, class,
+		"Homebrew Cellar layout must classify as PMLayoutSymlink, not ForeignWrapper; got %s", class)
+	resolved, _ := filepath.EvalSymlinks(realPython)
+	require.Equal(t, resolved, target)
+}
+
+// TestClassifySymlink_PMLayoutSymlink_NpmCliJs proves the npm-cli.js
+// case: /opt/homebrew/bin/npm → /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js
+// classifies as ClassPMLayoutSymlink. The classifier accepts the
+// node_modules subpath as a PM install location.
+func TestClassifySymlink_PMLayoutSymlink_NpmCliJs(t *testing.T) {
+	root := t.TempDir()
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// Plant a Homebrew node_modules layout.
+	cliBin := filepath.Join(root, "homebrew", "lib", "node_modules", "npm", "bin")
+	require.NoError(t, os.MkdirAll(cliBin, 0o755))
+	cliJs := filepath.Join(cliBin, "npm-cli.js")
+	require.NoError(t, os.WriteFile(cliJs, []byte("#!/usr/bin/env node\n"), 0o755))
+
+	binDir := filepath.Join(root, "homebrew", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	candidate := filepath.Join(binDir, "npm")
+	require.NoError(t, os.Symlink(cliJs, candidate))
+
+	class, _, err := pmsurvey.ClassifySymlink(candidate, id)
+	require.NoError(t, err)
+	require.Equal(t, pmsurvey.ClassPMLayoutSymlink, class)
+}
+
+// TestClassifySymlink_ForeignWrapper_OutsideAllPMDirs is the fixture-B
+// guarantee: a symlink to an executable whose target is NOT in any
+// known PM install dir keeps the ClassForeignWrapper verdict.
+// Reserves the --force gate for genuinely user-planted custom
+// wrappers — the security boundary stays intact.
+func TestClassifySymlink_ForeignWrapper_OutsideAllPMDirs(t *testing.T) {
+	root := t.TempDir()
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// Plant a random executable that is NOT in any known PM dir.
+	randomDir := filepath.Join(root, "random", "place")
+	require.NoError(t, os.MkdirAll(randomDir, 0o755))
+	target := filepath.Join(randomDir, "my-custom-python")
+	require.NoError(t, os.WriteFile(target, []byte("custom"), 0o755))
+
+	// Symlink to it from another random path.
+	binDir := filepath.Join(root, "user", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	candidate := filepath.Join(binDir, "python3")
+	require.NoError(t, os.Symlink(target, candidate))
+
+	class, _, err := pmsurvey.ClassifySymlink(candidate, id)
+	require.NoError(t, err)
+	require.Equal(t, pmsurvey.ClassForeignWrapper, class,
+		"non-PM-dir target must remain ClassForeignWrapper; got %s", class)
+}
+
+// TestApplyWrapper_PMLayoutSymlinkWrapsWithoutForce is the end-to-end
+// guarantee that the classifier change reaches install-wrappers: a
+// candidate carrying ClassPMLayoutSymlink wraps without --force, the
+// rename + symlink dance preserves the original at .veto-original, and
+// the new symlink at the candidate path points at veto.
+func TestApplyWrapper_PMLayoutSymlinkWrapsWithoutForce(t *testing.T) {
+	root := t.TempDir()
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+
+	// Real Cellar-style binary the symlink points at.
+	cellarBin := filepath.Join(root, "homebrew", "Cellar", "python@3.14", "3.14.3_1", "bin")
+	require.NoError(t, os.MkdirAll(cellarBin, 0o755))
+	realPython := filepath.Join(cellarBin, "python3.14")
+	require.NoError(t, os.WriteFile(realPython, []byte("real-python"), 0o755))
+
+	// Candidate: bin/python3 → Cellar/.../python3.14.
+	binDir := filepath.Join(root, "homebrew", "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	candidate := filepath.Join(binDir, "python3")
+	require.NoError(t, os.Symlink(realPython, candidate))
+
+	c := wrapCandidate{
+		path:   candidate,
+		pm:     "python3",
+		source: "homebrew",
+		class:  pmsurvey.ClassPMLayoutSymlink,
+		target: realPython,
+	}
+
+	// Pass nil identity so the re-classify pass is skipped and the
+	// dispatch hinges on c.class alone. NO --force.
+	action, err := applyWrapper(c, veto, nil, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionWrapped, action,
+		"ClassPMLayoutSymlink must wrap without --force")
+
+	// candidate is now a symlink to veto.
+	resolved, err := filepath.EvalSymlinks(candidate)
+	require.NoError(t, err)
+	resolvedVeto, err := filepath.EvalSymlinks(veto)
+	require.NoError(t, err)
+	require.Equal(t, resolvedVeto, resolved)
+
+	// The original symlink (→ Cellar python3.14) is preserved at
+	// .veto-original.
+	original := candidate + ".veto-original"
+	got, err := os.Readlink(original)
+	require.NoError(t, err, "expected .veto-original to be the moved-aside symlink")
+	require.Equal(t, realPython, got)
+}
+
+// TestApplyWrapper_ForeignWrapperStillSkipsWithoutForce proves the
+// --force gate is still in force for genuinely-foreign symlinks. The
+// security boundary did not loosen: only symlinks into known PM dirs
+// get the permissive verdict; everything else stays gated.
+func TestApplyWrapper_ForeignWrapperStillSkipsWithoutForce(t *testing.T) {
+	root := t.TempDir()
+	veto := filepath.Join(root, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+
+	// Target outside any known PM dir.
+	target := filepath.Join(root, "custom", "my-python")
+	require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o755))
+	require.NoError(t, os.WriteFile(target, []byte("custom-python"), 0o755))
+
+	candidate := filepath.Join(root, "user", "bin", "python3")
+	require.NoError(t, os.MkdirAll(filepath.Dir(candidate), 0o755))
+	require.NoError(t, os.Symlink(target, candidate))
+
+	c := wrapCandidate{
+		path:   candidate,
+		pm:     "python3",
+		source: "user",
+		class:  pmsurvey.ClassForeignWrapper,
+		target: target,
+	}
+
+	action, err := applyWrapper(c, veto, nil, false, false)
+	require.NoError(t, err)
+	require.Equal(t, wrapperActionSkipForeignWrapper, action,
+		"non-PM-dir foreign wrapper must still SKIP without --force")
 }

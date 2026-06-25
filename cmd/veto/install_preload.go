@@ -113,17 +113,14 @@ func runInstallPreload(logger zerolog.Logger, args []string) int {
 		return exitOK
 	}
 
-	rcPath := opts.shellRC
-	if rcPath == "" && opts.autoRC {
-		rcPath, err = autoDetectShellRC()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "veto install-preload: %v\n", err)
-			fmt.Fprintln(os.Stderr, "Pass --shell-rc PATH explicitly, or use --print to dump the export lines.")
-			return exitUsage
-		}
+	rcPaths, err := preloadShellRCTargets(opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "veto install-preload: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Pass --shell-rc PATH explicitly, or use --print to dump the export lines.")
+		return exitUsage
 	}
 
-	if rcPath == "" {
+	if len(rcPaths) == 0 {
 		// No file edit requested — print the block plus a clear note.
 		fmt.Println()
 		fmt.Println("# Add the block below to your shell rc (~/.zshrc, ~/.bashrc, …)")
@@ -133,16 +130,50 @@ func runInstallPreload(logger zerolog.Logger, args []string) int {
 		return exitOK
 	}
 
-	if err := upsertShellRCBlock(rcPath, envBlock); err != nil {
-		logger.Error().Err(err).Str("rc", rcPath).Msg("update shell rc")
-		return exitInternal
+	for _, rcPath := range rcPaths {
+		if err := upsertShellRCBlock(rcPath, envBlock); err != nil {
+			logger.Error().Err(err).Str("rc", rcPath).Msg("update shell rc")
+			return exitInternal
+		}
+		fmt.Printf("veto: wrote preload block to %s\n", rcPath)
 	}
-	fmt.Printf("veto: wrote preload block to %s\n", rcPath)
-	fmt.Println("         Open a new terminal (or `source ~/.zshrc`), then run `veto doctor` —")
+	fmt.Println("         Open a new terminal (or source your shell rc), then run `veto doctor` —")
 	fmt.Println("         the 'interposer env' check should go from WARN to PASS.")
 	fmt.Println()
 	printSIPCaveat(os.Stdout)
 	return exitOK
+}
+
+// preloadShellRCTargets returns the list of rc files to write the preload
+// block to. Semantics mirror shellIntegrationTargets: an explicit
+// --shell-rc PATH wins (single file), --shell-rc auto fans out to the
+// auto-detected interactive rc PLUS the bash family (.bashrc,
+// .bash_profile, .profile) when bash is on disk, and no flag at all
+// returns an empty list (caller prints the block instead of writing).
+//
+// Why fan out: the env-export block (DYLD_INSERT_LIBRARIES /
+// LD_PRELOAD / VETO_PATH) needs to be set in whatever shell ends up
+// running the user's package-manager commands. A zsh user who drops
+// into bash for a script, or an agent runner that sources .profile
+// for non-interactive login, will otherwise silently lose Layer 3.
+// Shell integration already fans out for the same reason; preload had
+// drifted out of parity (zsh-only by default), and this aligns them.
+func preloadShellRCTargets(opts preloadOpts) ([]string, error) {
+	if opts.shellRC != "" {
+		return []string{opts.shellRC}, nil
+	}
+	if !opts.autoRC {
+		return nil, nil
+	}
+	targets, err := defaultShellIntegrationTargets()
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(targets))
+	for _, t := range targets {
+		paths = append(paths, t.path)
+	}
+	return paths, nil
 }
 
 // verifyInterposerLoads spawns a quick test subprocess with the
@@ -218,15 +249,12 @@ func runUninstallPreload(logger zerolog.Logger, args []string) int {
 		return exitUsage
 	}
 
-	rcPath := opts.shellRC
-	if rcPath == "" && opts.autoRC {
-		rcPath, err = autoDetectShellRC()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "veto uninstall-preload: %v\n", err)
-			return exitUsage
-		}
+	rcPaths, err := preloadShellRCTargets(opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "veto uninstall-preload: %v\n", err)
+		return exitUsage
 	}
-	if rcPath != "" {
+	for _, rcPath := range rcPaths {
 		if removed, err := removeShellRCBlock(rcPath); err != nil {
 			logger.Error().Err(err).Str("rc", rcPath).Msg("strip rc block")
 			return exitInternal

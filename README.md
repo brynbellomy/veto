@@ -36,6 +36,54 @@ Use `veto npm install <pkg>`, `veto pip install <pkg>`, `veto uv pip
 install <pkg>`, `veto go get <pkg>`, or `veto cargo add <crate>` to run
 one package-manager command through the gate explicitly.
 
+### Upgrading an existing install
+
+veto iterates quickly. When you pull a new version the layered
+install state on disk needs to be re-synced with the new binary —
+some shims/wrappers point at the old veto path, the C interposer
+header may have changed PMs, and new shim names may have been added
+(uv-managed python3.X aliases, for example). The canonical upgrade
+sequence:
+
+```sh
+cd path/to/veto
+git pull
+make install                       # rebuild + replace ~/.local/bin/veto
+veto install-shims --force         # re-point Layer 2 shims at the new binary,
+                                   # add any newly-discovered python3.X shims
+make interposer                    # regenerate pm_names.h, rebuild the dylib
+veto install-preload --lib $(pwd)/libveto_interpose.dylib  # macOS path; see
+                                                            # `install-preload --help`
+veto install-wrappers --force      # re-point Layer 4 wrappers; add new ones
+                                   # (uv canonical python3.X binaries, …)
+veto sync                          # refresh intel
+veto doctor                        # confirm green
+```
+
+`veto install-all --force` is the one-shot equivalent for the common
+case; the granular commands above let you skip layers that haven't
+changed.
+
+If `veto doctor` reports drift — stray `*.veto-original` siblings in
+the Layer 2 shim dir, stale wrappers.json entries, foreign-wrapper
+FAILs on the canonical Homebrew install — just run:
+
+```sh
+veto install-all
+```
+
+install-all is the convergence command: it reconciles each layer
+against the current on-disk state, prunes anything stale, and
+re-applies anything missing. The same command handles "first install"
+and "recover from drift" without flags.
+
+(Older versions of veto exposed `repair-shims` and recommended
+`uninstall-wrappers && install-wrappers` for recovery; both are gone.
+The scrub-stale-siblings + prune-stale-entries logic now runs at the
+top of every install-shims / install-wrappers pass.) See
+[docs/2026-06-23--python-shim-stall-postmortem.md](docs/2026-06-23--python-shim-stall-postmortem.md)
+for the failure mode that motivated the convergence rewrite.
+
 ## What it actually blocks
 
 Tested end-to-end on a macOS / mise / homebrew dev machine against the
@@ -51,9 +99,13 @@ veto npm ci  # against a lockfile naming a flagged package # transitive coverage
 veto npm install clean-direct # refused if npm resolves a flagged transitive
 
 # The canonical Python install form — caught via the python shim,
-# which fast-paths every non-`-m {pm}` invocation back to real python:
+# which fast-paths every non-`-m {pm}` invocation back to real python.
+# Every versioned `python3.X` alias on disk gets its own shim too
+# (install-shims enumerates uv's canonical cpython store) so a venv
+# that resolves python3.12 directly still routes through veto:
 python -m pip install chai-as-upgraded                        # refused
 python3 -m uv pip install chai-as-upgraded                    # refused
+python3.12 -m pip install chai-as-upgraded                    # refused (uv-venv path)
 
 # Fetch-and-run forms (npx-style):
 npm exec chai-as-upgraded                                     # refused
@@ -90,9 +142,9 @@ remediation without parsing human-readable output:
 
 | Exit | Meaning |
 |---|---|
-| `0` | every requested step succeeded |
+| `0` | every requested step succeeded. Candidates on a read-only filesystem (typically SIP-protected paths like `/usr/bin/pip3` on macOS) are reported as `SKIP read-only filesystem (SIP-protected)` and do not affect the exit code — sudo can't bypass SIP, so there's nothing to retry. |
 | `10` | a user-scoped layer failed (shims/shell/hook/preload/intel/doctor) |
-| `20` | the wrappers step skipped one or more candidate dirs because the current (non-root) user can't write to them — retry under sudo |
+| `20` | the wrappers step skipped one or more candidate dirs because the current (non-root) user can't write to them — retry under sudo. Distinct from the SIP case above, where elevation does not help. |
 | `30` | the wrappers step had write access (or we are already root) and still hit a real failure |
 
 If you want to install the layers one at a time, the equivalent commands are
@@ -405,6 +457,52 @@ hashes differently and still refuses. `veto scan` keeps reporting
 acknowledged findings for visibility; only the install-time block is
 lifted.
 
+### `.pth` startup-hook worm detection (Hades / Shai-Hulud)
+
+The June 2026 Hades wave is the PyPI branch of the same Miasma lineage veto
+fights on npm with `binding.gyp`. It rides a trusted package name (maintainer
+account takeover, so the name is not in any malware feed for hours), keeps the
+package metadata clean, and ships its payload as a `*-setup.pth` file inside
+a wheel. Python's `site` module exec()s every `*.pth` whose first token is
+`import` at *every* interpreter startup — so a poisoned environment detonates
+the worm on the next `python` call, not just at install time.
+
+veto detects this by content, not name, at four points:
+
+1. **`veto scan`** — walks every `site-packages` / `dist-packages` directory
+   under each project root and classifies each `.pth` via the `pthscan`
+   content heuristic. Critical findings are the Hades signature; medium
+   findings are non-allowlisted executable lines that warrant attention.
+2. **Install hot path — existing tree** — before `pip` / `uv` / `poetry` /
+   `pdm` runs, veto scans the target venv for `.pth` worms. A critical hit
+   refuses the install fail-closed.
+3. **Install hot path — incoming wheels** — veto downloads the wheel(s)
+   about to be installed with `pip download --no-deps --only-binary :all:`
+   (no sdist building; nothing executed), opens each as a zip in memory,
+   and inspects every `.pth` inside. Default-on for argv-direct installs;
+   set `VETO_PTH_WHEEL_SCAN=full` for resolved transitives, `=off` to
+   disable. The prescan has a default timeout of **120 seconds**
+   (`VETO_PTH_WHEEL_SCAN_TIMEOUT` overrides it). On timeout the prescan
+   is **best-effort / fail-open** — veto logs a warning and allows the
+   install rather than blocking it indefinitely. Critical findings detected
+   before the timeout always refuse. This is an intentional UX trade-off:
+   a slow registry hiccup must not block every install. Set
+   `VETO_PTH_WHEEL_SCAN=off` to skip the prescan entirely when needed.
+4. **Claude Code hook** — a `pip install` / `uv pip install` issued by an
+   agent in a poisoned environment is denied at the earliest point, with
+   the worm reason instead of the usual "re-run with veto" nudge —
+   prefixing would not make the environment safe to install into.
+
+veto also surfaces Hades infection markers via `veto scan`'s agent-surface
+sub-scanner: host artifacts (`/tmp/.bun_ran`, `/tmp/tmp.*.lock`, dropped
+Bun binaries), local GitHub persistence (`.github/workflows/*.yml` exfil
+shapes, clones with attacker naming), and `sitecustomize.py` /
+`usercustomize.py` *presence inside `site-packages`*.
+
+The intel store also ships a curated stopgap source (`hades`) carrying the
+known Hades package@versions. The durable defense is the `.pth` content
+heuristic; the stopgap shortens the window for already-catalogued names.
+
 **Fail-closed defaults.** Per-source malware feeds are fetched
 concurrently with etag-based caching in `~/.cache/veto/`.
 On network outage the last good snapshot is used; if zero sources
@@ -601,9 +699,25 @@ these):
   by dyld for `/usr/bin/*` and `/System/...`; the dir is also
   read-only so Layer 4 wrappers can't be installed there. Out of
   veto's reach by design — it's a command-layer scanner, not a
-  kernel-level interposer. Non-SIP python (mise, pyenv, homebrew) IS
-  covered via the Layer 2 python shim — only the system interpreter
-  at `/usr/bin/python3` is unreachable.
+  kernel-level interposer. Non-SIP python (mise, pyenv, homebrew,
+  uv-managed cpython) IS covered via the Layer 2 python shim and the
+  Layer 4 wrappers, including every versioned `python3.X` alias on
+  disk — only the system interpreter at `/usr/bin/python3` is
+  unreachable. `install-wrappers` emits a clean
+  `SKIP /usr/bin/<pm> — read-only filesystem (SIP-protected)` line
+  for these paths and exits 0 (a previous version reported them as
+  `FAIL`, aborting `install-all` even though no remediation exists).
+- **Per-python-invocation cost** (intentional). Layer 4 now wraps
+  every canonical `python` / `python3` / `python3.X` binary on disk
+  — including uv's `~/.local/share/uv/python/cpython-*/bin/*` store
+  — to close the uv-venv bypass (an `uv run python -c "..."`
+  resolves the venv python by absolute path; without wrapping the
+  canonical binary the call skipped Layer 2). Every python
+  invocation now exec's through veto, which dispatches the `-m {pm}`
+  fast-path and forwards everything else to the real interpreter
+  before touching the intel store. The overhead is small (one
+  binary load + a few syscalls) but real; the user explicitly
+  accepted it as the cost of closing the bypass.
 - **Linux `execl*` / `fexecve` / `execveat` coverage**: best-effort.
   The interposer exports LD_PRELOAD shadows for execl/execlp/execle/
   execvpe/fexecve/execveat, but glibc's internal `__execve` calls and

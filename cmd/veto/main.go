@@ -35,6 +35,7 @@ import (
 	"github.com/brynbellomy/veto/internal/intel/sources/gemnasium"
 	"github.com/brynbellomy/veto/internal/intel/sources/ghsa"
 	"github.com/brynbellomy/veto/internal/intel/sources/govulndb"
+	"github.com/brynbellomy/veto/internal/intel/sources/hades"
 	"github.com/brynbellomy/veto/internal/intel/sources/openssf"
 	"github.com/brynbellomy/veto/internal/intel/sources/osv"
 	"github.com/brynbellomy/veto/internal/intel/sources/pypa"
@@ -126,7 +127,7 @@ func main() {
 		// rewrite that lets the existing gate logic handle the PM lookup
 		// while still exec'ing python (not the PM directly) on the allow
 		// path.
-		if self == "python" || self == "python3" {
+		if isPythonBasename(self) {
 			if pm, ok := pythonDashMTarget(args); ok {
 				// `python -m pip install foo` → route through veto as if
 				// the user had typed `pip install foo`. We thread the
@@ -263,7 +264,7 @@ func run(args []string) int {
 	case "status":
 		return runStatus(logger, cfg)
 	case "install-shims":
-		return runInstallShims(logger, args[1:])
+		return runInstallShims(logger, cfg, args[1:])
 	case "uninstall-shims":
 		return runUninstallShims(logger, args[1:])
 	case "hook":
@@ -273,9 +274,9 @@ func run(args []string) int {
 	case "uninstall-claude-hook":
 		return runUninstallClaudeHook(logger, args[1:])
 	case "install-codex":
-		return runInstallCodex(logger, args[1:])
+		return runInstallCodex(logger, cfg, args[1:])
 	case "install-cursor":
-		return runInstallCursor(logger, args[1:])
+		return runInstallCursor(logger, cfg, args[1:])
 	case "install-shell":
 		return runInstallShell(logger, args[1:])
 	case "uninstall-shell":
@@ -307,7 +308,7 @@ func run(args []string) int {
 
 // isShimName reports whether basename matches one of the package-manager
 // binaries veto shadows via PATH shims. Delegates to the canonical
-// pmlist.IsShimmed so this hot path and `veto install-shims` consume
+// pmlist.MatchesShim so this hot path and `veto install-shims` consume
 // one source of truth — see internal/packagemanager/pmlist for why.
 //
 // "python" and "python3" are in the canonical list because
@@ -317,8 +318,25 @@ func run(args []string) int {
 // hot-paths every non-`-m {pm}` python call straight to the real
 // interpreter so REPLs, `-V`, `-c`, scripts, and `-m http.server` etc.
 // stay fast and transparent.
+//
+// Versioned aliases ("python3.10", "python3.11.2", …) match through
+// pmlist.MatchesShim's regex too — install-shims creates per-version
+// symlinks for every uv-managed cpython on disk, and the dispatch
+// here recognises them so the same fast-path applies. Without this,
+// a venv that exec's python3.12 directly would dispatch as "unknown"
+// and route through the gate's `unknown package manager; passing
+// through` branch — slow and noisy.
 func isShimName(basename string) bool {
-	return pmlist.IsShimmed(basename)
+	return pmlist.MatchesShim(basename)
+}
+
+// isPythonBasename reports whether basename is one of the python
+// flavors veto fast-paths through the `-m <pm>` gate: the canonical
+// "python" / "python3" names OR a versioned `python3.X` alias.
+// Centralised so main()'s shim-dispatch + execReal lookup stay in
+// sync with the python-family classification in pmlist.
+func isPythonBasename(basename string) bool {
+	return basename == "python" || basename == "python3" || pmlist.IsVersionedPython(basename)
 }
 
 // runGate handles the `veto <pm> <args...>` path: parse the invocation,
@@ -471,6 +489,27 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 		// WHOLE tree, so a worm already in node_modules (from an earlier
 		// install) would detonate on this unrelated install. Scan it.
 		if runGypPreflightIfNpmFamily(logger, cfg, pm, pmArgs) {
+			return exitRefused
+		}
+	}
+
+	// Hades / Shai-Hulud .pth startup-hook worm layers. The intel gate
+	// above cannot see this worm — it rides a trusted name and keeps
+	// package metadata clean — so for Python-family installs we apply
+	// the same two content heuristics before letting the real package
+	// manager run.
+	if isPythonFamily(pm.Ecosystem()) {
+		// (a) Wheel prescan: fetch the wheels about to be installed
+		// (Task 8) and inspect each .pth they would drop. Catches a
+		// freshly-resolved/compromised version that is not yet in any
+		// intel feed. Wired below; Task 8 fills the body.
+		if pthWheelPreflight(logger, os.Stderr, cfg, installs, preScanInstalls) {
+			return exitRefused
+		}
+		// (b) Existing-tree scan: site.py loads every .pth at every
+		// `python` startup, so a worm already in the target venv would
+		// detonate before this install completes. Scan it.
+		if runPthPreflightIfPythonFamily(logger, pm, pmArgs) {
 			return exitRefused
 		}
 	}
@@ -1190,6 +1229,19 @@ func wrapperRegisteredFunc(cfg config) func(string) bool {
 // exec their payload. If wrappers.json is missing or unreadable the
 // caller supplies a predicate that returns false for everything; that
 // collapses to PATH-walk-only resolution (fail closed).
+//
+// Self-reference guard: after the sibling passes the registration and
+// executable checks, we resolve it through filepath.EvalSymlinks and
+// compare against veto's own resolved executable path. If they match,
+// the sibling chains back to this very binary — exec'ing it would
+// produce an infinite loop. This protects against (a) a manually-
+// planted self-referential .veto-original, and (b) a future discovery
+// bug that wraps both an alias and its target in the same uv cpython
+// bin dir (chain: python -> python3.X -> veto, with
+// python.veto-original -> python3.X -> veto). The discovery filter in
+// pmsurvey.PathsFor closes case (b) at the source; this runtime check
+// is belt-and-suspenders for case (a) and anything else that lands a
+// loop on disk.
 func findWrappedOriginal(argv0 string, registered func(string) bool) (string, bool) {
 	if argv0 == "" || !strings.ContainsRune(argv0, '/') {
 		return "", false
@@ -1206,7 +1258,32 @@ func findWrappedOriginal(argv0 string, registered func(string) bool) (string, bo
 	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
 		return "", false
 	}
+	if isSelfReferential(original) {
+		return "", false
+	}
 	return original, true
+}
+
+// isSelfReferential reports whether the given path resolves through
+// filepath.EvalSymlinks to the same physical file as veto's own
+// executable. Used by findWrappedOriginal as a belt-and-suspenders
+// guard against an exec loop where a .veto-original chains back into
+// veto itself. Returns false on any EvalSymlinks error — the caller's
+// PATH walk is the fail-safe.
+func isSelfReferential(path string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	selfReal, err := filepath.EvalSymlinks(self)
+	if err != nil {
+		return false
+	}
+	return resolved == selfReal
 }
 
 // findRealBinary returns the path veto should exec to satisfy a
@@ -1261,8 +1338,17 @@ func findRealBinary(name string, registered func(string) bool) (string, error) {
 			// attacker planting `<dir>/<name>.veto-original` at any
 			// PATH entry would otherwise hijack execution. Unregistered
 			// siblings are ignored; the loop continues.
+			//
+			// Self-reference guard: mirrors findWrappedOriginal's
+			// isSelfReferential check. Without it, a sibling that
+			// resolves back to the veto binary itself (e.g. a stale
+			// `~/.local/bin/python3.veto-original` symlink pointing
+			// at `~/.local/bin/veto`) would be returned here and
+			// exec'd, producing an infinite re-entry loop — the root
+			// cause of the veto-dzk python-shim stall. PATH walk and
+			// argv[0] lookup must agree on which siblings to trust.
 			if registered != nil && registered(candidate) {
-				if sibling := candidate + ".veto-original"; isExecutableRegularOrSymlink(sibling) {
+				if sibling := candidate + ".veto-original"; isExecutableRegularOrSymlink(sibling) && !isSelfReferential(sibling) {
 					return sibling, nil
 				}
 			}
@@ -1300,7 +1386,7 @@ func loadConfig() (config, error) {
 	v.SetEnvPrefix("VETO")
 	v.AutomaticEnv()
 	v.SetDefault("cache_dir", defaultCacheDir())
-	v.SetDefault("sources", []string{"aikido", "datadog", "openssf", "osv", "pypa"})
+	v.SetDefault("sources", []string{"aikido", "datadog", "openssf", "osv", "pypa", "hades"})
 	// IOC feeds (abuse.ch, MISP, ...) are all opt-in and land in Wave 4. The
 	// default is empty so the IOC subsystem costs nothing until a feed is
 	// explicitly enabled via ioc_sources / VETO_IOC_SOURCES.
@@ -1396,6 +1482,8 @@ func buildSource(logger zerolog.Logger, cfg config, id string) (intel.Source, er
 			CacheDir: filepath.Join(cfg.CacheDir, "gemnasium"),
 			Logger:   logger,
 		})
+	case "hades":
+		return hades.New(), nil
 	default:
 		return nil, errors.WithNew("unknown source").Set("id", id)
 	}
@@ -1590,7 +1678,7 @@ Layer 1 — Claude Code hook (Bash tool interception):
                                decision to stdout if the command reaches a PM
 
 Layer 2 — PATH shims (any agent shell, Codex, CI):
-  veto install-shims [--dir DIR] [--force]
+  veto install-shims [--dir DIR] [--force] [--dry-run]
                                symlinks ~/.local/bin/{npm,pip,…} → veto
   veto uninstall-shims [--dir DIR]
                                remove veto-managed symlinks
@@ -1657,7 +1745,7 @@ Go/Cargo live gating:
 
 Environment:
   VETO_CACHE_DIR     override cache location (default: $XDG_CACHE_HOME/veto)
-  VETO_SOURCES       comma-separated source IDs (default: aikido,datadog,openssf,osv,pypa)
+  VETO_SOURCES       comma-separated source IDs (default: aikido,datadog,openssf,osv,pypa,hades)
                        optional vulnerability feeds: ghsa, rustsec, govulndb, gemnasium
   VETO_IOC_SOURCES   comma-separated host-level IOC feed IDs (default: none).
                        Available: abusech, misp. When set, cache artifacts are
@@ -1667,5 +1755,15 @@ Environment:
                      abusech IOC feed; without it the feed logs once and no-ops
   VETO_LOG           set to "debug" for verbose logging
   VETO_PATH          set by install-preload; consumed by the interposer
+  VETO_PTH_WHEEL_SCAN
+                     enable / disable the .pth wheel prescan for the Hades
+                     PyPI worm. Values: on (default; argv-direct only),
+                     full (also fetch resolved transitives), off.
+  VETO_PTH_WHEEL_SCAN_TIMEOUT
+                     timeout for the wheel prescan (default: 120s). The prescan
+                     is best-effort: on timeout veto logs a warning and allows
+                     the install (fail-open). Critical findings detected before
+                     the timeout always refuse. Set VETO_PTH_WHEEL_SCAN=off to
+                     skip the prescan entirely.
 `)
 }

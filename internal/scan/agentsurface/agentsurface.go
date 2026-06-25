@@ -94,6 +94,10 @@ func (s *Scanner) Scan(ctx context.Context) scan.Result {
 		}
 	}
 	result.Findings = append(result.Findings, s.scanLaunchdDisabled(ctx)...)
+	result.Findings = append(result.Findings, s.scanHadesHostArtifacts()...)
+	result.Findings = append(result.Findings, s.scanHadesTmpLocks()...)
+	result.Findings = append(result.Findings, s.scanHadesPersistence(ctx)...)
+	result.Findings = append(result.Findings, s.scanCustomizePresence(ctx)...)
 	return result
 }
 
@@ -136,6 +140,237 @@ func (s *Scanner) targets() []target {
 			target{owner: "cursor", path: filepath.Join(root, ".cursor"), accept: acceptConfig},
 			target{owner: "sirene", path: filepath.Join(root, ".sirene"), accept: acceptConfig},
 		)
+	}
+	return out
+}
+
+var (
+	// hadesAttackerNamingRe matches the Hades / Shai-Hulud worm's
+	// attacker-controlled GitHub repo / directory naming.
+	hadesAttackerNamingRe = regexp.MustCompile(`(?i)\b(?:Shai-Hulud|stygian-cerberus[-_][A-Za-z0-9._-]+|tartarean-charon[-_][A-Za-z0-9._-]+)\b`)
+
+	// hadesWorkflowExfilRe matches a GitHub Actions workflow that posts to
+	// a webhook with environment / secret material in its body — the worm's
+	// exfiltration shape. Heuristic, not a parser.
+	//
+	// The (?s) flag makes . match newlines, which is required for the first
+	// alternative: real exfil workflows frequently split curl, -X POST, the
+	// target URL, and ${{ secrets.X }} across multiple lines inside a YAML
+	// run: | block, so [^\n]* would silently miss them. We use .*? (non-greedy)
+	// to avoid catastrophic backtracking on large YAML files while still
+	// spanning arbitrary line breaks within a single run block.
+	hadesWorkflowExfilRe = regexp.MustCompile(`(?is)curl\s+.*?-X\s*POST.*?\$\{\{\s*secrets\.|toJson\(\s*secrets\s*\)|webhook\.site|webhooks?\.[A-Za-z0-9.-]+/`)
+)
+
+// scanHadesPersistence emits findings for local GitHub persistence under each
+// project root: workflow yml files matching the worm's exfil shape, and
+// directories whose name / remote URL matches attacker naming.
+func (s *Scanner) scanHadesPersistence(ctx context.Context) []scan.Finding {
+	var out []scan.Finding
+	for _, root := range s.projectRoots {
+		if err := ctx.Err(); err != nil {
+			return out
+		}
+		if root == "" {
+			continue
+		}
+		// Directory name match — cheap; check first.
+		base := filepath.Base(root)
+		if hadesAttackerNamingRe.MatchString(base) {
+			out = append(out, finding("hades", root, "attacker-naming", scan.SeverityHigh,
+				"Project directory name matches Hades / Shai-Hulud attacker naming",
+				"Confirm this clone is intentional. Attacker repos with this naming have been observed staging the Hades PyPI worm.",
+				scan.Evidence{Label: "owner", Value: "hades"},
+				scan.Evidence{Label: "dir", Value: base},
+			))
+		}
+		// .git/config remote URL match.
+		gitCfg, err := os.ReadFile(filepath.Join(root, ".git", "config"))
+		if err == nil && hadesAttackerNamingRe.MatchString(string(gitCfg)) {
+			out = append(out, finding("hades", filepath.Join(root, ".git", "config"), "attacker-remote", scan.SeverityHigh,
+				"Git remote URL matches Hades / Shai-Hulud attacker naming",
+				"Inspect the configured remote; if it is not yours, treat any pushed branches as exfiltrated and remove the remote.",
+				scan.Evidence{Label: "owner", Value: "hades"},
+			))
+		}
+		// .github/workflows/*.yml exfil-shape match.
+		wfDir := filepath.Join(root, ".github", "workflows")
+		entries, err := os.ReadDir(wfDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml") {
+				continue
+			}
+			path := filepath.Join(wfDir, name)
+			content, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			if !hadesWorkflowExfilRe.Match(content) {
+				continue
+			}
+			out = append(out, finding("hades", path, "workflow-exfil", scan.SeverityHigh,
+				"GitHub Actions workflow posts secrets to an external webhook (Hades exfil shape)",
+				"Inspect the workflow; if it is not yours, delete it, rotate every secret it can read, and audit recent workflow runs.",
+				scan.Evidence{Label: "owner", Value: "hades"},
+				scan.Evidence{Label: "snippet", Value: snippet(content, hadesWorkflowExfilRe, 200)},
+			))
+		}
+	}
+	return out
+}
+
+// snippet returns a single-line, length-capped excerpt centered on the first
+// match of re inside content, for display in the finding's evidence.
+func snippet(content []byte, re *regexp.Regexp, limit int) string {
+	loc := re.FindIndex(content)
+	if loc == nil {
+		return ""
+	}
+	start := max(loc[0]-limit/4, 0)
+	end := min(start+limit, len(content))
+	frag := strings.Join(strings.Fields(string(content[start:end])), " ")
+	if len(frag) > limit {
+		frag = frag[:limit] + "…"
+	}
+	return frag
+}
+
+// scanCustomizePresence walks each project root for `sitecustomize.py` or
+// `usercustomize.py` files inside a `site-packages` directory and emits a
+// medium presence finding. We never read or evaluate the body — these files
+// legitimately do real work in some toolchains; their presence-in-site-packages
+// is itself the structural signal.
+func (s *Scanner) scanCustomizePresence(ctx context.Context) []scan.Finding {
+	var out []scan.Finding
+	for _, root := range s.projectRoots {
+		if err := ctx.Err(); err != nil {
+			return out
+		}
+		_ = filepath.WalkDir(root, func(p string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if entry.IsDir() {
+				// Descend into venvs — that is where site-packages
+				// lives — but skip purely-noisy trees.
+				if shouldPruneDirForCustomize(entry.Name()) {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			name := entry.Name()
+			if name != "sitecustomize.py" && name != "usercustomize.py" {
+				return nil
+			}
+			// Only flag when the file sits in a site-packages directory.
+			parent := filepath.Base(filepath.Dir(p))
+			if parent != "site-packages" && parent != "dist-packages" {
+				return nil
+			}
+			out = append(out, finding("hades", p, "customize-presence", scan.SeverityMedium,
+				"Python "+name+" present inside site-packages",
+				"Confirm this customize hook is yours. site-packages-resident "+name+" runs at every interpreter startup; verify its body is not an exfil payload.",
+				scan.Evidence{Label: "owner", Value: "hades"},
+				scan.Evidence{Label: "kind", Value: name},
+			))
+			return nil
+		})
+	}
+	return out
+}
+
+// hadesHostTargets returns probe paths for the on-host artifacts the Hades /
+// Shai-Hulud PyPI worm drops. Presence of any of these is the signal; we
+// stat-check rather than scan, so a missing file is the common case and
+// returns silently.
+func (s *Scanner) hadesHostTargets() []hadesProbe {
+	var probes []hadesProbe
+	probes = append(probes,
+		hadesProbe{path: "/tmp/.bun_ran", reason: "Hades worm runtime marker"},
+		hadesProbe{path: "/tmp/_index.js", reason: "Hades second-stage payload"},
+		hadesProbe{path: "/tmp/bun", reason: "Bun runtime dropped in /tmp by Hades worm"},
+	)
+	if home := s.home; home != "" {
+		probes = append(probes,
+			hadesProbe{path: filepath.Join(home, ".cache", "bun"), reason: "Bun runtime dropped under ~/.cache by Hades worm"},
+		)
+	}
+	return probes
+}
+
+type hadesProbe struct {
+	path   string
+	reason string
+}
+
+// scanHadesHostArtifacts emits a finding per Hades probe path present on the
+// host. Stat-only; no file contents are read.
+func (s *Scanner) scanHadesHostArtifacts() []scan.Finding {
+	var out []scan.Finding
+	for _, probe := range s.hadesHostTargets() {
+		info, err := os.Stat(probe.path)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			// Directory probes (e.g. ~/.cache/bun) only fire when present
+			// AND non-empty — an empty dir is unlikely to be the worm.
+			entries, _ := os.ReadDir(probe.path)
+			if len(entries) == 0 {
+				continue
+			}
+		}
+		out = append(out, scan.Finding{
+			ID:       fmt.Sprintf("agent-surface:hades-host:%s", probe.path),
+			Surface:  scan.SurfaceAgentSurface,
+			Severity: scan.SeverityHigh,
+			Path:     probe.path,
+			Title:    "Hades / Shai-Hulud .pth worm host artifact present",
+			Evidence: []scan.Evidence{
+				{Label: "owner", Value: "hades"},
+				{Label: "reason", Value: probe.reason},
+			},
+			Remediation: "Verify the artifact is not from the Hades worm; if any Python interpreter recently ran in a poisoned venv, treat reachable credentials as compromised, remove the artifact, and run `veto scan` over all venvs.",
+		})
+	}
+	return out
+}
+
+// scanHadesTmpLocks scans /tmp for tmp.*.lock files — the Hades single-
+// instance lock shape. Stat-only; we list /tmp once and filter by name.
+// /tmp on Linux+macOS is world-readable; on systems where it isn't, the
+// listing error is non-fatal.
+func (s *Scanner) scanHadesTmpLocks() []scan.Finding {
+	entries, err := os.ReadDir("/tmp")
+	if err != nil {
+		return nil
+	}
+	var out []scan.Finding
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "tmp.") || !strings.HasSuffix(name, ".lock") {
+			continue
+		}
+		path := filepath.Join("/tmp", name)
+		out = append(out, scan.Finding{
+			ID:       "agent-surface:hades-tmp-lock:" + path,
+			Surface:  scan.SurfaceAgentSurface,
+			Severity: scan.SeverityMedium,
+			Path:     path,
+			Title:    "/tmp/tmp.*.lock matches Hades worm single-instance lock shape",
+			Evidence: []scan.Evidence{
+				{Label: "owner", Value: "hades"},
+				{Label: "lock", Value: name},
+			},
+			Remediation: "If no recent legitimate process explains this lock, investigate the owning process and treat as a possible Hades infection.",
+		})
 	}
 	return out
 }
@@ -304,6 +539,18 @@ func currentUserHome() string {
 func shouldPruneDir(name string) bool {
 	switch name {
 	case ".git", "node_modules", ".venv", "venv", "env":
+		return true
+	default:
+		return false
+	}
+}
+
+// shouldPruneDirForCustomize is the customize/site-packages walker's prune
+// list. It deliberately does NOT skip `.venv` / `venv` / `env` (those are the
+// trees where `sitecustomize.py` would live), only the noisy roots and caches.
+func shouldPruneDirForCustomize(name string) bool {
+	switch name {
+	case ".git", ".hg", ".svn", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache":
 		return true
 	default:
 		return false

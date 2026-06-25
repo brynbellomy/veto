@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/brynbellomy/go-utils/errors"
@@ -49,7 +50,7 @@ import (
 // straight to the real interpreter.
 var shimmedManagers = pmlist.Shimmed
 
-// runInstallShims implements `veto install-shims [--dir DIR] [--force]`.
+// runInstallShims implements `veto install-shims [--dir DIR] [--force] [--dry-run]`.
 //
 // Idempotency:
 //   - If DIR/<pm> doesn't exist: create a symlink to the veto binary.
@@ -61,12 +62,23 @@ var shimmedManagers = pmlist.Shimmed
 //   - If DIR/<pm> is a regular file (e.g. a real npm binary): refuse unless
 //     --force. Replacing real binaries silently is exactly the kind of
 //     surprise a security tool should not cause.
-func runInstallShims(logger zerolog.Logger, args []string) int {
-	dir, force, err := parseShimFlags(args)
+//
+// Convergence: every run also reconciles wrappers.json against the shim
+// dir, removing any Layer 4 entry whose path lies inside DIR. The two
+// layers must never share territory — a stray shim-dir entry in
+// wrappers.json is the failure mode that broke recovery during the
+// veto-dzk debacle (uninstall-wrappers followed the bogus entries and
+// destroyed the Layer 2 shims themselves).
+//
+// --dry-run lists every shim that would be created / updated / left
+// alone without touching the filesystem.
+func runInstallShims(logger zerolog.Logger, cfg config, args []string) int {
+	flags, err := parseShimFlags(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "veto: %v\n", err)
 		return exitUsage
 	}
+	dir, force, dryRun := flags.dir, flags.force, flags.dryRun
 
 	vetoPath, err := resolveVetoBinary()
 	if err != nil {
@@ -74,29 +86,96 @@ func runInstallShims(logger zerolog.Logger, args []string) int {
 		return exitInternal
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		logger.Error().Err(err).Str("dir", dir).Msg("create shim dir")
-		return exitInternal
+	if !dryRun {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			logger.Error().Err(err).Str("dir", dir).Msg("create shim dir")
+			return exitInternal
+		}
 	}
 
+	// Names we shim = the static canonical list PLUS every
+	// `python3.X` alias we can discover on this host (uv canonical
+	// store + PATH walk, deduped). Without the dynamic enumeration the
+	// uv-venv bypass stays open for venvs that resolve python3.12
+	// directly — see pmlist's Wrapped doc for the cost rationale and
+	// pmsurvey.PathsFor for the discovery surface.
+	names := append([]string{}, shimmedManagers...)
+	names = append(names, discoverVersionedPythons()...)
+
 	var hadFailure, hadAction bool
-	for _, name := range shimmedManagers {
+	for _, name := range names {
 		target := filepath.Join(dir, name)
+		if dryRun {
+			action, _, err := planShim(target, vetoPath, force)
+			if err != nil {
+				hadFailure = true
+				fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", name, err)
+				continue
+			}
+			if action == "" {
+				fmt.Fprintf(os.Stdout, "  %-12s  ok      already installed (dry-run)\n", name)
+			} else {
+				hadAction = true
+				fmt.Fprintf(os.Stdout, "  %-12s  ok      would %s\n", name, action)
+			}
+			continue
+		}
 		action, err := ensureShim(target, vetoPath, force)
 		switch {
 		case err != nil:
 			hadFailure = true
-			fmt.Fprintf(os.Stderr, "  %-8s  FAILED  %v\n", name, err)
+			fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", name, err)
 		case action == "":
 			// no-op; already correct
-			fmt.Fprintf(os.Stdout, "  %-8s  ok      already installed\n", name)
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      already installed\n", name)
 		default:
 			hadAction = true
-			fmt.Fprintf(os.Stdout, "  %-8s  ok      %s\n", name, action)
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      %s\n", name, action)
 		}
 	}
 
-	if hadAction {
+	// Scrub stale `.veto-original` siblings in the shim dir. Layer 2 shims
+	// MUST NOT have `.veto-original` siblings — those belong to Layer 4
+	// wrap sites that are registered in wrappers.json. If a previous
+	// install-shims (or a different veto build) ever left siblings here,
+	// they can chain back into veto itself and cause exec loops or stalls
+	// — most visibly when veto is invoked as a python3 shim from agent
+	// spawn contexts (see veto-dzk epic). Idempotent: no-op if none exist.
+	scrubbed, scrubErrs := scrubVetoOriginalSiblings(dir, dryRun)
+	for _, p := range scrubbed {
+		if dryRun {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      would remove stale Layer 2 sibling %s\n", "scrub", p)
+		} else {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      removed stale Layer 2 sibling %s\n", "scrub", p)
+		}
+		hadAction = true
+	}
+	for _, e := range scrubErrs {
+		hadFailure = true
+		fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "scrub", e)
+	}
+
+	// Convergence: prune any wrappers.json entry whose path is inside the
+	// shim dir. Layer 2 and Layer 4 must not share territory; a Layer 4
+	// entry pointing into the shim dir is the bug that broke veto-dzk's
+	// recovery — uninstall-wrappers followed the bogus entries and
+	// destroyed the Layer 2 shims themselves. Idempotent: no-op if no
+	// shim-dir entries are recorded.
+	pruned, pruneErr := pruneWrappersInShimDir(cfg, dir, dryRun)
+	if pruneErr != nil {
+		hadFailure = true
+		fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "prune", pruneErr)
+	}
+	for _, p := range pruned {
+		if dryRun {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      would prune shim-dir wrapper entry %s\n", "prune", p)
+		} else {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      pruned shim-dir wrapper entry %s\n", "prune", p)
+		}
+		hadAction = true
+	}
+
+	if hadAction && !dryRun {
 		printPathOrderingHint(os.Stdout, dir)
 	}
 	if hadFailure {
@@ -106,34 +185,234 @@ func runInstallShims(logger zerolog.Logger, args []string) int {
 	return exitOK
 }
 
+// scrubVetoOriginalSiblings removes every `*.veto-original` entry in dir.
+// Layer 2 shims (install-shims output) must NEVER have `.veto-original`
+// siblings — those are owned by Layer 4 wrap sites registered in
+// wrappers.json. If an older install-shims (or a hand-edit) left siblings
+// behind, they can chain back into veto itself, producing exec loops or
+// silent stalls in agent spawn contexts.
+//
+// Returns the paths actually removed (or that would be removed under
+// dryRun) plus any per-entry errors. The directory itself is not created;
+// callers handle that. Missing dir is treated as "no siblings present" by
+// returning (nil, nil).
+//
+// We do NOT consult wrappers.json here: by construction, Layer 2 shim dirs
+// are never registered as Layer 4 wrap sites, so any `.veto-original` here
+// is stale. Cross-layer collision would be a deeper invariant violation
+// and is detected by doctor, not by install-shims.
+func scrubVetoOriginalSiblings(dir string, dryRun bool) ([]string, []error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, []error{errors.With(err, "scrub: read shim dir").Set("dir", dir)}
+	}
+	var removed []string
+	var errsOut []error
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".veto-original") {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		if dryRun {
+			removed = append(removed, full)
+			continue
+		}
+		if err := os.Remove(full); err != nil {
+			errsOut = append(errsOut, errors.With(err, "scrub: remove stale sibling").Set("path", full))
+			continue
+		}
+		removed = append(removed, full)
+	}
+	sort.Strings(removed)
+	return removed, errsOut
+}
+
+// pruneWrappersInShimDir reconciles wrappers.json against the Layer 2
+// shim dir. Removes every entry whose `Path` is inside shimDir (after
+// path cleaning so trailing slashes and `~` expansions don't slip past).
+// Layer 2 shims (install-shims output) and Layer 4 wraps (install-wrappers
+// output) must never share territory: an install-wrappers entry pointing
+// into the shim dir is a write-once bug that turns recovery commands into
+// destroyers (uninstall-wrappers blindly follows the bogus entry and
+// removes the actual shim).
+//
+// Returns the paths actually pruned (or that would be pruned under
+// dryRun). Missing wrappers.json is not an error — pruning a non-existent
+// registry is a clean no-op. Save errors propagate so the caller can
+// surface a FAIL row.
+//
+// The check is conservative: only entries strictly inside shimDir are
+// dropped. An entry whose path EQUALS the shimDir itself (impossible by
+// construction, but harmless to defend against) is left alone.
+func pruneWrappersInShimDir(cfg config, shimDir string, dryRun bool) ([]string, error) {
+	state, err := loadWrapperState(cfg)
+	if err != nil {
+		return nil, errors.With(err, "prune: load wrappers.json").Set("cache_dir", cfg.CacheDir)
+	}
+	cleanShim := filepath.Clean(shimDir)
+	prefix := cleanShim + string(filepath.Separator)
+
+	kept := make([]wrapperEntry, 0, len(state.Wrappers))
+	var pruned []string
+	for _, w := range state.Wrappers {
+		cleanPath := filepath.Clean(w.Path)
+		if strings.HasPrefix(cleanPath, prefix) {
+			pruned = append(pruned, w.Path)
+			continue
+		}
+		kept = append(kept, w)
+	}
+	sort.Strings(pruned)
+	if len(pruned) == 0 || dryRun {
+		return pruned, nil
+	}
+	state.Wrappers = kept
+	if err := saveWrapperState(cfg, state); err != nil {
+		return pruned, errors.With(err, "prune: save wrappers.json").Set("cache_dir", cfg.CacheDir)
+	}
+	return pruned, nil
+}
+
+// discoverVersionedPythons enumerates every `python3.X` (or
+// `python3.X.Y`) alias currently on disk: uv's canonical cpython
+// store first, then every $PATH entry that is not a shim dir.
+// Deduplicated and returned in deterministic alphabetical order so
+// install-shims output is stable across runs.
+//
+// install-shims uses this list to decide which extra symlinks to
+// create in the shim dir. The canonical `python` / `python3` names
+// are NOT included here — they live in the static shimmedManagers
+// slice — so a host with no uv pythons and no python3.X aliases on
+// PATH returns an empty slice (the static set is unchanged).
+//
+// Errors are silenced: discovery failures here translate to "no extra
+// shims to install," which is the right safe default. The user can
+// always re-run.
+func discoverVersionedPythons() []string {
+	seen := map[string]struct{}{}
+
+	// uv canonical store: walk every cpython-* bin dir for python3.X
+	// entries. This is the same surface install-wrappers's PathsFor
+	// covers via pmsurvey, but install-shims wants the NAME, not the
+	// path, so we walk the same dirs directly.
+	if home, err := os.UserHomeDir(); err == nil {
+		uvRoot := filepath.Join(home, ".local", "share", "uv", "python")
+		if entries, err := os.ReadDir(uvRoot); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || !strings.HasPrefix(e.Name(), "cpython-") {
+					continue
+				}
+				bin := filepath.Join(uvRoot, e.Name(), "bin")
+				binEntries, err := os.ReadDir(bin)
+				if err != nil {
+					continue
+				}
+				for _, be := range binEntries {
+					name := be.Name()
+					if !pmlist.IsVersionedPython(name) {
+						continue
+					}
+					seen[name] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// PATH walk: catches versioned pythons installed by pyenv / mise /
+	// distro packages that don't live in the uv store.
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if !pmlist.IsVersionedPython(name) {
+				continue
+			}
+			seen[name] = struct{}{}
+		}
+	}
+
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // runUninstallShims removes veto-managed symlinks from DIR. It leaves
 // untouched anything that isn't a symlink pointing at the veto binary
 // — symmetric with install-shims's refusal to clobber.
+//
+// We sweep the static names + every python3.X symlink in the shim dir
+// that ALREADY points at veto. The "dir-scan for python3.X" half is
+// what catches versioned aliases install-shims created at a previous
+// install when the host had a different uv python on disk: re-reading
+// shimmedManagers + discoverVersionedPythons() on uninstall would miss
+// any python3.X whose source disappeared between install and
+// uninstall.
 func runUninstallShims(logger zerolog.Logger, args []string) int {
-	dir, _, err := parseShimFlags(args)
+	flags, err := parseShimFlags(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "veto: %v\n", err)
 		return exitUsage
 	}
+	dir := flags.dir
 	vetoPath, err := resolveVetoBinary()
 	if err != nil {
 		logger.Error().Err(err).Msg("locate veto binary")
 		return exitInternal
 	}
 
-	for _, name := range shimmedManagers {
+	names := append([]string{}, shimmedManagers...)
+	names = append(names, discoverInstalledPythonShims(dir)...)
+
+	for _, name := range names {
 		target := filepath.Join(dir, name)
 		removed, err := removeShim(target, vetoPath)
 		switch {
 		case err != nil:
-			fmt.Fprintf(os.Stderr, "  %-8s  FAILED  %v\n", name, err)
+			fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", name, err)
 		case removed:
-			fmt.Fprintf(os.Stdout, "  %-8s  ok      removed\n", name)
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      removed\n", name)
 		default:
-			fmt.Fprintf(os.Stdout, "  %-8s  skip    not a veto shim\n", name)
+			fmt.Fprintf(os.Stdout, "  %-12s  skip    not a veto shim\n", name)
 		}
 	}
 	return exitOK
+}
+
+// discoverInstalledPythonShims returns the python3.X entries that
+// currently exist in the shim dir. uninstall-shims walks these in
+// addition to shimmedManagers so we don't strand symlinks created by
+// a previous install run whose source uv-python is no longer on disk.
+//
+// Each entry is the basename only; the caller joins it with dir to
+// form the target path. Returns deterministic sorted order.
+func discoverInstalledPythonShims(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if !pmlist.IsVersionedPython(name) {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ensureShim creates or updates a symlink at target pointing to vetoPath.
@@ -199,6 +478,47 @@ func ensureShim(target, vetoPath string, force bool) (string, error) {
 	return "created -> " + vetoPath, nil
 }
 
+// planShim is the read-only sibling of ensureShim. It inspects target
+// and reports what ensureShim WOULD do without mutating the
+// filesystem: returns an action description ("create -> …" /
+// "update -> …" / ""), a boolean indicating whether the change would
+// be filesystem-mutating, and an error if ensureShim would refuse
+// (e.g. target is a regular file and --force was not passed).
+//
+// Used by install-shims --dry-run to print the same per-row outcomes
+// without touching disk. Keeping the dry-run plan distinct from the
+// mutation path means we cannot accidentally write through a "would
+// wrap" branch — the two functions are physically separate.
+func planShim(target, vetoPath string, force bool) (string, bool, error) {
+	info, err := os.Lstat(target)
+	if err != nil && !os.IsNotExist(err) {
+		return "", false, errors.With(err, "lstat").Set("path", target)
+	}
+	if err != nil { // not-exist
+		return "create -> " + vetoPath, true, nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		existing, lerr := os.Readlink(target)
+		if lerr != nil {
+			return "", false, errors.With(lerr, "readlink").Set("path", target)
+		}
+		if existing == vetoPath {
+			return "", false, nil
+		}
+		if !force {
+			return "", false, errors.WithNew("symlink points elsewhere; pass --force to overwrite").
+				Set("path", target, "current_target", existing)
+		}
+		return "update -> " + vetoPath, true, nil
+	}
+	// Regular file.
+	if !force {
+		return "", false, errors.WithNew("file exists and is not a symlink; pass --force to overwrite").
+			Set("path", target)
+	}
+	return "update -> " + vetoPath + " (displaces real binary to .veto-displaced)", true, nil
+}
+
 // removeShim deletes target if it's a symlink to vetoPath. Returns
 // (true, nil) on removal, (false, nil) if target doesn't exist or isn't ours.
 func removeShim(target, vetoPath string) (bool, error) {
@@ -250,39 +570,52 @@ func resolveVetoBinary() (string, error) {
 	return resolved, nil
 }
 
-// parseShimFlags accepts `--dir PATH` and `--force` in any order.
-func parseShimFlags(args []string) (string, bool, error) {
-	dir := defaultShimDir()
-	force := false
+// shimFlags captures parsed CLI args for install-shims / uninstall-shims.
+type shimFlags struct {
+	dir    string
+	force  bool
+	dryRun bool
+}
+
+// parseShimFlags accepts `--dir PATH`, `--force`, and `--dry-run` in
+// any order. uninstall-shims ignores --force / --dry-run (it's
+// strictly a removal of veto-managed symlinks); only install-shims
+// honors them.
+func parseShimFlags(args []string) (shimFlags, error) {
+	out := shimFlags{dir: defaultShimDir()}
 	i := 0
 	for i < len(args) {
 		switch args[i] {
 		case "--dir":
 			if i+1 >= len(args) {
-				return "", false, errors.New("--dir requires a path argument")
+				return shimFlags{}, errors.New("--dir requires a path argument")
 			}
-			dir = args[i+1]
+			out.dir = args[i+1]
 			i += 2
 		case "--force":
-			force = true
+			out.force = true
+			i++
+		case "--dry-run":
+			out.dryRun = true
 			i++
 		default:
 			if v, ok := strings.CutPrefix(args[i], "--dir="); ok {
-				dir = v
+				out.dir = v
 				i++
 				continue
 			}
-			return "", false, errors.WithNew("unknown argument").Set("arg", args[i])
+			return shimFlags{}, errors.WithNew("unknown argument").Set("arg", args[i])
 		}
 	}
-	if dir == "" {
-		return "", false, errors.New("shim directory resolved empty")
+	if out.dir == "" {
+		return shimFlags{}, errors.New("shim directory resolved empty")
 	}
-	abs, err := filepath.Abs(dir)
+	abs, err := filepath.Abs(out.dir)
 	if err != nil {
-		return "", false, errors.With(err, "resolve shim dir")
+		return shimFlags{}, errors.With(err, "resolve shim dir")
 	}
-	return abs, force, nil
+	out.dir = abs
+	return out, nil
 }
 
 // defaultShimDir mirrors defaultCacheDir's spirit: prefer XDG, fall back to

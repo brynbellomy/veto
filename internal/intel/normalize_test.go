@@ -93,3 +93,81 @@ func TestNormalizeVersionUnknownEcosystem(t *testing.T) {
 	got := intel.NormalizeVersion(intel.Ecosystem("unknown"), "v1.2.3")
 	require.Equal(t, "v1.2.3", got)
 }
+
+// TestNormalizeVersionPyPI exercises PEP 440 canonical form for PyPI versions.
+// The goal is that alternate spellings of the same version collapse to the
+// same key, so an advisory for "0.8.6.post1" also catches an install of
+// "0.8.6-post1" or "0.8.6_post1", and vice-versa.
+//
+// Design choice for local labels (+local): stripped. PyPI rejects
+// "+local" versions at publish time, so they cannot appear in advisory
+// feeds. Stripping lets a locally-built variant of a flagged version
+// still be caught by exact-version lookup.
+func TestNormalizeVersionPyPI(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// Plain release — unchanged.
+		{"0.8.6", "0.8.6"},
+		{"1.0.0", "1.0.0"},
+		{"3.11.2", "3.11.2"},
+		// Post-release variants (all three separator styles).
+		{"0.8.6.post1", "0.8.6.post1"},
+		{"0.8.6-post1", "0.8.6.post1"},
+		{"0.8.6_post1", "0.8.6.post1"},
+		{"0.8.6post1", "0.8.6.post1"},
+		// Post-0 (implicit post release).
+		{"0.8.6.post0", "0.8.6.post0"},
+		// Pre-release: rc / alpha / beta.
+		{"0.8.6rc1", "0.8.6rc1"},
+		{"0.8.6.rc1", "0.8.6rc1"},
+		{"0.8.6-RC1", "0.8.6rc1"},
+		{"0.8.6a1", "0.8.6a1"},
+		{"0.8.6alpha1", "0.8.6a1"},
+		{"0.8.6b2", "0.8.6b2"},
+		{"0.8.6beta2", "0.8.6b2"},
+		// Dev release.
+		{"0.8.6.dev1", "0.8.6.dev1"},
+		{"0.8.6-dev1", "0.8.6.dev1"},
+		{"0.8.6dev1", "0.8.6.dev1"},
+		// Local label stripped (cannot be published to PyPI).
+		{"0.8.6+local", "0.8.6"},
+		{"0.8.6+local.1.2", "0.8.6"},
+		// Epoch.
+		{"1!0.8.6", "1!0.8.6"},
+		{"1!0.8.6.post1", "1!0.8.6.post1"},
+		// v-prefix stripped.
+		{"v0.8.6", "0.8.6"},
+		// Underscore/dash separator in release segment normalised to dot
+		// via PEP 440 parser; unusual but valid.
+		// Idempotent on already-canonical input.
+		{"0.8.6.post1", "0.8.6.post1"},
+		// Non-parseable input returned unchanged.
+		{"not-a-version", "not-a-version"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got := intel.NormalizeVersion(intel.EcosystemPyPI, tc.in)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestNormalizeVersionPyPI_HadesVariants specifically tests the Hades intel
+// use case: an advisory entry for a plain version must match common PEP 440
+// variant spellings of that version after normalization.
+func TestNormalizeVersionPyPI_HadesVariants(t *testing.T) {
+	// post-release of 0.8.6 — realistic attack variant
+	require.Equal(t, "0.8.6.post1", intel.NormalizeVersion(intel.EcosystemPyPI, "0.8.6.post1"))
+	require.Equal(t, "0.8.6.post1", intel.NormalizeVersion(intel.EcosystemPyPI, "0.8.6-post1"))
+	// pre-release
+	require.Equal(t, "0.8.6rc1", intel.NormalizeVersion(intel.EcosystemPyPI, "0.8.6rc1"))
+	require.Equal(t, "0.8.6rc1", intel.NormalizeVersion(intel.EcosystemPyPI, "0.8.6.rc1"))
+	// dev release
+	require.Equal(t, "0.8.6.dev1", intel.NormalizeVersion(intel.EcosystemPyPI, "0.8.6.dev1"))
+	require.Equal(t, "0.8.6.dev1", intel.NormalizeVersion(intel.EcosystemPyPI, "0.8.6-dev1"))
+	// local segment stripped — cannot be published to PyPI
+	require.Equal(t, "0.8.6", intel.NormalizeVersion(intel.EcosystemPyPI, "0.8.6+local"))
+}

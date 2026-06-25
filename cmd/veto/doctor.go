@@ -32,6 +32,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
+	"github.com/brynbellomy/veto/internal/packagemanager/pmsurvey"
 )
 
 // status is the per-check outcome. PASS = green; WARN = yellow; FAIL =
@@ -183,7 +184,14 @@ func checkShimDir() []checkResult {
 		})
 	}
 
-	for _, name := range shimmedManagers {
+	// Static-canonical shim names PLUS every `python3.X` shim already
+	// installed in the shim dir. The latter is what catches versioned
+	// aliases install-shims created on a previous run — we want
+	// doctor to confirm they STILL point at the current veto binary,
+	// not silently ignore them.
+	shimNames := append([]string{}, shimmedManagers...)
+	shimNames = append(shimNames, discoverInstalledPythonShims(shimDir)...)
+	for _, name := range shimNames {
 		shimPath := filepath.Join(shimDir, name)
 		info, err := os.Lstat(shimPath)
 		if err != nil {
@@ -245,6 +253,58 @@ func checkShimDir() []checkResult {
 			status: statusPass,
 			label:  "shim:" + name,
 			detail: fmt.Sprintf("%s → %s", shimPath, target),
+		})
+	}
+
+	// Layer 2 invariant: no `*.veto-original` siblings allowed in the
+	// shim dir. Those belong to Layer 4 wrap sites and would never be
+	// registered with this shim dir as their parent. Each stray entry is
+	// at minimum a stale artifact; at worst (when it resolves back into
+	// veto itself) it can chain into an exec loop or stall when veto is
+	// invoked as a `python3` shim from an agent spawn context — the
+	// observed veto-dzk symptom.
+	out = append(out, checkStaleShimSiblings(shimDir)...)
+
+	return out
+}
+
+// checkStaleShimSiblings scans the Layer 2 shim dir for any
+// `*.veto-original` entries. Each one produces a FAIL row naming the
+// exact path; this matches the severity of other Layer 2 invariants
+// (shim-not-a-symlink also FAILs in checkShimDir above). The fix
+// suggestion routes through `veto install-all` (or `veto install-shims`)
+// because the convergence pass at the top of install-shims scrubs
+// these siblings every run — no separate recovery command needed.
+func checkStaleShimSiblings(shimDir string) []checkResult {
+	entries, err := os.ReadDir(shimDir)
+	if err != nil {
+		// Missing shim dir is not a finding here; checkShimDir's own
+		// PATH check (above) handles "shim dir absent" explicitly.
+		// Any other read error means we cannot enforce the invariant —
+		// surface it as a WARN with the failure detail so the user
+		// can fix permissions, then re-run doctor.
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return []checkResult{{
+			status:   statusWarn,
+			label:    "shim-dir scan",
+			detail:   "read " + shimDir + ": " + err.Error(),
+			howToFix: "Fix perms on the shim dir, then re-run `veto doctor`.",
+		}}
+	}
+	var out []checkResult
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".veto-original") {
+			continue
+		}
+		full := filepath.Join(shimDir, name)
+		out = append(out, checkResult{
+			status:   statusFail,
+			label:    "shim sibling:" + name,
+			detail:   full + " exists but Layer 2 shim dirs must not have .veto-original siblings",
+			howToFix: "Run `veto install-all` (or `veto install-shims`) to scrub stale siblings.",
 		})
 	}
 	return out
@@ -617,6 +677,25 @@ func pathExists(path string) bool {
 	return err == nil
 }
 
+// isSIPProtectedPath returns true on macOS when path is under a
+// System Integrity Protection root (/usr/bin, /usr/sbin, /bin, /sbin,
+// /System/...). dyld strips DYLD_INSERT_LIBRARIES from SIP-protected
+// binaries and the directories themselves are read-only, so neither
+// Layer 3 (interposer) nor Layer 4 (wrappers) can cover them. On Linux
+// this always returns false — SIP does not exist there.
+func isSIPProtectedPath(path string) bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	clean := filepath.Clean(path)
+	for _, prefix := range []string{"/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/", "/System/"} {
+		if strings.HasPrefix(clean, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // checkInterposer validates the native-interposer layer. Three checks:
 //   - the preload env var (DYLD_INSERT_LIBRARIES / LD_PRELOAD) is set;
 //   - VETO_PATH is set and points at the veto binary;
@@ -716,6 +795,30 @@ func checkInterposer() []checkResult {
 // path in Linux output and gave no signal on hosts where no PMs were
 // installed in known absolute-path roots.
 func checkWrappers(cfg config) []checkResult {
+	// Thin shim: resolve the veto identity, then delegate to
+	// checkWrappersWith. Tests construct their own VetoIdentity against a
+	// planted veto binary in a tempdir and call checkWrappersWith
+	// directly — that's why the resolveVetoBinary call lives here, not
+	// inside the worker.
+	vetoPath, vetoErr := resolveVetoBinary()
+	var vetoID *pmsurvey.VetoIdentity
+	if vetoErr == nil {
+		id, idErr := pmsurvey.VetoIdentityFor(vetoPath)
+		if idErr != nil {
+			vetoErr = idErr
+		} else {
+			vetoID = id
+		}
+	}
+	return checkWrappersWith(cfg, vetoID, vetoErr)
+}
+
+// checkWrappersWith is the worker. checkWrappers is the production
+// entrypoint that constructs vetoID via resolveVetoBinary; tests build
+// their own identity against a planted veto binary in a tempdir so
+// classifications are deterministic regardless of where the test
+// binary lives.
+func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error) []checkResult {
 	state, err := loadWrapperState(cfg)
 	if err != nil {
 		return []checkResult{{
@@ -725,14 +828,6 @@ func checkWrappers(cfg config) []checkResult {
 			howToFix: "Inspect " + filepath.Join(cfg.CacheDir, stateFileName) + " — JSON may be corrupted.",
 		}}
 	}
-
-	// resolveVetoBinary is needed for the strict physical-path
-	// identity checks (pointsAtVeto / isAlreadyOursWrap). If it
-	// fails the survey can't reliably distinguish wrapped from
-	// not-wrapped, so we degrade to the older string-match check
-	// only for the state-drift phase. Survey phase short-circuits to
-	// a single WARN.
-	vetoPath, vetoErr := resolveVetoBinary()
 
 	out := []checkResult{}
 	// Paths already reported by the state-drift phase. The host
@@ -765,23 +860,79 @@ func checkWrappers(cfg config) []checkResult {
 			})
 			continue
 		}
-		target, _ := os.Readlink(w.Path)
-		if !strings.Contains(target, "veto") {
-			out = append(out, checkResult{
-				status: statusFail,
-				label:  "wrapper:" + w.PM,
-				detail: fmt.Sprintf("%s points at %s, not veto — wrapper subverted", w.Path, target),
-				howToFix: "Re-run `veto install-wrappers --force`. If this happens repeatedly, " +
-					"investigate what is rewriting the symlink.",
-			})
-			continue
+		// Classifier-driven identity check. The prior version used
+		// strings.Contains(target, "veto") which accepted any symlink
+		// whose name happened to contain "veto" — so a previous-tool
+		// wrapper (the "bouncer" case) read as "subverted" with no
+		// actionable detail. ClassifySymlink uses SHA-256 of the target
+		// against the running veto binary, distinguishing broken /
+		// foreign / ours-by-path / ours-by-hash explicitly.
+		if vetoID == nil {
+			// Survey degraded due to vetoErr; fall through (the WARN below
+			// surfaces it). Leave this entry's healthy-PASS to follow.
+		} else {
+			class, target, classErr := pmsurvey.ClassifySymlink(w.Path, vetoID)
+			if classErr != nil {
+				out = append(out, checkResult{
+					status:   statusFail,
+					label:    "wrapper:" + w.PM,
+					detail:   fmt.Sprintf("%s: classify error — %v", w.Path, classErr),
+					howToFix: "Re-run `veto doctor` after resolving the I/O error; if the path is on an unusual filesystem, check permissions.",
+				})
+				continue
+			}
+			switch class {
+			case pmsurvey.ClassOursByPath, pmsurvey.ClassOursByHash:
+				// Healthy by classification; fall through to the OriginalPath
+				// stat check below.
+			case pmsurvey.ClassBrokenSymlink:
+				out = append(out, checkResult{
+					status:   statusFail,
+					label:    "wrapper:" + w.PM,
+					detail:   fmt.Sprintf("%s is a broken symlink to %s — wrapper target vanished (likely a previous wrapper tool's leftover)", w.Path, target),
+					howToFix: "Delete the broken symlink. If a sibling `<path>.veto-original` exists, restore it to the original name. Then re-run `veto install-wrappers`.",
+				})
+				continue
+			case pmsurvey.ClassForeignWrapper:
+				out = append(out, checkResult{
+					status:   statusFail,
+					label:    "wrapper:" + w.PM,
+					detail:   fmt.Sprintf("%s is a symlink to %s, which is not the veto binary — a foreign wrapper from another tool is installed at this path", w.Path, target),
+					howToFix: "Delete the symlink. If a sibling `<path>.veto-original` exists (e.g. `.bouncer-original`), restore it to the original name. Then re-run `veto install-wrappers`.",
+				})
+				continue
+			case pmsurvey.ClassPMLayoutSymlink:
+				// State says we wrapped this path, but the current
+				// symlink resolves to a package-manager install (Cellar,
+				// mise, etc.) — almost always the result of a brew /
+				// mise upgrade reinstalling the canonical layout on top
+				// of our wrap. Routine; install-all heals it.
+				out = append(out, checkResult{
+					status:   statusFail,
+					label:    "wrapper:" + w.PM,
+					detail:   fmt.Sprintf("%s now resolves to %s (canonical package-manager install) — wrapper was overwritten, likely by a package upgrade", w.Path, target),
+					howToFix: "Run `veto install-all` (or `veto install-wrappers`) to re-wrap.",
+				})
+				continue
+			case pmsurvey.ClassReal:
+				// info.Mode()&ModeSymlink == 0 already short-circuited above,
+				// so ClassReal should be unreachable here — but defend
+				// against future refactors that loosen the early-out.
+				out = append(out, checkResult{
+					status:   statusFail,
+					label:    "wrapper:" + w.PM,
+					detail:   fmt.Sprintf("%s is no longer a symlink — wrapper has been replaced by a real binary (likely after upgrade)", w.Path),
+					howToFix: "Re-run `veto install-wrappers --force` to re-wrap.",
+				})
+				continue
+			}
 		}
 		if _, err := os.Stat(w.OriginalPath); err != nil {
 			out = append(out, checkResult{
 				status:   statusFail,
 				label:    "wrapper:" + w.PM,
 				detail:   fmt.Sprintf("%s missing — wrapper would execute as veto with nothing to delegate to", w.OriginalPath),
-				howToFix: "Run `veto uninstall-wrappers` to clean state and `veto install-wrappers` to re-wrap.",
+				howToFix: "Run `veto install-all` (or `veto install-wrappers`) — the convergence pass at the top of install-wrappers prunes stale entries and re-wraps the live binary on the next run.",
 			})
 			continue
 		}
@@ -812,7 +963,7 @@ func checkWrappers(cfg config) []checkResult {
 	anyUnwrappedFound := false
 	firstUnwrappedPM := ""
 	for _, pm := range pmlist.Wrapped {
-		locations := surveyWrappablePaths(pm)
+		locations := pmsurvey.PathsFor(pm)
 		seen := map[string]bool{}
 		pmHadDiscovery := false
 		for _, path := range locations {
@@ -826,17 +977,82 @@ func checkWrappers(cfg config) []checkResult {
 				pmHadDiscovery = true
 				continue
 			}
+			class, target, classErr := pmsurvey.ClassifySymlink(path, vetoID)
+			if classErr != nil {
+				out = append(out, checkResult{
+					status:   statusWarn,
+					label:    "wrapper:" + pm,
+					detail:   fmt.Sprintf("%s: classify error — %v", path, classErr),
+					howToFix: "Re-run `veto doctor` after resolving the I/O error.",
+				})
+				pmHadDiscovery = true
+				continue
+			}
 			pmHadDiscovery = true
-			if isAlreadyOursWrap(path, vetoPath) {
+			switch class {
+			case pmsurvey.ClassOursByPath:
 				out = append(out, checkResult{
 					status: statusPass,
 					label:  "wrapper:" + pm,
 					detail: fmt.Sprintf("%s (wrapped, original at %s%s)", path, path, wrapperSuffix),
 				})
 				continue
+			case pmsurvey.ClassOursByHash:
+				out = append(out, checkResult{
+					status: statusPass,
+					label:  "wrapper:" + pm,
+					detail: fmt.Sprintf("%s (wrapped via hash-identified veto at %s, original at %s%s)", path, target, path, wrapperSuffix),
+				})
+				continue
+			case pmsurvey.ClassBrokenSymlink:
+				out = append(out, checkResult{
+					status:   statusFail,
+					label:    "wrapper:" + pm,
+					detail:   fmt.Sprintf("%s is a broken symlink to %s — likely a previous wrapper tool's leftover", path, target),
+					howToFix: "Delete the broken symlink. If a sibling `<path>.veto-original` exists, restore it. Then re-run `veto install-wrappers`.",
+				})
+				continue
+			case pmsurvey.ClassForeignWrapper:
+				out = append(out, checkResult{
+					status:   statusFail,
+					label:    "wrapper:" + pm,
+					detail:   fmt.Sprintf("%s is a symlink to %s — foreign wrapper, not veto", path, target),
+					howToFix: "Delete the symlink. If a sibling `<path>.veto-original` exists, restore it. Then re-run `veto install-wrappers`.",
+				})
+				continue
+			case pmsurvey.ClassPMLayoutSymlink:
+				// Symlink into a known package-manager install dir
+				// (Homebrew Cellar, mise install tree, npm-cli.js, etc.).
+				// Wrappable by default — emit the same "NOT wrapped"
+				// WARN as a regular file: install-wrappers will wrap it
+				// without --force.
+				if !anyUnwrappedFound {
+					firstUnwrappedPM = pm
+				}
+				anyUnwrappedFound = true
+				out = append(out, checkResult{
+					status:   statusWarn,
+					label:    "wrapper:" + pm,
+					detail:   fmt.Sprintf("%s (canonical package-manager symlink → %s; NOT wrapped — run veto install-wrappers)", path, target),
+					howToFix: "Run `veto install-wrappers` (or `veto install-all`) to wrap this binary so absolute-path invocations route through veto.",
+				})
+				continue
+			case pmsurvey.ClassReal:
+				if isSIPProtectedPath(path) {
+					out = append(out, checkResult{
+						status: statusNotApplicable,
+						label:  "wrapper:" + pm,
+						detail: fmt.Sprintf("%s (SIP-protected — no defense layer can cover this)", path),
+					})
+					// SIP paths are not "unwrapped" — they're
+					// unwrappable. Don't bump anyUnwrappedFound;
+					// the generic Layer-4 WARN must not count them.
+					continue
+				}
+				// Fall through to the WARN "NOT wrapped" emit below.
 			}
-			// Not wrapped: real binary, or a non-veto symlink. Either
-			// way the absolute-path invocation skips the gate.
+			// Not wrapped: real binary. The absolute-path invocation skips
+			// the gate.
 			if !anyUnwrappedFound {
 				firstUnwrappedPM = pm
 			}
@@ -886,130 +1102,6 @@ func checkWrappers(cfg config) []checkResult {
 	}
 
 	return out
-}
-
-// surveyWrappablePaths returns every absolute path on this host where
-// `pm` could live and is a Layer-4 wrap candidate. Walks the same
-// well-known roots as discoverWrapCandidates in install_wrappers.go
-// (homebrew prefix, mise installs, asdf installs, pyenv versions, nvm
-// node versions, ~/.bun/bin) plus any $PATH entries that are NOT
-// known shim/version-manager dirs.
-//
-// Why we intentionally duplicate the dir-discovery patterns from
-// install_wrappers.go rather than refactor a shared helper: the
-// discovery there returns a richer wrapCandidate struct (with
-// source/include filters) coupled to install logic; extracting it
-// cleanly would balloon this PR. The canonical implementation is
-// discoverWrapCandidates — see that for the source of truth.
-//
-// Shim dirs we deliberately skip in $PATH:
-//
-//   - ~/.local/bin when it's a veto shim dir (symlink inside resolves
-//     to the veto binary) — the shim there is Layer-2 and counting it
-//     as a Layer-4 candidate would suggest the user run install-wrappers
-//     on their own shim.
-//   - */mise/shims, */.asdf/shims, */.pyenv/shims, */.nvm/versions/* —
-//     these are version-manager shim dirs whose contents are
-//     wrapper scripts the manager owns; veto's own absolute-path
-//     coverage hits the underlying install dir (already in the
-//     well-known roots list).
-func surveyWrappablePaths(pm string) []string {
-	out := []string{}
-	seen := map[string]bool{}
-	add := func(p string) {
-		if p == "" || seen[p] {
-			return
-		}
-		info, err := os.Lstat(p)
-		if err != nil || info.IsDir() {
-			return
-		}
-		seen[p] = true
-		out = append(out, p)
-	}
-
-	// 1) Known absolute-path install roots. Mirrors
-	// discoverWrapCandidates in install_wrappers.go. Order parallels
-	// that function so behaviour stays predictable.
-	for _, dir := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
-		add(filepath.Join(dir, pm))
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		for _, binDir := range globToolVersionBinDirs(filepath.Join(home, ".local", "share", "mise", "installs")) {
-			add(filepath.Join(binDir, pm))
-		}
-		for _, binDir := range globToolVersionBinDirs(filepath.Join(home, ".asdf", "installs")) {
-			add(filepath.Join(binDir, pm))
-		}
-		for _, binDir := range globVersionBinDirs(filepath.Join(home, ".pyenv", "versions")) {
-			add(filepath.Join(binDir, pm))
-		}
-		for _, binDir := range globVersionBinDirs(filepath.Join(home, ".nvm", "versions", "node")) {
-			add(filepath.Join(binDir, pm))
-		}
-		if pm == "bun" || pm == "bunx" {
-			add(filepath.Join(home, ".bun", "bin", pm))
-		}
-	}
-
-	// 2) $PATH entries, skipping known shim/version-manager dirs.
-	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
-		if dir == "" {
-			continue
-		}
-		if isShimDirForSurvey(dir) {
-			continue
-		}
-		add(filepath.Join(dir, pm))
-	}
-
-	return out
-}
-
-// isShimDirForSurvey reports whether a $PATH entry is one the
-// per-PM host survey should skip. Two reasons to skip:
-//
-//   - veto's own Layer-2 shim dir (~/.local/bin when it holds a
-//     symlink pointing at the veto binary): surveying it would flag
-//     the shim itself as a wrap candidate, which is wrong — Layer-2
-//     and Layer-4 are different defenses at different paths.
-//   - version-manager shim dirs (mise/asdf/pyenv/nvm): their entries
-//     are wrapper scripts the manager owns and re-creates on
-//     activate; veto's absolute-path coverage hits the install dir
-//     downstream instead.
-func isShimDirForSurvey(dir string) bool {
-	// Substring matches catch both *nix-style and macOS paths.
-	switch {
-	case strings.Contains(dir, "/mise/shims"),
-		strings.Contains(dir, "/.asdf/shims"),
-		strings.Contains(dir, "/.pyenv/shims"):
-		return true
-	}
-	if strings.Contains(dir, "/.nvm/versions/") || strings.Contains(dir, "/nvm/versions/node/") {
-		return true
-	}
-	// veto's own shim dir: look for any symlink whose physical
-	// resolution contains "veto" in the path. Cheap heuristic — we
-	// don't need to be exact; if we skip a non-shim dir that happens
-	// to have a veto-named symlink the only consequence is we miss
-	// surveying a directory that almost certainly has nothing to wrap.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if e.Type()&os.ModeSymlink == 0 {
-			continue
-		}
-		resolved, err := filepath.EvalSymlinks(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		if strings.Contains(filepath.Base(resolved), "veto") {
-			return true
-		}
-	}
-	return false
 }
 
 // layer4ExampleHints returns the platform-correct example path and
