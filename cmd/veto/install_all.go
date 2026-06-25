@@ -111,7 +111,7 @@ func buildInstallAllSteps(opts installAllOpts, cfg config, libPath string, logge
 			if opts.force {
 				shimArgs = append(shimArgs, "--force")
 			}
-			return runInstallShims(logger, shimArgs)
+			return runInstallShims(logger, cfg, shimArgs)
 		}},
 		{name: "install shell integration", kind: installAllStepKindLayer, run: func() int {
 			return runInstallShell(logger, shellRCArgs(opts))

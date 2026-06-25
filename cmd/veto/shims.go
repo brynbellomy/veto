@@ -63,9 +63,16 @@ var shimmedManagers = pmlist.Shimmed
 //     --force. Replacing real binaries silently is exactly the kind of
 //     surprise a security tool should not cause.
 //
+// Convergence: every run also reconciles wrappers.json against the shim
+// dir, removing any Layer 4 entry whose path lies inside DIR. The two
+// layers must never share territory — a stray shim-dir entry in
+// wrappers.json is the failure mode that broke recovery during the
+// veto-dzk debacle (uninstall-wrappers followed the bogus entries and
+// destroyed the Layer 2 shims themselves).
+//
 // --dry-run lists every shim that would be created / updated / left
 // alone without touching the filesystem.
-func runInstallShims(logger zerolog.Logger, args []string) int {
+func runInstallShims(logger zerolog.Logger, cfg config, args []string) int {
 	flags, err := parseShimFlags(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "veto: %v\n", err)
@@ -127,6 +134,47 @@ func runInstallShims(logger zerolog.Logger, args []string) int {
 		}
 	}
 
+	// Scrub stale `.veto-original` siblings in the shim dir. Layer 2 shims
+	// MUST NOT have `.veto-original` siblings — those belong to Layer 4
+	// wrap sites that are registered in wrappers.json. If a previous
+	// install-shims (or a different veto build) ever left siblings here,
+	// they can chain back into veto itself and cause exec loops or stalls
+	// — most visibly when veto is invoked as a python3 shim from agent
+	// spawn contexts (see veto-dzk epic). Idempotent: no-op if none exist.
+	scrubbed, scrubErrs := scrubVetoOriginalSiblings(dir, dryRun)
+	for _, p := range scrubbed {
+		if dryRun {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      would remove stale Layer 2 sibling %s\n", "scrub", p)
+		} else {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      removed stale Layer 2 sibling %s\n", "scrub", p)
+		}
+		hadAction = true
+	}
+	for _, e := range scrubErrs {
+		hadFailure = true
+		fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "scrub", e)
+	}
+
+	// Convergence: prune any wrappers.json entry whose path is inside the
+	// shim dir. Layer 2 and Layer 4 must not share territory; a Layer 4
+	// entry pointing into the shim dir is the bug that broke veto-dzk's
+	// recovery — uninstall-wrappers followed the bogus entries and
+	// destroyed the Layer 2 shims themselves. Idempotent: no-op if no
+	// shim-dir entries are recorded.
+	pruned, pruneErr := pruneWrappersInShimDir(cfg, dir, dryRun)
+	if pruneErr != nil {
+		hadFailure = true
+		fmt.Fprintf(os.Stderr, "  %-12s  FAILED  %v\n", "prune", pruneErr)
+	}
+	for _, p := range pruned {
+		if dryRun {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      would prune shim-dir wrapper entry %s\n", "prune", p)
+		} else {
+			fmt.Fprintf(os.Stdout, "  %-12s  ok      pruned shim-dir wrapper entry %s\n", "prune", p)
+		}
+		hadAction = true
+	}
+
 	if hadAction && !dryRun {
 		printPathOrderingHint(os.Stdout, dir)
 	}
@@ -135,6 +183,98 @@ func runInstallShims(logger zerolog.Logger, args []string) int {
 		return exitInternal
 	}
 	return exitOK
+}
+
+// scrubVetoOriginalSiblings removes every `*.veto-original` entry in dir.
+// Layer 2 shims (install-shims output) must NEVER have `.veto-original`
+// siblings — those are owned by Layer 4 wrap sites registered in
+// wrappers.json. If an older install-shims (or a hand-edit) left siblings
+// behind, they can chain back into veto itself, producing exec loops or
+// silent stalls in agent spawn contexts.
+//
+// Returns the paths actually removed (or that would be removed under
+// dryRun) plus any per-entry errors. The directory itself is not created;
+// callers handle that. Missing dir is treated as "no siblings present" by
+// returning (nil, nil).
+//
+// We do NOT consult wrappers.json here: by construction, Layer 2 shim dirs
+// are never registered as Layer 4 wrap sites, so any `.veto-original` here
+// is stale. Cross-layer collision would be a deeper invariant violation
+// and is detected by doctor, not by install-shims.
+func scrubVetoOriginalSiblings(dir string, dryRun bool) ([]string, []error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, []error{errors.With(err, "scrub: read shim dir").Set("dir", dir)}
+	}
+	var removed []string
+	var errsOut []error
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".veto-original") {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		if dryRun {
+			removed = append(removed, full)
+			continue
+		}
+		if err := os.Remove(full); err != nil {
+			errsOut = append(errsOut, errors.With(err, "scrub: remove stale sibling").Set("path", full))
+			continue
+		}
+		removed = append(removed, full)
+	}
+	sort.Strings(removed)
+	return removed, errsOut
+}
+
+// pruneWrappersInShimDir reconciles wrappers.json against the Layer 2
+// shim dir. Removes every entry whose `Path` is inside shimDir (after
+// path cleaning so trailing slashes and `~` expansions don't slip past).
+// Layer 2 shims (install-shims output) and Layer 4 wraps (install-wrappers
+// output) must never share territory: an install-wrappers entry pointing
+// into the shim dir is a write-once bug that turns recovery commands into
+// destroyers (uninstall-wrappers blindly follows the bogus entry and
+// removes the actual shim).
+//
+// Returns the paths actually pruned (or that would be pruned under
+// dryRun). Missing wrappers.json is not an error — pruning a non-existent
+// registry is a clean no-op. Save errors propagate so the caller can
+// surface a FAIL row.
+//
+// The check is conservative: only entries strictly inside shimDir are
+// dropped. An entry whose path EQUALS the shimDir itself (impossible by
+// construction, but harmless to defend against) is left alone.
+func pruneWrappersInShimDir(cfg config, shimDir string, dryRun bool) ([]string, error) {
+	state, err := loadWrapperState(cfg)
+	if err != nil {
+		return nil, errors.With(err, "prune: load wrappers.json").Set("cache_dir", cfg.CacheDir)
+	}
+	cleanShim := filepath.Clean(shimDir)
+	prefix := cleanShim + string(filepath.Separator)
+
+	kept := make([]wrapperEntry, 0, len(state.Wrappers))
+	var pruned []string
+	for _, w := range state.Wrappers {
+		cleanPath := filepath.Clean(w.Path)
+		if strings.HasPrefix(cleanPath, prefix) {
+			pruned = append(pruned, w.Path)
+			continue
+		}
+		kept = append(kept, w)
+	}
+	sort.Strings(pruned)
+	if len(pruned) == 0 || dryRun {
+		return pruned, nil
+	}
+	state.Wrappers = kept
+	if err := saveWrapperState(cfg, state); err != nil {
+		return pruned, errors.With(err, "prune: save wrappers.json").Set("cache_dir", cfg.CacheDir)
+	}
+	return pruned, nil
 }
 
 // discoverVersionedPythons enumerates every `python3.X` (or

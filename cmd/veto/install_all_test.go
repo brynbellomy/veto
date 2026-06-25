@@ -9,6 +9,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
+
+	"github.com/brynbellomy/veto/internal/packagemanager/pmsurvey"
 )
 
 func TestParseInstallAllFlags(t *testing.T) {
@@ -219,4 +221,113 @@ func TestFindInterposerArtifactExplicit(t *testing.T) {
 	got, err := findInterposerArtifact(path)
 	require.NoError(t, err)
 	require.Equal(t, path, got)
+}
+
+// TestInstallAllConvergence_FromBrokenState is the veto-76f epic
+// acceptance test. It simulates the exact disaster state that broke
+// bryn's machine during the veto-dzk recovery — Layer 2 shims gone, a
+// stale .veto-original sibling in the shim dir, and wrappers.json
+// containing one legit Layer 4 entry plus one bogus shim-dir entry —
+// then drives install-shims + install-wrappers (the layers that
+// install-all invokes) in sequence and asserts the convergence passes
+// reconcile everything to a working state.
+//
+// The contract this test enforces: starting from any drifted state,
+// `make install && veto install-all` produces a fully working
+// installation with no FAIL rows, no stale entries, and the
+// genuinely-legit state untouched. No --force, no manual cleanup
+// commands.
+func TestInstallAllConvergence_FromBrokenState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Empty PATH so install-wrappers' discovery doesn't pick up the
+	// host's real $PATH dirs — the test must stay hermetic.
+	t.Setenv("PATH", "")
+
+	shimDir := filepath.Join(home, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	cacheDir := filepath.Join(home, ".cache", "veto")
+	cfg := config{CacheDir: cacheDir}
+
+	// --- State setup: simulate the post-disaster shape ---
+	//
+	// (a) Plant a stale `.veto-original` sibling in the shim dir.
+	// This is the on-disk shape that broke exec resolution in the
+	// veto-dzk postmortem.
+	staleSibling := filepath.Join(shimDir, "python3.veto-original")
+	require.NoError(t, os.Symlink("/usr/local/bin/veto-fake", staleSibling))
+
+	// (b) Plant a wrappers.json with one legit entry + one bogus
+	// shim-dir entry. The bogus entry is the failure mode that turned
+	// uninstall-wrappers into a destroyer of Layer 2 shims.
+	legitFixture := filepath.Join(home, "fake-pm-install", "npm")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legitFixture), 0o755))
+	require.NoError(t, os.WriteFile(legitFixture, []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.WriteFile(legitFixture+".veto-original", []byte("real-npm"), 0o755))
+
+	planted := wrapperState{Wrappers: []wrapperEntry{
+		{
+			Path:         legitFixture,
+			OriginalPath: legitFixture + ".veto-original",
+			PM:           "npm",
+			Source:       "user",
+		},
+		{
+			Path:         filepath.Join(shimDir, "python3"),
+			OriginalPath: filepath.Join(shimDir, "python3.veto-original"),
+			PM:           "python3",
+			Source:       "path",
+		},
+	}}
+	require.NoError(t, saveWrapperState(cfg, planted))
+
+	// --- Run the convergence passes install-all would invoke ---
+	logger := zerolog.Nop()
+
+	rc := runInstallShims(logger, cfg, []string{"--dir", shimDir})
+	require.Equal(t, exitOK, rc, "install-shims must succeed on the broken-state fixture")
+
+	// install-wrappers, given an empty PATH + no homebrew on the test
+	// host's known dirs, discovers nothing. But its convergence pass
+	// still prunes stale wrappers.json entries — that's what we care
+	// about here. Use the *With variant with an explicitly-built
+	// identity so we don't need a real veto binary on disk; we also
+	// pass an empty wrapperFlags so discovery walks only WellKnownBinDirs.
+	// The bogus shim-dir entry was already removed by install-shims;
+	// install-wrappers verifies the remaining state survives.
+	veto := filepath.Join(home, "fake-veto")
+	require.NoError(t, os.WriteFile(veto, []byte("veto"), 0o755))
+	id, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+	rc2, _ := runInstallWrappersWith(logger, cfg, wrapperFlags{}, veto, id)
+	require.Equal(t, exitOK, rc2, "install-wrappers must succeed on the broken-state fixture")
+
+	// --- Post-state assertions ---
+
+	// 1. Shims recreated. Spot-check the static set — install-shims
+	// creates a symlink per name from pmlist.Shimmed.
+	for _, name := range []string{"npm", "python3", "pip"} {
+		link := filepath.Join(shimDir, name)
+		info, err := os.Lstat(link)
+		require.NoError(t, err, "shim %s missing after install-shims", name)
+		require.NotZero(t, info.Mode()&os.ModeSymlink, "%s must be a symlink", name)
+	}
+
+	// 2. Stale `.veto-original` sibling gone.
+	_, err = os.Lstat(staleSibling)
+	require.True(t, os.IsNotExist(err), "stale sibling must be scrubbed by install-shims; got err=%v", err)
+
+	// 3. Bogus shim-dir wrappers.json entry gone; legit entry survives.
+	got, err := loadWrapperState(cfg)
+	require.NoError(t, err)
+	require.Len(t, got.Wrappers, 1, "expected only the legit entry to remain; got %d", len(got.Wrappers))
+	require.Equal(t, legitFixture, got.Wrappers[0].Path)
+	require.Equal(t, "npm", got.Wrappers[0].PM)
+
+	// 4. Sanity: no wrappers.json entry has a path inside the shim dir.
+	for _, w := range got.Wrappers {
+		require.False(t, strings.HasPrefix(filepath.Clean(w.Path), shimDir+string(filepath.Separator)),
+			"wrappers.json should not contain shim-dir entries after install-all; found %s", w.Path)
+	}
 }

@@ -189,6 +189,29 @@ func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags
 		return exitInternal, wrapperStats{}
 	}
 
+	// Convergence: prune stale wrappers.json entries before doing
+	// anything else. An entry is stale when either the recorded path no
+	// longer exists on disk (uninstalled, mise upgrade renamed the
+	// version dir, manual cleanup) OR the `.veto-original` sibling is
+	// missing (a prior install-shims convergence pass removed it,
+	// manual delete). Without this reconcile pass install-wrappers only
+	// ADDS — drifted state stays drifted forever and doctor FAILs the
+	// entries indefinitely.
+	prunedStale, dirty := pruneStaleWrapperEntries(&state)
+	for _, p := range prunedStale {
+		if opts.dryRun {
+			fmt.Printf("  %-10s  ok    would prune stale entry: %s — %s\n", "prune", p.Path, p.Reason)
+		} else {
+			fmt.Printf("  %-10s  ok    pruned stale entry: %s — %s\n", "prune", p.Path, p.Reason)
+		}
+	}
+	if dirty && !opts.dryRun {
+		if err := saveWrapperState(cfg, state); err != nil {
+			logger.Error().Err(err).Msg("save wrapper state (prune stale)")
+			return exitInternal, wrapperStats{}
+		}
+	}
+
 	// Discovery includes already-ours paths, so empty candidates now
 	// genuinely means nothing on disk — no PMs in known dirs at all.
 	if len(candidates) == 0 {
@@ -234,7 +257,7 @@ func runInstallWrappersWith(logger zerolog.Logger, cfg config, opts wrapperFlags
 				continue
 			}
 		}
-		switch action, err := applyWrapper(c, vetoPath, opts.dryRun, opts.force); {
+		switch action, err := applyWrapper(c, vetoPath, vetoID, opts.dryRun, opts.force); {
 		case err != nil:
 			stats.failed++
 			fmt.Fprintf(os.Stderr, "  %-10s  FAIL  %s — %v\n", c.pm, c.path, err)
@@ -597,9 +620,25 @@ func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([
 		return ok
 	}
 
+	// Defense in depth: refuse to enroll any candidate whose path lies
+	// inside the Layer 2 shim dir. Layer 2 and Layer 4 must not share
+	// territory; if a previous install-wrappers version walked $PATH and
+	// scooped up shim-dir entries (the bug that broke veto-dzk recovery),
+	// this guard prevents the regression even before install-shims
+	// reconciles the registry.
+	shimDirCanonical := filepath.Clean(defaultShimDir())
+	shimPrefix := shimDirCanonical + string(filepath.Separator)
+	inShimDir := func(p string) bool {
+		clean := filepath.Clean(p)
+		return strings.HasPrefix(clean, shimPrefix) || clean == shimDirCanonical
+	}
+
 	seen := map[string]struct{}{}
 	add := func(c wrapCandidate) {
 		if _, dup := seen[c.path]; dup {
+			return
+		}
+		if inShimDir(c.path) {
 			return
 		}
 		seen[c.path] = struct{}{}
@@ -769,11 +808,34 @@ func isWrappableTarget(p, vetoPath string) bool {
 // the symlink-create step fails we've still left the system in a
 // recoverable state: the user can move .veto-original back manually,
 // or re-run install-wrappers to retry.
-func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAction, error) {
+//
+// vetoID may be nil — callers that don't have one yet (typically older
+// tests) skip the re-classify pass and trust the cached c.class.
+// Production callers pass the same identity discovery used.
+func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentity, dryRun, force bool) (wrapAction, error) {
+	// Re-classify at wrap time. Discovery (discoverWrapCandidatesWith)
+	// runs ClassifySymlink once on every candidate, but the candidates
+	// are processed in a loop and an earlier wrap can change a later
+	// candidate's effective target — the cached verdict goes stale.
+	// Concrete case from veto-ynv.4: bun is Mach-O at discovery, gets
+	// wrapped, becomes a veto symlink. bunx (relative symlink `./bun`
+	// in the same dir) now resolves through veto. Its cached
+	// ClassForeignWrapper verdict is stale; the live classification
+	// would say "ours-by-path" — a different action entirely. Calling
+	// ClassifySymlink again here is cheap (a few stats + a hash that
+	// is sync.Once'd on vetoID) and eliminates the staleness footgun.
+	if vetoID != nil {
+		if class, target, err := pmsurvey.ClassifySymlink(c.path, vetoID); err == nil {
+			c.class = class
+			c.target = target
+		}
+	}
+
 	// Classification-driven short-circuits for the broken / foreign
-	// cases. Discovery (discoverWrapCandidatesWith) pre-classifies
-	// every candidate via pmsurvey.ClassifySymlink, so applyWrapper
-	// can dispatch without re-walking the disk.
+	// cases. ClassPMLayoutSymlink (Homebrew Cellar, mise, npm-cli.js,
+	// rustup, etc.) is the canonical install layout and falls through
+	// to the regular wrap path — applyWrapper's rename + symlink works
+	// uniformly on a symlink whose target is a regular file.
 	switch c.class {
 	case pmsurvey.ClassBrokenSymlink:
 		return wrapperActionSkipBrokenSymlink, nil
@@ -786,6 +848,16 @@ func applyWrapper(c wrapCandidate, vetoPath string, dryRun, force bool) (wrapAct
 		// (which would destroy the preserved real-binary trail).
 		if !force {
 			return wrapperActionSkipForeignWrapper, nil
+		}
+	case pmsurvey.ClassOursByPath, pmsurvey.ClassOursByHash:
+		// Re-classify saw a veto-identity symlink. If the
+		// `.veto-original` sibling exists, this is the canonical
+		// "already-ours" state — early-return as a skip so the wrap-loop
+		// below does not race to rename a symlink onto an existing
+		// sibling. If the sibling is missing, fall through to the
+		// regular wrap path which handles the broken-state case.
+		if _, err := os.Lstat(c.path + wrapperSuffix); err == nil {
+			return wrapperActionSkipAlreadyOurs, nil
 		}
 	}
 
@@ -1015,6 +1087,63 @@ func (s *wrapperState) has(path string) bool {
 		}
 	}
 	return false
+}
+
+// stalePruneRecord describes one entry pruneStaleWrapperEntries removed
+// from state, so the caller can log a per-entry line. Reason is one of
+// "path missing" / "sibling missing" — the two failure modes that mean
+// "the registry is out of sync with disk."
+type stalePruneRecord struct {
+	Path   string
+	Reason string
+}
+
+// pruneStaleWrapperEntries drops every wrappers.json entry whose
+// on-disk anchors no longer exist. An entry survives only when BOTH
+// its `Path` exists AND its `<Path>.veto-original` sibling exists. If
+// either is missing, the entry no longer reflects reality and any
+// downstream operation that trusts it (notably uninstall-wrappers)
+// will mis-behave. Returns the list of pruned entries (for logging)
+// and a dirty flag indicating whether state was modified.
+//
+// Convergence semantics: this runs at the top of every install-wrappers
+// pass. It is the reconciliation step that lets a single
+// `veto install-all` recover from drift caused by repair-* runs, mise
+// upgrades, manual cleanup, or earlier veto versions. We do NOT attempt
+// to re-wrap missing entries — discovery will find any new live PM in
+// the same dir and wrap it on its own. Drop, don't heal.
+func pruneStaleWrapperEntries(state *wrapperState) ([]stalePruneRecord, bool) {
+	kept := make([]wrapperEntry, 0, len(state.Wrappers))
+	var pruned []stalePruneRecord
+	for _, w := range state.Wrappers {
+		reason := ""
+		if _, err := os.Lstat(w.Path); err != nil {
+			if os.IsNotExist(err) {
+				reason = "path missing"
+			}
+		}
+		if reason == "" {
+			sibling := w.OriginalPath
+			if sibling == "" {
+				sibling = w.Path + wrapperSuffix
+			}
+			if _, err := os.Lstat(sibling); err != nil {
+				if os.IsNotExist(err) {
+					reason = "sibling missing"
+				}
+			}
+		}
+		if reason != "" {
+			pruned = append(pruned, stalePruneRecord{Path: w.Path, Reason: reason})
+			continue
+		}
+		kept = append(kept, w)
+	}
+	if len(pruned) == 0 {
+		return nil, false
+	}
+	state.Wrappers = kept
+	return pruned, true
 }
 
 // loadWrapperState reads the state file. Missing file is not an error;

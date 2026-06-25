@@ -32,10 +32,10 @@ import (
 
 // runInstallCodex implements `veto install-codex [--dir DIR] [--force]`.
 // Same flag shape as install-shims; we hand them through.
-func runInstallCodex(logger zerolog.Logger, args []string) int {
+func runInstallCodex(logger zerolog.Logger, cfg config, args []string) int {
 	fmt.Println("veto: wiring Codex CLI via PATH shims")
 	fmt.Println()
-	rc := runInstallShims(logger, args)
+	rc := runInstallShims(logger, cfg, args)
 	if rc != exitOK {
 		return rc
 	}

@@ -670,3 +670,87 @@ func TestSIPPathIsNotApplicableInWrapperSurvey(t *testing.T) {
 	require.True(t, isSIPProtectedPath("/usr/bin/python3"))
 	require.False(t, isSIPProtectedPath(pmPath))
 }
+
+// TestCheckStaleShimSiblings_FlagsPlanted plants the on-disk shape behind
+// the veto-dzk bead (self-referential `*.veto-original` symlinks in
+// ~/.local/bin) and asserts doctor returns one FAIL row per stale entry,
+// naming the exact path and pointing at `veto install-all`.
+func TestCheckStaleShimSiblings_FlagsPlanted(t *testing.T) {
+	shimDir := t.TempDir()
+	veto := filepath.Join(shimDir, "..", "fake-veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+
+	planted := []string{
+		filepath.Join(shimDir, "python3.veto-original"),
+		filepath.Join(shimDir, "python3.12.veto-original"),
+	}
+	for _, p := range planted {
+		require.NoError(t, os.Symlink(veto, p))
+	}
+
+	got := checkStaleShimSiblings(shimDir)
+	require.Len(t, got, len(planted))
+	for _, r := range got {
+		require.Equal(t, statusFail, r.status)
+		require.Contains(t, r.howToFix, "veto install-all")
+	}
+
+	// Each planted path appears verbatim in exactly one row's detail.
+	for _, p := range planted {
+		var found bool
+		for _, r := range got {
+			if strings.Contains(r.detail, p) {
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "expected a doctor row naming %s", p)
+	}
+}
+
+// TestCheckStaleShimSiblings_PassWhenClean proves a healthy shim dir
+// (real shim symlinks, no .veto-original entries) produces zero rows.
+// The caller appends rows to the parent slice, so an empty return means
+// the invariant holds silently.
+func TestCheckStaleShimSiblings_PassWhenClean(t *testing.T) {
+	shimDir := t.TempDir()
+	veto := filepath.Join(shimDir, "..", "fake-veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.Symlink(veto, filepath.Join(shimDir, "npm")))
+
+	got := checkStaleShimSiblings(shimDir)
+	require.Empty(t, got)
+}
+
+// TestCheckStaleShimSiblings_MissingDirIsNoFinding proves an absent
+// shim dir produces zero rows: the parent `checkShimDir` already
+// reports "shim dir not on PATH" in that case, and we don't want to
+// double-report.
+func TestCheckStaleShimSiblings_MissingDirIsNoFinding(t *testing.T) {
+	got := checkStaleShimSiblings(filepath.Join(t.TempDir(), "absent"))
+	require.Empty(t, got)
+}
+
+// TestCheckStaleShimSiblings_AfterScrubPasses proves the
+// install-shims convergence pass actually heals the invariant: after
+// the scrub runs, doctor reports zero stale-sibling rows.
+func TestCheckStaleShimSiblings_AfterScrubPasses(t *testing.T) {
+	shimDir := t.TempDir()
+	veto := filepath.Join(shimDir, "..", "fake-veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n"), 0o755))
+	stale := filepath.Join(shimDir, "python3.veto-original")
+	require.NoError(t, os.Symlink(veto, stale))
+
+	// Confirm doctor flags it BEFORE the scrub.
+	pre := checkStaleShimSiblings(shimDir)
+	require.Len(t, pre, 1)
+
+	// Run the scrub primitive that install-shims wires into its
+	// convergence pass.
+	_, errs := scrubVetoOriginalSiblings(shimDir, false)
+	require.Empty(t, errs)
+
+	// Doctor reports clean AFTER scrub.
+	post := checkStaleShimSiblings(shimDir)
+	require.Empty(t, post)
+}

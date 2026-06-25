@@ -64,6 +64,26 @@ veto doctor                        # confirm green
 case; the granular commands above let you skip layers that haven't
 changed.
 
+If `veto doctor` reports drift — stray `*.veto-original` siblings in
+the Layer 2 shim dir, stale wrappers.json entries, foreign-wrapper
+FAILs on the canonical Homebrew install — just run:
+
+```sh
+veto install-all
+```
+
+install-all is the convergence command: it reconciles each layer
+against the current on-disk state, prunes anything stale, and
+re-applies anything missing. The same command handles "first install"
+and "recover from drift" without flags.
+
+(Older versions of veto exposed `repair-shims` and recommended
+`uninstall-wrappers && install-wrappers` for recovery; both are gone.
+The scrub-stale-siblings + prune-stale-entries logic now runs at the
+top of every install-shims / install-wrappers pass.) See
+[docs/2026-06-23--python-shim-stall-postmortem.md](docs/2026-06-23--python-shim-stall-postmortem.md)
+for the failure mode that motivated the convergence rewrite.
+
 ## What it actually blocks
 
 Tested end-to-end on a macOS / mise / homebrew dev machine against the
