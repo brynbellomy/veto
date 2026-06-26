@@ -118,10 +118,13 @@ func runClaudeCodeHook(logger zerolog.Logger, stdin io.Reader, stdout io.Writer)
 		return exitOK
 	}
 
-	// Shell-expansion refusal (Phase 1.2 band-aid for $(), backticks,
-	// <(), >(), <<<). There's no "prefix with veto" correction — the
-	// agent must reissue without the construct. Phase 3.1 (sh/v3
-	// AST walker) will replace this with structural detection.
+	// Shell-expansion refusal. The analyzer now parses a real shell AST and
+	// classifies each command node; it emits PM "shell-expansion" only for
+	// the fail-CLOSED cases it cannot statically resolve — a substitution in
+	// the command-name or verb slot, a substitution-bearing `bash -c`/`eval`/
+	// here-doc payload, unparseable-but-substitution-bearing input, or
+	// pathologically nested/oversized input. There's no "prefix with veto"
+	// correction for these — the agent must reissue without the construct.
 	if finding.PM == "shell-expansion" {
 		msg := "veto-hook: refusing to evaluate shell command-substitution / herestring.\n" +
 			"The command contains $(...), backticks, <(...), >(...), or <<< — these hide commands from " +

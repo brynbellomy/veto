@@ -20,6 +20,7 @@ package claudecode
 import (
 	"strings"
 
+	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/syntax"
 
 	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
@@ -120,6 +121,17 @@ var execPMs = map[string]struct{}{
 	"npx": {}, "pnpx": {}, "bunx": {}, "rushx": {}, "uvx": {},
 }
 
+// strongInstallVerbs are the unambiguous package-install verbs across PMs,
+// used by the dynamic-command-name guard (dynamicCommandHidesInstall) where
+// argv[0] is a substitution so the PM is unknown. Deliberately EXCLUDES the
+// common English words that are dangerous only for a specific PM (go
+// build/test/run/vet) to avoid false-positives when the command name is
+// dynamic.
+var strongInstallVerbs = setOf(
+	"install", "i", "add", "ci", "dlx", "exec", "x",
+	"upgrade", "up", "update", "sync", "inject", "download", "fetch", "create",
+)
+
 // wrappers are programs whose argv pattern is `<wrapper> [flags] <real-cmd>
 // [real-args]`. They execvp the inner command, so a shell function aliasing
 // the inner command does not engage.
@@ -155,19 +167,35 @@ func setOf(items ...string) map[string]struct{} {
 // read-only commands like `go list -m $(git rev-parse HEAD)` while a real
 // PM install hidden inside a substitution is still caught precisely (the
 // hidden install is a command node the walk visits).
-func Analyze(cmd string) (Finding, bool) {
+func Analyze(cmd string) (Finding, bool) { return analyzeDepth(cmd, 0) }
+
+// Resource bounds. Analyze runs on EVERY Bash tool call. mvdan/sh's
+// recursive-descent parser, syntax.Walk, and our own re-analysis of
+// `bash -c` / `eval` / here-doc payloads all recurse with input nesting
+// depth; a pathologically nested or huge command could exhaust the goroutine
+// stack with a runtime fatal error that recover() cannot catch. We bound the
+// input fail-CLOSED (treat as a refusal) before doing any of that.
+const (
+	maxCommandLen     = 128 * 1024
+	maxNestingDepth   = 64
+	maxReanalyzeDepth = 32
+)
+
+func analyzeDepth(cmd string, depth int) (Finding, bool) {
+	if depth > maxReanalyzeDepth || len(cmd) > maxCommandLen || parenNestingDepth(cmd) > maxNestingDepth {
+		return Finding{PM: "shell-expansion", Tokens: []string{cmd}}, true
+	}
 	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
 	if err != nil {
-		// Unparseable as shell. Preserve the prior fail-CLOSED posture for
-		// inputs that still look like they hide a command in substitution
-		// syntax; otherwise defer to the shell, matching the legacy
-		// shlex-failure behavior (e.g. `npm install "unterminated`).
-		if containsShellExpansion(cmd) {
-			return Finding{PM: "shell-expansion", Tokens: []string{cmd}}, true
-		}
-		return Finding{}, false
+		return analyzeUnparseable(cmd, depth)
 	}
+	return walkFile(file, depth)
+}
 
+// walkFile classifies every command node in a parsed shell file, including
+// nodes nested inside substitutions, process substitutions, here-docs, and
+// pipelines (syntax.Walk descends into all of them).
+func walkFile(file *syntax.File, depth int) (Finding, bool) {
 	var finding Finding
 	found := false
 	syntax.Walk(file, func(node syntax.Node) bool {
@@ -177,16 +205,21 @@ func Analyze(cmd string) (Finding, bool) {
 		switch n := node.(type) {
 		case *syntax.Stmt:
 			// `sh <<< 'npm install foo'` / a here-doc feeding a shell: the
-			// payload is a redirect word, not a command the parser descends
-			// into. If the leading binary is a shell, re-analyze the body.
-			if inner, ok := shellStdinScript(n); ok {
-				if f, risky := Analyze(inner); risky {
+			// payload is a redirect word the parser does not descend into. A
+			// static body is re-analyzed; a substitution-bearing body cannot
+			// be resolved, so we fail closed.
+			if script, scriptStatic, ok := shellStdinScript(n); ok {
+				if !scriptStatic {
+					finding, found = Finding{PM: "shell-expansion", Tokens: []string{script}}, true
+					return false
+				}
+				if f, risky := analyzeDepth(script, depth+1); risky {
 					finding, found = f, true
 					return false
 				}
 			}
 		case *syntax.CallExpr:
-			if f, risky := analyzeCall(n); risky {
+			if f, risky := analyzeCall(n, depth); risky {
 				finding, found = f, true
 				return false
 			}
@@ -198,9 +231,8 @@ func Analyze(cmd string) (Finding, bool) {
 
 // analyzeCall classifies a single simple-command node. CallExpr.Args holds
 // only the command words — env assignments live in Assigns and redirects on
-// the enclosing Stmt, both handled natively by the AST — so we resolve the
-// words to their literal text, strip known wrappers, and reuse isRisky.
-func analyzeCall(ce *syntax.CallExpr) (Finding, bool) {
+// the enclosing Stmt, both handled natively by the AST.
+func analyzeCall(ce *syntax.CallExpr, depth int) (Finding, bool) {
 	words, static := callWords(ce)
 	if len(words) == 0 {
 		return Finding{}, false // pure assignment / empty
@@ -209,37 +241,52 @@ func analyzeCall(ce *syntax.CallExpr) (Finding, bool) {
 	if len(stripped) == 0 {
 		return Finding{}, false
 	}
-	// `bash -c "<script>"`: the -c argument is opaque shell source the
-	// parser does not descend into. Re-analyze it as its own command.
-	if inner, ok := shellDashCScript(stripped); ok {
-		if f, risky := Analyze(inner); risky {
+	// stripWrappers only ever removes a PREFIX of the tokens, so the per-word
+	// static flags and AST words for `stripped` are the trailing len(stripped)
+	// entries (callWords is 1:1 with ce.Args).
+	sstatic := static[len(static)-len(stripped):]
+	strippedArgs := ce.Args[len(ce.Args)-len(stripped):]
+
+	// `eval <words>` / `<shell> -c <script>`: opaque shell source the parser
+	// does not descend into. A static payload is re-analyzed; a
+	// substitution-bearing one we cannot resolve fails closed.
+	if script, scriptStatic, ok := dispatchedScript(stripped, strippedArgs); ok {
+		if !scriptStatic {
+			return Finding{PM: "shell-expansion", Tokens: stripped}, true
+		}
+		if f, risky := analyzeDepth(script, depth+1); risky {
 			return f, true
 		}
 	}
+
 	if pm, ok := isRisky(stripped); ok {
 		return Finding{PM: pm, Tokens: stripped}, true
 	}
-	// Conservative guard: a known PM whose VERB position is itself a
-	// substitution (e.g. `npm $(echo install) foo`) cannot be classified
-	// statically — refuse rather than fail open. A dynamic ARGUMENT to an
-	// otherwise determinate command (`go list -m $(git rev-parse HEAD)`)
-	// does NOT trip this; only the verb slot matters. stripWrappers returns
-	// a suffix of words, so the static flags realign by the dropped count.
-	off := len(words) - len(stripped)
-	if verbSlotDynamic(stripped, static[off:]) {
-		b := base(stripped[0])
-		if b != "veto" && (isInterposerPM(b) || isPythonInterpreter(b)) {
-			return Finding{PM: b, Tokens: stripped}, true
-		}
+
+	// Fail-closed guards for substitutions that hide the install from static
+	// classification — these keep the old blanket rule's conservatism for the
+	// cases that genuinely cannot be classified:
+	//   (a) argv[0] is itself a substitution (command name unknowable) and a
+	//       package-install verb follows (`$(echo npm) install evil`);
+	//   (b) a known PM whose verb slot is a substitution
+	//       (`npm $(echo install) foo`).
+	// A dynamic ARGUMENT to an otherwise determinate command
+	// (`go list -m $(git rev-parse HEAD)`) trips neither.
+	if dynamicCommandHidesInstall(stripped, sstatic) {
+		return Finding{PM: "shell-expansion", Tokens: stripped}, true
+	}
+	if pm, ok := dynamicVerbOnPM(stripped, sstatic); ok {
+		return Finding{PM: pm, Tokens: stripped}, true
 	}
 	return Finding{}, false
 }
 
 // callWords resolves a CallExpr's argument words to literal text and reports,
 // per word, whether the word is fully static (no command / parameter /
-// process / arithmetic expansion). A purely dynamic word resolves to "" —
-// enough for the verb-slot guard to notice while leaving determinate flags
-// and verbs matchable.
+// process / arithmetic expansion, and no ANSI-C $'...' quoting). A
+// non-static word resolves to its static prefix ("" when purely dynamic) —
+// enough for the guards to notice while leaving determinate flags and verbs
+// matchable.
 func callWords(ce *syntax.CallExpr) (words []string, static []bool) {
 	for _, w := range ce.Args {
 		text, ok := wordLiteral(w)
@@ -249,9 +296,13 @@ func callWords(ce *syntax.CallExpr) (words []string, static []bool) {
 	return words, static
 }
 
-// wordLiteral concatenates the literal portions of a word and reports
-// whether the word was fully static. Single/double-quoted literals are
-// static; command/parameter/process/arithmetic expansions are not.
+// wordLiteral concatenates the literal portions of a word and reports whether
+// the word was fully static. Plain single/double-quoted literals are static;
+// command/parameter/process/arithmetic expansions are not. ANSI-C $'...'
+// quoting is treated as NON-static: its .Value is the undecoded source
+// (e.g. \x69...), not the runtime string, so treating it as a literal would
+// both mis-match and let a verb hidden in ANSI-C escapes masquerade as a
+// benign static token — failing the conservative guard open.
 func wordLiteral(w *syntax.Word) (string, bool) {
 	if w == nil {
 		return "", true
@@ -263,6 +314,10 @@ func wordLiteral(w *syntax.Word) (string, bool) {
 		case *syntax.Lit:
 			b.WriteString(p.Value)
 		case *syntax.SglQuoted:
+			if p.Dollar { // $'...' ANSI-C quoting — undecoded, treat as dynamic
+				static = false
+				continue
+			}
 			b.WriteString(p.Value)
 		case *syntax.DblQuoted:
 			for _, dp := range p.Parts {
@@ -279,74 +334,290 @@ func wordLiteral(w *syntax.Word) (string, bool) {
 	return b.String(), static
 }
 
-// verbSlotDynamic reports whether the verb position — the first non-flag
-// word after argv[0] — is a non-static (substitution-bearing) word.
-func verbSlotDynamic(words []string, static []bool) bool {
-	for i := 1; i < len(words) && i < len(static); i++ {
-		if strings.HasPrefix(words[i], "-") {
-			continue
+// dispatchedScript returns the shell-source payload a command interprets as a
+// nested script — `eval <words>` or `<shell> -c <script>` — so the caller can
+// re-analyze it. The payload is decoded from the AST word with
+// expand.Literal so quote/escape handling is faithful (a hand-concatenation
+// of Lit parts mangles `bash -c "… \"x\" …"`). scriptStatic reports whether
+// the payload is fully static (re-analyzable) or substitution-bearing (must
+// be refused). present is false for any other command. tokens and args are
+// 1:1 (both the wrapper-stripped suffix).
+func dispatchedScript(tokens []string, args []*syntax.Word) (script string, scriptStatic, present bool) {
+	if len(tokens) == 0 {
+		return "", false, false
+	}
+	if base(tokens[0]) == "eval" {
+		var parts []string
+		allStatic := true
+		for i := 1; i < len(tokens); i++ {
+			if strings.HasPrefix(tokens[i], "-") {
+				continue // eval's own flags (e.g. `--`)
+			}
+			val, st := decodeStaticWord(argAt(args, i))
+			if !st {
+				allStatic = false
+			}
+			parts = append(parts, val)
 		}
-		return !static[i]
+		if len(parts) == 0 {
+			return "", false, false
+		}
+		return strings.Join(parts, " "), allStatic, true
+	}
+	if _, ok := shellBins[base(tokens[0])]; ok {
+		for i := 1; i < len(tokens); i++ {
+			t := tokens[i]
+			if isDashCFlag(t) && i+1 < len(tokens) {
+				val, st := decodeStaticWord(argAt(args, i+1))
+				return val, st, true
+			}
+			if !strings.HasPrefix(t, "-") {
+				break
+			}
+		}
+	}
+	return "", false, false
+}
+
+func argAt(args []*syntax.Word, i int) *syntax.Word {
+	if i >= 0 && i < len(args) {
+		return args[i]
+	}
+	return nil
+}
+
+// decodeStaticWord returns a word's fully-decoded literal value (quotes and
+// escapes resolved by mvdan's own expander) and whether the word is static.
+// A word containing any command/parameter/process/arithmetic expansion — or
+// ANSI-C $'...' quoting — is NOT static; we return ("", false) and the caller
+// fails closed rather than guessing at the runtime value.
+func decodeStaticWord(w *syntax.Word) (string, bool) {
+	if w == nil {
+		return "", true
+	}
+	if !isStaticWord(w) {
+		return "", false
+	}
+	s, err := expand.Literal(nil, w)
+	if err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// isStaticWord reports whether a word is composed entirely of literal text
+// (plain literals and ordinary single/double quotes), with no expansion of
+// any kind and no ANSI-C $'...' quoting.
+func isStaticWord(w *syntax.Word) bool {
+	for _, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+		case *syntax.SglQuoted:
+			if p.Dollar {
+				return false
+			}
+		case *syntax.DblQuoted:
+			for _, dp := range p.Parts {
+				switch d := dp.(type) {
+				case *syntax.Lit:
+				case *syntax.SglQuoted:
+					if d.Dollar {
+						return false
+					}
+				default:
+					return false
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isDashCFlag matches `-c` and short-flag clusters whose LAST letter is c
+// (`sh -ec "…"`, `sh -xc "…"`), where the next argument is the command string.
+func isDashCFlag(t string) bool {
+	if t == "-c" {
+		return true
+	}
+	if len(t) >= 2 && t[0] == '-' && t[1] != '-' {
+		body := t[1:]
+		return isAllLetters(body) && strings.HasSuffix(body, "c")
 	}
 	return false
 }
 
-// shellDashCScript returns the inline script of a `<shell> -c "<script>"`
-// invocation so the caller can re-analyze it. tokens must already be
-// wrapper-stripped. Returns ("", false) for non-shell or no-`-c` commands.
-func shellDashCScript(tokens []string) (string, bool) {
-	if len(tokens) < 3 {
-		return "", false
+func isAllLetters(s string) bool {
+	if s == "" {
+		return false
 	}
-	if _, ok := shellBins[base(tokens[0])]; !ok {
-		return "", false
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+// dynamicCommandHidesInstall reports whether argv[0] is substitution-bearing
+// (so the binary is unknowable) AND a recognizable package-install verb
+// follows. The old blanket rule refused such commands; we keep that
+// conservatism only where we genuinely cannot classify, still allowing a
+// dynamic argv[0] with no install verb (`$(tty)`-style usage).
+func dynamicCommandHidesInstall(tokens []string, static []bool) bool {
+	if len(static) == 0 || static[0] {
+		return false
 	}
 	for i := 1; i < len(tokens); i++ {
-		t := tokens[i]
-		if t == "-c" && i+1 < len(tokens) {
-			return tokens[i+1], true
+		if i < len(static) && !static[i] {
+			continue
 		}
-		if !strings.HasPrefix(t, "-") {
-			break
+		if _, ok := strongInstallVerbs[tokens[i]]; ok {
+			return true
 		}
 	}
+	return false
+}
+
+// dynamicVerbOnPM reports a known PM whose verb slot is a substitution, which
+// cannot be classified statically. It locates the verb slot EXACTLY as the
+// isRisky classifier does (same per-PM flag tables, cargo +toolchain skip,
+// python -m form), so the guard inspects the same slot the classifier would.
+func dynamicVerbOnPM(tokens []string, static []bool) (string, bool) {
+	if len(tokens) == 0 {
+		return "", false
+	}
+	b := base(tokens[0])
+	if b == "veto" {
+		return "", false
+	}
+	if isPythonInterpreter(b) {
+		// `python -m <module>`: the module name is the risky slot.
+		if len(tokens) >= 3 && tokens[1] == "-m" && len(static) > 2 && !static[2] {
+			return b, true
+		}
+		return "", false
+	}
+	if !isInterposerPM(b) {
+		return "", false
+	}
+	idx, ok := classifierVerbIndex(b, tokens)
+	if ok && idx < len(static) && !static[idx] {
+		return b, true
+	}
 	return "", false
+}
+
+// classifierVerbIndex returns the argv index isRisky treats as the verb,
+// mirroring its per-PM flag handling.
+func classifierVerbIndex(pm string, tokens []string) (int, bool) {
+	switch pm {
+	case "go":
+		idx, _, ok := firstNonFlagWithValues(tokens, 1, goFlagsWithValues)
+		return idx, ok
+	case "cargo":
+		start := 1
+		if len(tokens) > 1 && strings.HasPrefix(tokens[1], "+") {
+			start = 2 // skip rustup `+toolchain` override
+		}
+		idx, _, ok := firstNonFlagWithValues(tokens, start, cargoFlagsWithValues)
+		return idx, ok
+	default:
+		idx, _, ok := firstNonFlagWithValues(tokens, 1, nil)
+		return idx, ok
+	}
+}
+
+// parenNestingDepth returns the maximum paren nesting depth (plus a backtick
+// estimate) — a cheap pre-parse proxy for how deep the parser/walk will
+// recurse. It over-counts parens inside quotes (a fail-closed bias); real
+// commands stay far below the cap.
+func parenNestingDepth(s string) int {
+	depth, max := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+			if depth > max {
+				max = depth
+			}
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	if bt := strings.Count(s, "`") / 2; bt > max {
+		max = bt
+	}
+	return max
+}
+
+// analyzeUnparseable handles input mvdan/sh rejects. It retries once with
+// leading `!` negation runs stripped (a bash-vs-POSIX divergence the parser
+// can reject), then preserves the documented posture for what remains: fail
+// CLOSED on substitution-bearing input, otherwise defer to the shell (an
+// unparseable non-substitution command is a shell syntax error, not ours to
+// gate — matches the legacy shlex-failure behavior).
+func analyzeUnparseable(cmd string, depth int) (Finding, bool) {
+	if trimmed, removed := stripLeadingBang(cmd); removed && depth <= maxReanalyzeDepth {
+		if file, err := syntax.NewParser().Parse(strings.NewReader(trimmed), ""); err == nil {
+			return walkFile(file, depth+1)
+		}
+	}
+	if containsShellExpansion(cmd) {
+		return Finding{PM: "shell-expansion", Tokens: []string{cmd}}, true
+	}
+	return Finding{}, false
+}
+
+// stripLeadingBang removes leading `!` negation tokens (`! ! cmd`).
+func stripLeadingBang(cmd string) (string, bool) {
+	s := strings.TrimLeft(cmd, " \t")
+	removed := false
+	for len(s) > 0 && s[0] == '!' && (len(s) == 1 || s[1] == ' ' || s[1] == '\t') {
+		s = strings.TrimLeft(s[1:], " \t")
+		removed = true
+	}
+	return s, removed
 }
 
 // shellStdinScript returns the here-string / here-doc body fed to a shell
-// command on stdin (`sh <<< 'npm install foo'`, `bash <<EOF … EOF`), which
-// the shell executes as a script. Returns ("", false) when the command is
-// not a shell or carries no such redirect.
-func shellStdinScript(stmt *syntax.Stmt) (string, bool) {
+// command on stdin (`sh <<< 'npm install foo'`, `bash <<EOF … EOF`), which the
+// shell executes as a script, plus whether that body is fully static. present
+// is false when the command is not a shell or carries no such redirect.
+func shellStdinScript(stmt *syntax.Stmt) (script string, scriptStatic, present bool) {
 	ce, ok := stmt.Cmd.(*syntax.CallExpr)
 	if !ok || len(ce.Args) == 0 {
-		return "", false
+		return "", false, false
 	}
 	lead, _ := wordLiteral(ce.Args[0])
 	if _, ok := shellBins[base(lead)]; !ok {
-		return "", false
+		return "", false, false
 	}
 	for _, r := range stmt.Redirs {
+		var w *syntax.Word
 		switch r.Op {
 		case syntax.WordHdoc:
-			if body, _ := wordLiteral(r.Word); body != "" {
-				return body, true
-			}
+			w = r.Word
 		case syntax.Hdoc, syntax.DashHdoc:
-			if body, _ := wordLiteral(r.Hdoc); body != "" {
-				return body, true
-			}
+			w = r.Hdoc
+		default:
+			continue
 		}
+		body, st := decodeStaticWord(w)
+		return body, st, true
 	}
-	return "", false
+	return "", false, false
 }
 
 // containsShellExpansion reports whether the raw command string contains
-// constructs that hide commands from a token-pipeline parser: command
-// substitution ($(...) and backticks), process substitution (<(...),
-// >(...)), and herestrings (<<<). Any of these can route a PM call past
-// the analyzer; Phase 1.2 refuses them to close the fail-OPEN until
-// Phase 3.1 swaps in a real shell AST.
+// command substitution ($(...) / backticks), process substitution (<(...),
+// >(...)), or a here-string (<<<). The primary classifier is now the shell
+// AST walk in Analyze; this is only a residual fail-CLOSED fallback for input
+// the parser REJECTS (analyzeUnparseable) — if we cannot parse it but it
+// still hides commands in substitution syntax, we refuse rather than guess.
 func containsShellExpansion(s string) bool {
 	if strings.Contains(s, "$(") {
 		return true
