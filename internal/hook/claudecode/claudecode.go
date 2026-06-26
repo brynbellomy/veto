@@ -20,7 +20,6 @@ package claudecode
 import (
 	"strings"
 
-	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/syntax"
 
 	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
@@ -296,13 +295,18 @@ func callWords(ce *syntax.CallExpr) (words []string, static []bool) {
 	return words, static
 }
 
-// wordLiteral concatenates the literal portions of a word and reports whether
-// the word was fully static. Plain single/double-quoted literals are static;
-// command/parameter/process/arithmetic expansions are not. ANSI-C $'...'
-// quoting is treated as NON-static: its .Value is the undecoded source
-// (e.g. \x69...), not the runtime string, so treating it as a literal would
-// both mis-match and let a verb hidden in ANSI-C escapes masquerade as a
-// benign static token — failing the conservative guard open.
+// wordLiteral returns a word's decoded token text and whether the word is
+// fully static (no expansion of any kind, no ANSI-C $'...'). It resolves
+// shell quoting/escaping the way the shell would: unquoted `\X` → `X` (so
+// `\npm` → `npm`, the classic alias bypass a raw Lit would miss), single
+// quotes are literal, and inside double quotes a backslash is special only
+// before $ ` " \ or newline. mvdan keeps these escapes raw in Lit nodes and
+// its expand.Literal does NOT strip unquoted backslashes, so we decode here.
+//
+// A dynamic word (command/parameter/process/arithmetic expansion, or ANSI-C
+// quoting) still returns its decoded static PREFIX — enough for flag forms
+// like `--config=$(x)` to read as flags — but reports static=false so the
+// fail-closed guards treat the substitution-bearing slot as unknowable.
 func wordLiteral(w *syntax.Word) (string, bool) {
 	if w == nil {
 		return "", true
@@ -312,18 +316,25 @@ func wordLiteral(w *syntax.Word) (string, bool) {
 	for _, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			b.WriteString(p.Value)
+			b.WriteString(unescapeUnquoted(p.Value))
 		case *syntax.SglQuoted:
-			if p.Dollar { // $'...' ANSI-C quoting — undecoded, treat as dynamic
+			if p.Dollar { // $'...' ANSI-C — undecoded source, not a real literal
 				static = false
 				continue
 			}
 			b.WriteString(p.Value)
 		case *syntax.DblQuoted:
 			for _, dp := range p.Parts {
-				if lit, ok := dp.(*syntax.Lit); ok {
-					b.WriteString(lit.Value)
-				} else {
+				switch d := dp.(type) {
+				case *syntax.Lit:
+					b.WriteString(unescapeDquote(d.Value))
+				case *syntax.SglQuoted:
+					if d.Dollar {
+						static = false
+					} else {
+						b.WriteString(d.Value)
+					}
+				default:
 					static = false
 				}
 			}
@@ -332,6 +343,53 @@ func wordLiteral(w *syntax.Word) (string, bool) {
 		}
 	}
 	return b.String(), static
+}
+
+// unescapeUnquoted resolves backslash escapes in UNQUOTED shell text: `\X`
+// drops the backslash and keeps X literally; `\<newline>` is a line
+// continuation (removed).
+func unescapeUnquoted(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			if s[i] == '\n' {
+				continue
+			}
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// unescapeDquote resolves backslash escapes inside DOUBLE quotes, where a
+// backslash is special only before $ ` " \ or newline; any other backslash
+// is literal.
+func unescapeDquote(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '$', '`', '"', '\\':
+				i++
+				b.WriteByte(s[i])
+				continue
+			case '\n':
+				i++
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // dispatchedScript returns the shell-source payload a command interprets as a
@@ -353,7 +411,7 @@ func dispatchedScript(tokens []string, args []*syntax.Word) (script string, scri
 			if strings.HasPrefix(tokens[i], "-") {
 				continue // eval's own flags (e.g. `--`)
 			}
-			val, st := decodeStaticWord(argAt(args, i))
+			val, st := wordLiteral(argAt(args, i))
 			if !st {
 				allStatic = false
 			}
@@ -368,7 +426,7 @@ func dispatchedScript(tokens []string, args []*syntax.Word) (script string, scri
 		for i := 1; i < len(tokens); i++ {
 			t := tokens[i]
 			if isDashCFlag(t) && i+1 < len(tokens) {
-				val, st := decodeStaticWord(argAt(args, i+1))
+				val, st := wordLiteral(argAt(args, i+1))
 				return val, st, true
 			}
 			if !strings.HasPrefix(t, "-") {
@@ -384,55 +442,6 @@ func argAt(args []*syntax.Word, i int) *syntax.Word {
 		return args[i]
 	}
 	return nil
-}
-
-// decodeStaticWord returns a word's fully-decoded literal value (quotes and
-// escapes resolved by mvdan's own expander) and whether the word is static.
-// A word containing any command/parameter/process/arithmetic expansion — or
-// ANSI-C $'...' quoting — is NOT static; we return ("", false) and the caller
-// fails closed rather than guessing at the runtime value.
-func decodeStaticWord(w *syntax.Word) (string, bool) {
-	if w == nil {
-		return "", true
-	}
-	if !isStaticWord(w) {
-		return "", false
-	}
-	s, err := expand.Literal(nil, w)
-	if err != nil {
-		return "", false
-	}
-	return s, true
-}
-
-// isStaticWord reports whether a word is composed entirely of literal text
-// (plain literals and ordinary single/double quotes), with no expansion of
-// any kind and no ANSI-C $'...' quoting.
-func isStaticWord(w *syntax.Word) bool {
-	for _, part := range w.Parts {
-		switch p := part.(type) {
-		case *syntax.Lit:
-		case *syntax.SglQuoted:
-			if p.Dollar {
-				return false
-			}
-		case *syntax.DblQuoted:
-			for _, dp := range p.Parts {
-				switch d := dp.(type) {
-				case *syntax.Lit:
-				case *syntax.SglQuoted:
-					if d.Dollar {
-						return false
-					}
-				default:
-					return false
-				}
-			}
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // isDashCFlag matches `-c` and short-flag clusters whose LAST letter is c
@@ -606,7 +615,7 @@ func shellStdinScript(stmt *syntax.Stmt) (script string, scriptStatic, present b
 		default:
 			continue
 		}
-		body, st := decodeStaticWord(w)
+		body, st := wordLiteral(w)
 		return body, st, true
 	}
 	return "", false, false

@@ -515,3 +515,36 @@ func TestAnalyze_LeadingBangNegation_StillDetected(t *testing.T) {
 		require.True(t, ok, "negated install must still be detected: %q", c)
 	}
 }
+
+// TestAnalyze_BackslashEscapedCommand_StillDetected: in bash `\npm` runs the
+// real `npm` (the classic alias/function bypass). The command name must be
+// decoded so the escape cannot hide a package manager from the analyzer.
+// Found by adversarial re-verification of the AST rewrite.
+func TestAnalyze_BackslashEscapedCommand_StillDetected(t *testing.T) {
+	for _, c := range []string{
+		`\npm install`,
+		`n\pm install foo`,
+		`np\m install foo`,
+		`\yarn add lodash`,
+		`\pnpm install`,
+		`\pip install requests`,
+		`\cargo install ripgrep`,
+		`\npx some-pkg`,
+		`echo done; \npm install lodash`,
+		`true && \npm install`,
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "backslash-escaped PM command must still be detected: %q", c)
+	}
+}
+
+func TestAnalyze_BackslashEscapedNonPM_Allowed(t *testing.T) {
+	for _, c := range []string{
+		`\ls -la`,
+		`\git status`,
+		`\echo npm install`,
+	} {
+		_, ok := Analyze(c)
+		require.False(t, ok, "backslash-escaped non-PM command must pass: %q", c)
+	}
+}
