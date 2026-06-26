@@ -57,6 +57,9 @@ func TestInstallWrappers_BrokenSymlinkIsVisibleSkip(t *testing.T) {
 	require.NoError(t, os.Symlink(filepath.Join(tmp, "vanished-bouncer"), brokenSym))
 	t.Setenv("HOME", tmp)
 	t.Setenv("PATH", "")
+	// Keep discovery off the real /opt/homebrew/bin (see SystemBinDirsEnv);
+	// the mise fixture below lives under the temp $HOME and is unaffected.
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
 
 	cfg := config{CacheDir: cacheDir}
 	opts := wrapperFlags{only: map[string]struct{}{"bun": {}}}
@@ -95,6 +98,9 @@ func TestInstallWrappers_ForeignWrapperWithoutForceIsSkip(t *testing.T) {
 	require.NoError(t, os.Symlink(foreignBin, foreignSym))
 	t.Setenv("HOME", tmp)
 	t.Setenv("PATH", "")
+	// Keep discovery off the real /opt/homebrew/bin (see SystemBinDirsEnv);
+	// the mise fixture below lives under the temp $HOME and is unaffected.
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
 
 	cfg := config{CacheDir: cacheDir}
 	opts := wrapperFlags{only: map[string]struct{}{"bun": {}}}

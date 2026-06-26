@@ -395,6 +395,10 @@ func TestRunInstallWrappers_WrapsUVCanonicalPython(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("PATH", "")
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// The uv canonical python is discovered via the uv-store walk (under
+	// the temp $HOME), independent of the system prefixes; confine those so
+	// the test never wraps the real /opt/homebrew/bin/python3.12.
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
 
 	veto := filepath.Join(home, ".local", "bin", "veto")
 	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
@@ -442,6 +446,9 @@ func TestRunInstallWrappers_ReentrantOnUVCanonicalPython(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("PATH", "")
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// See TestRunInstallWrappers_WrapsUVCanonicalPython: confine system
+	// prefixes so the reentrant run never touches real homebrew binaries.
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
 
 	veto := filepath.Join(home, ".local", "bin", "veto")
 	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))

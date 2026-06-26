@@ -243,6 +243,11 @@ func TestInstallAllConvergence_FromBrokenState(t *testing.T) {
 	// Empty PATH so install-wrappers' discovery doesn't pick up the
 	// host's real $PATH dirs — the test must stay hermetic.
 	t.Setenv("PATH", "")
+	// Confine the hardcoded system prefixes (/opt/homebrew/bin,
+	// /usr/local/bin) too: they are absolute paths independent of $HOME,
+	// so without this install-wrappers would discover and WRAP the
+	// developer's real homebrew binaries during the test.
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
 
 	shimDir := filepath.Join(home, ".local", "bin")
 	require.NoError(t, os.MkdirAll(shimDir, 0o755))
