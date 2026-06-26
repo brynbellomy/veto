@@ -20,7 +20,7 @@ package claudecode
 import (
 	"strings"
 
-	"github.com/google/shlex"
+	"mvdan.cc/sh/v3/syntax"
 
 	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
 )
@@ -133,10 +133,6 @@ var shellBins = map[string]struct{}{
 	"bash": {}, "sh": {}, "zsh": {}, "dash": {}, "ksh": {}, "fish": {},
 }
 
-var listSeparators = map[string]struct{}{
-	"|": {}, "||": {}, "&&": {}, ";": {}, "&": {},
-}
-
 func setOf(items ...string) map[string]struct{} {
 	out := make(map[string]struct{}, len(items))
 	for _, it := range items {
@@ -149,38 +145,200 @@ func setOf(items ...string) map[string]struct{} {
 // reaches a covered package manager with a dangerous verb. ok=false means
 // the command is safe to let through unchanged (or unparseable; we defer
 // to the shell in that case, matching the Python original).
+//
+// The command is parsed into a real shell AST (mvdan.cc/sh) and every
+// command node is classified — including ones nested inside command
+// substitution ($(...) / backticks), process substitution (<(...), >(...)),
+// here-strings / here-docs, `bash -c "..."` payloads, pipelines, and
+// separators. This replaces the earlier blanket refusal of any command
+// merely containing substitution syntax, which false-positived on harmless
+// read-only commands like `go list -m $(git rev-parse HEAD)` while a real
+// PM install hidden inside a substitution is still caught precisely (the
+// hidden install is a command node the walk visits).
 func Analyze(cmd string) (Finding, bool) {
-	// Command substitution and herestrings are opaque to shlex: $(...),
-	// `...`, <(...), >(...), and <<<. Rather than half-parse them, refuse
-	// the install — the agent can re-issue without the construct. Phase
-	// 3.1 (sh/v3/syntax) replaces this band-aid with a real AST walker.
-	// Regressions: TestAnalyze_CommandSubstitution_Refused,
-	// TestAnalyze_Herestring_Refused.
-	if containsShellExpansion(cmd) {
-		return Finding{
-			PM:     "shell-expansion",
-			Tokens: []string{cmd},
-		}, true
-	}
-	top, err := shlex.Split(cmd)
-	if err != nil || len(top) == 0 {
-		// Unparseable — defer to the shell, same as the Python version.
+	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	if err != nil {
+		// Unparseable as shell. Preserve the prior fail-CLOSED posture for
+		// inputs that still look like they hide a command in substitution
+		// syntax; otherwise defer to the shell, matching the legacy
+		// shlex-failure behavior (e.g. `npm install "unterminated`).
+		if containsShellExpansion(cmd) {
+			return Finding{PM: "shell-expansion", Tokens: []string{cmd}}, true
+		}
 		return Finding{}, false
 	}
 
-	top = splitInlineSeparators(top)
-	top = stripRedirects(top)
-	for _, sub := range splitBySeparators(top) {
-		for _, inner := range expandShellInvocations(sub) {
-			inner = stripRedirects(inner)
-			inner = stripEnvAssignments(inner)
-			inner = stripWrappers(inner)
-			if pm, ok := isRisky(inner); ok {
-				return Finding{PM: pm, Tokens: inner}, true
+	var finding Finding
+	found := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if found {
+			return false
+		}
+		switch n := node.(type) {
+		case *syntax.Stmt:
+			// `sh <<< 'npm install foo'` / a here-doc feeding a shell: the
+			// payload is a redirect word, not a command the parser descends
+			// into. If the leading binary is a shell, re-analyze the body.
+			if inner, ok := shellStdinScript(n); ok {
+				if f, risky := Analyze(inner); risky {
+					finding, found = f, true
+					return false
+				}
 			}
+		case *syntax.CallExpr:
+			if f, risky := analyzeCall(n); risky {
+				finding, found = f, true
+				return false
+			}
+		}
+		return true
+	})
+	return finding, found
+}
+
+// analyzeCall classifies a single simple-command node. CallExpr.Args holds
+// only the command words — env assignments live in Assigns and redirects on
+// the enclosing Stmt, both handled natively by the AST — so we resolve the
+// words to their literal text, strip known wrappers, and reuse isRisky.
+func analyzeCall(ce *syntax.CallExpr) (Finding, bool) {
+	words, static := callWords(ce)
+	if len(words) == 0 {
+		return Finding{}, false // pure assignment / empty
+	}
+	stripped := stripWrappers(words)
+	if len(stripped) == 0 {
+		return Finding{}, false
+	}
+	// `bash -c "<script>"`: the -c argument is opaque shell source the
+	// parser does not descend into. Re-analyze it as its own command.
+	if inner, ok := shellDashCScript(stripped); ok {
+		if f, risky := Analyze(inner); risky {
+			return f, true
+		}
+	}
+	if pm, ok := isRisky(stripped); ok {
+		return Finding{PM: pm, Tokens: stripped}, true
+	}
+	// Conservative guard: a known PM whose VERB position is itself a
+	// substitution (e.g. `npm $(echo install) foo`) cannot be classified
+	// statically — refuse rather than fail open. A dynamic ARGUMENT to an
+	// otherwise determinate command (`go list -m $(git rev-parse HEAD)`)
+	// does NOT trip this; only the verb slot matters. stripWrappers returns
+	// a suffix of words, so the static flags realign by the dropped count.
+	off := len(words) - len(stripped)
+	if verbSlotDynamic(stripped, static[off:]) {
+		b := base(stripped[0])
+		if b != "veto" && (isInterposerPM(b) || isPythonInterpreter(b)) {
+			return Finding{PM: b, Tokens: stripped}, true
 		}
 	}
 	return Finding{}, false
+}
+
+// callWords resolves a CallExpr's argument words to literal text and reports,
+// per word, whether the word is fully static (no command / parameter /
+// process / arithmetic expansion). A purely dynamic word resolves to "" —
+// enough for the verb-slot guard to notice while leaving determinate flags
+// and verbs matchable.
+func callWords(ce *syntax.CallExpr) (words []string, static []bool) {
+	for _, w := range ce.Args {
+		text, ok := wordLiteral(w)
+		words = append(words, text)
+		static = append(static, ok)
+	}
+	return words, static
+}
+
+// wordLiteral concatenates the literal portions of a word and reports
+// whether the word was fully static. Single/double-quoted literals are
+// static; command/parameter/process/arithmetic expansions are not.
+func wordLiteral(w *syntax.Word) (string, bool) {
+	if w == nil {
+		return "", true
+	}
+	var b strings.Builder
+	static := true
+	for _, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			b.WriteString(p.Value)
+		case *syntax.SglQuoted:
+			b.WriteString(p.Value)
+		case *syntax.DblQuoted:
+			for _, dp := range p.Parts {
+				if lit, ok := dp.(*syntax.Lit); ok {
+					b.WriteString(lit.Value)
+				} else {
+					static = false
+				}
+			}
+		default:
+			static = false
+		}
+	}
+	return b.String(), static
+}
+
+// verbSlotDynamic reports whether the verb position — the first non-flag
+// word after argv[0] — is a non-static (substitution-bearing) word.
+func verbSlotDynamic(words []string, static []bool) bool {
+	for i := 1; i < len(words) && i < len(static); i++ {
+		if strings.HasPrefix(words[i], "-") {
+			continue
+		}
+		return !static[i]
+	}
+	return false
+}
+
+// shellDashCScript returns the inline script of a `<shell> -c "<script>"`
+// invocation so the caller can re-analyze it. tokens must already be
+// wrapper-stripped. Returns ("", false) for non-shell or no-`-c` commands.
+func shellDashCScript(tokens []string) (string, bool) {
+	if len(tokens) < 3 {
+		return "", false
+	}
+	if _, ok := shellBins[base(tokens[0])]; !ok {
+		return "", false
+	}
+	for i := 1; i < len(tokens); i++ {
+		t := tokens[i]
+		if t == "-c" && i+1 < len(tokens) {
+			return tokens[i+1], true
+		}
+		if !strings.HasPrefix(t, "-") {
+			break
+		}
+	}
+	return "", false
+}
+
+// shellStdinScript returns the here-string / here-doc body fed to a shell
+// command on stdin (`sh <<< 'npm install foo'`, `bash <<EOF … EOF`), which
+// the shell executes as a script. Returns ("", false) when the command is
+// not a shell or carries no such redirect.
+func shellStdinScript(stmt *syntax.Stmt) (string, bool) {
+	ce, ok := stmt.Cmd.(*syntax.CallExpr)
+	if !ok || len(ce.Args) == 0 {
+		return "", false
+	}
+	lead, _ := wordLiteral(ce.Args[0])
+	if _, ok := shellBins[base(lead)]; !ok {
+		return "", false
+	}
+	for _, r := range stmt.Redirs {
+		switch r.Op {
+		case syntax.WordHdoc:
+			if body, _ := wordLiteral(r.Word); body != "" {
+				return body, true
+			}
+		case syntax.Hdoc, syntax.DashHdoc:
+			if body, _ := wordLiteral(r.Hdoc); body != "" {
+				return body, true
+			}
+		}
+	}
+	return "", false
 }
 
 // containsShellExpansion reports whether the raw command string contains
@@ -205,79 +363,6 @@ func containsShellExpansion(s string) bool {
 	return false
 }
 
-// splitInlineSeparators turns tokens like `/tmp;` into [`/tmp`, `;`] so
-// downstream splitBySeparators can see the command boundary even when the
-// user typed `cd /tmp; npm install foo` with no space around the separator.
-// shlex strips quotes before this point, so any remaining separator in a
-// token was unquoted in the original input — safe to split on.
-//
-// Recognized separators: `;`, `|`, `||`, `&`, `&&`. They are extracted as
-// standalone tokens regardless of where they appear inside the input token.
-// Closes a fail-OPEN the Python original shared with us.
-func splitInlineSeparators(tokens []string) []string {
-	out := make([]string, 0, len(tokens))
-	for _, t := range tokens {
-		// Fast path: no separator characters at all.
-		if !strings.ContainsAny(t, ";|&") {
-			out = append(out, t)
-			continue
-		}
-		// Whitespace inside a token implies the user quoted it (shlex would
-		// otherwise have split on it). Quoted strings are opaque to us — they
-		// might be a `bash -c "cd /tmp && npm install foo"` payload that
-		// expandShellInvocations will recurse into. Don't shred it here.
-		if strings.ContainsAny(t, " \t\n") {
-			out = append(out, t)
-			continue
-		}
-		var current strings.Builder
-		i := 0
-		for i < len(t) {
-			c := t[i]
-			switch c {
-			case ';':
-				if current.Len() > 0 {
-					out = append(out, current.String())
-					current.Reset()
-				}
-				out = append(out, ";")
-				i++
-			case '|':
-				if current.Len() > 0 {
-					out = append(out, current.String())
-					current.Reset()
-				}
-				if i+1 < len(t) && t[i+1] == '|' {
-					out = append(out, "||")
-					i += 2
-				} else {
-					out = append(out, "|")
-					i++
-				}
-			case '&':
-				if current.Len() > 0 {
-					out = append(out, current.String())
-					current.Reset()
-				}
-				if i+1 < len(t) && t[i+1] == '&' {
-					out = append(out, "&&")
-					i += 2
-				} else {
-					out = append(out, "&")
-					i++
-				}
-			default:
-				current.WriteByte(c)
-				i++
-			}
-		}
-		if current.Len() > 0 {
-			out = append(out, current.String())
-		}
-	}
-	return out
-}
-
 // base returns the last path component (no directory). Mirrors Python's
 // `tok.rsplit('/', 1)[-1]` without requiring filepath semantics.
 func base(tok string) string {
@@ -285,134 +370,6 @@ func base(tok string) string {
 		return tok[i+1:]
 	}
 	return tok
-}
-
-// isRedirect reports whether tok looks like a shell redirection token that
-// shlex tokenized as an ordinary string (>, >>, 2>, 2>&1, &>file, ...).
-// Without this filter, `2>&1` would be parsed as a positional argument.
-func isRedirect(tok string) bool {
-	if tok == "" {
-		return false
-	}
-	s := strings.TrimLeft(tok, "0123456789")
-	if s == "" {
-		return false
-	}
-	return strings.HasPrefix(s, "<") || strings.HasPrefix(s, ">") || strings.HasPrefix(s, "&>")
-}
-
-func splitBySeparators(tokens []string) [][]string {
-	var out [][]string
-	var current []string
-	for _, t := range tokens {
-		if _, isSep := listSeparators[t]; isSep {
-			if len(current) > 0 {
-				out = append(out, current)
-				current = nil
-			}
-			continue
-		}
-		current = append(current, t)
-	}
-	if len(current) > 0 {
-		out = append(out, current)
-	}
-	return out
-}
-
-// stripRedirects drops redirect tokens AND, when the redirect has no inline
-// target (e.g. `>` alone vs `>file`), the filename successor too.
-func stripRedirects(tokens []string) []string {
-	out := make([]string, 0, len(tokens))
-	skipNext := false
-	for _, t := range tokens {
-		if skipNext {
-			skipNext = false
-			continue
-		}
-		if isRedirect(t) {
-			// If the redirect token doesn't already carry its target
-			// (`>file` vs `>`), the next token is the filename — skip it.
-			stripped := strings.TrimLeft(t, "0123456789")
-			stripped = strings.TrimLeft(stripped, "<>&")
-			if stripped == "" {
-				skipNext = true
-			}
-			continue
-		}
-		out = append(out, t)
-	}
-	return out
-}
-
-// expandShellInvocations recursively unpacks `bash -c "<inline>"` and
-// returns the list of leaf command-token-lists found inside. Non-shell
-// invocations pass through unchanged.
-func expandShellInvocations(tokens []string) [][]string {
-	if len(tokens) < 3 {
-		return [][]string{tokens}
-	}
-	if _, isShell := shellBins[base(tokens[0])]; !isShell {
-		return [][]string{tokens}
-	}
-	for i := 1; i < len(tokens); i++ {
-		t := tokens[i]
-		if t == "-c" && i+1 < len(tokens) {
-			inner, err := shlex.Split(tokens[i+1])
-			if err != nil {
-				return [][]string{tokens}
-			}
-			// Recover unspaced separators in the nested payload —
-			// the top-level Analyze loop already does this, but the
-			// inner re-shlex of `bash -c "cd /tmp;npm install foo"`
-			// would otherwise leave `cd /tmp;npm` glued and the leaf
-			// `cd` would shadow the npm install.
-			// Regression: TestAnalyze_NestedBashC_UnspacedSeparators.
-			inner = splitInlineSeparators(inner)
-			inner = stripRedirects(inner)
-			var out [][]string
-			for _, sub := range splitBySeparators(inner) {
-				out = append(out, expandShellInvocations(sub)...)
-			}
-			if len(out) == 0 {
-				return [][]string{tokens}
-			}
-			return out
-		}
-		if !strings.HasPrefix(t, "-") {
-			break
-		}
-	}
-	return [][]string{tokens}
-}
-
-// stripEnvAssignments drops leading `VAR=value` tokens (shell-style env
-// assignments preceding a command).
-func stripEnvAssignments(tokens []string) []string {
-	i := 0
-	for i < len(tokens) {
-		t := tokens[i]
-		if strings.HasPrefix(t, "-") {
-			break
-		}
-		name, _, hasEq := strings.Cut(t, "=")
-		if !hasEq || name == "" {
-			break
-		}
-		valid := true
-		for _, r := range name {
-			if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-				(r >= '0' && r <= '9')) {
-				valid = false
-				break
-			}
-		}
-		if !valid {
-			break
-		}
-		i++
-	}
-	return tokens[i:]
 }
 
 // stripWrappers peels off known wrappers and their flags until it reaches

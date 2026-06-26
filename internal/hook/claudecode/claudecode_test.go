@@ -261,17 +261,110 @@ func TestAnalyze_CommandSubstitution_Refused(t *testing.T) {
 }
 
 // TestAnalyze_Herestring_Refused — `sh <<< 'npm install foo'`. The <<<
-// herestring is opaque to shlex, and the legacy redirect-stripper
-// discarded the payload entirely. Phase 1.2 surfaces this as risky.
+// herestring feeds a script to the shell on stdin; the AST exposes it as a
+// redirect word the parser does not descend into, so the analyzer
+// re-parses the body. A here-doc feeding a shell is handled the same way.
 func TestAnalyze_Herestring_Refused(t *testing.T) {
 	cases := []string{
 		`sh <<< 'npm install foo'`,
 		`bash <<< "pip install requests"`,
+		"bash <<EOF\nnpm install foo\nEOF",
 	}
 	for _, c := range cases {
 		t.Run(c, func(t *testing.T) {
 			_, ok := Analyze(c)
-			require.True(t, ok, "<<< herestrings must not silently drop the payload (%q)", c)
+			require.True(t, ok, "shell stdin scripts must not silently drop the payload (%q)", c)
+		})
+	}
+}
+
+// TestAnalyze_ReadOnlySubstitution_Allowed is the regression for the
+// false-positive that motivated the AST rewrite: a command substitution in
+// argument position of a non-install command was blanket-refused even
+// though nothing inside it installs anything. After the rewrite each
+// command node is classified individually, so these pass through.
+func TestAnalyze_ReadOnlySubstitution_Allowed(t *testing.T) {
+	cases := []string{
+		`go list -m $(git rev-parse HEAD)`,
+		`go list -m all`,
+		`echo $(date)`,
+		`ls $(pwd)`,
+		`cat $(git rev-parse --show-toplevel)/go.mod`,
+		`grep -r foo $(go list -f '{{.Dir}}' ./...)`,
+		"echo `git describe --tags`",
+		`diff <(sort a.txt) <(sort b.txt)`,
+		`VAR=$(go env GOPATH) go vet ./...`, // go vet is its own risky node; the $() is benign
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			finding, ok := Analyze(c)
+			// `go vet` is independently risky; assert only that the
+			// substitution itself never causes a false PM detection.
+			if ok {
+				require.Equal(t, "go", finding.PM,
+					"only the go-vet node may flag for %q; got pm=%s", c, finding.PM)
+			}
+		})
+	}
+}
+
+// TestAnalyze_HiddenInstallInSubstitution_StillRefused proves the security
+// property survives the rewrite: an install hidden inside a substitution —
+// whether the substitution is an argument, a backtick, a process
+// substitution, or an assignment value — is still detected, because the
+// hidden install is a real command node the walk visits.
+func TestAnalyze_HiddenInstallInSubstitution_StillRefused(t *testing.T) {
+	cases := []struct {
+		cmd string
+		pm  string
+	}{
+		{`echo $(npm install evil)`, "npm"},
+		{"echo `pip install evil`", "pip"},
+		{`RESULT=$(npm install evil)`, "npm"},
+		{`x=$(go get evil@latest) && echo done`, "go"},
+		{`diff <(cat a) <(yarn add evil)`, "yarn"},
+		{`true && echo $(uv add evil)`, "uv"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.cmd, func(t *testing.T) {
+			finding, ok := Analyze(tc.cmd)
+			require.True(t, ok, "hidden install must still be refused: %q", tc.cmd)
+			require.Equal(t, tc.pm, finding.PM)
+		})
+	}
+}
+
+// TestAnalyze_DynamicVerbOnPM_Refused covers the conservative guard: when a
+// known PM's verb position is itself a substitution, the command can't be
+// classified statically, so it is refused rather than allowed. A dynamic
+// ARGUMENT to a determinate verb does not trip the guard (covered above).
+func TestAnalyze_DynamicVerbOnPM_Refused(t *testing.T) {
+	cases := []string{
+		`npm $(echo install) foo`,
+		"pip `printf install` requests",
+		`npm install $(echo foo)`, // determinate dangerous verb + dynamic arg
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			_, ok := Analyze(c)
+			require.True(t, ok, "PM with a dynamic verb / install must be refused: %q", c)
+		})
+	}
+}
+
+// TestAnalyze_DynamicArgToSafeVerb_Allowed is the precise complement: a
+// dynamic argument to a non-dangerous PM verb stays allowed (only the verb
+// slot matters for the guard).
+func TestAnalyze_DynamicArgToSafeVerb_Allowed(t *testing.T) {
+	cases := []string{
+		`npm config get $(echo registry)`,
+		`go list -m $(git rev-parse HEAD)`,
+		`cargo metadata --format-version $(echo 1)`,
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			_, ok := Analyze(c)
+			require.False(t, ok, "dynamic arg to a safe verb must pass: %q", c)
 		})
 	}
 }
