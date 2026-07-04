@@ -91,6 +91,42 @@ func TestManifestRefs(t *testing.T) {
 	}
 }
 
+func TestProjectPreflight(t *testing.T) {
+	m := pnpm.New()
+
+	cases := []struct {
+		name    string
+		args    []string
+		wantOK  bool
+		wantRef bool
+	}{
+		{name: "run dev triggers preflight", args: []string{"run", "dev"}, wantOK: true, wantRef: true},
+		{name: "start triggers preflight", args: []string{"start"}, wantOK: true, wantRef: true},
+		{name: "test triggers preflight", args: []string{"test"}, wantOK: true, wantRef: true},
+		{name: "restart triggers preflight", args: []string{"restart"}, wantOK: true, wantRef: true},
+		{name: "stop triggers preflight", args: []string{"stop"}, wantOK: true, wantRef: true},
+		{name: "install is not a preflight verb", args: []string{"install"}, wantOK: false},
+		{name: "add is not a preflight verb", args: []string{"add", "lodash"}, wantOK: false},
+		{name: "dlx is not a preflight verb", args: []string{"dlx", "some-tool"}, wantOK: false},
+		{name: "flag-with-value before verb still finds run", args: []string{"--store-dir", "/tmp", "run", "dev"}, wantOK: true, wantRef: true},
+		{name: "bare run with no script name still returns refs", args: []string{"run"}, wantOK: true, wantRef: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plan, ok := m.ProjectPreflight(c.args)
+			require.Equal(t, c.wantOK, ok)
+			if c.wantRef {
+				requireKind(t, plan.ManifestRefs, packagemanager.ManifestKindPackageJSON)
+				requireKind(t, plan.ManifestRefs, packagemanager.ManifestKindPackageLockJSON)
+				requireKind(t, plan.ManifestRefs, packagemanager.ManifestKindYarnLock)
+				requireKind(t, plan.ManifestRefs, packagemanager.ManifestKindPnpmLockYAML)
+				requireKind(t, plan.ManifestRefs, packagemanager.ManifestKindNpmShrinkwrap)
+				requireKind(t, plan.ManifestRefs, packagemanager.ManifestKindBunLock)
+			}
+		})
+	}
+}
+
 func requireKind(t *testing.T, refs []packagemanager.ManifestRef, kind packagemanager.ManifestKind) {
 	t.Helper()
 	for _, r := range refs {

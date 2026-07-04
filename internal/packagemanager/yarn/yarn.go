@@ -58,6 +58,7 @@ var flagsWithValues = argv.FlagsWithValues{
 type Manager struct{}
 
 var _ packagemanager.PackageManager = (*Manager)(nil)
+var _ packagemanager.ProjectPreflighter = (*Manager)(nil)
 
 // New builds a yarn manager.
 func New() *Manager { return &Manager{} }
@@ -67,6 +68,24 @@ func (Manager) Name() string { return binaryName }
 
 // Ecosystem implements packagemanager.PackageManager.
 func (Manager) Ecosystem() intel.Ecosystem { return intel.EcosystemNPM }
+
+// ProjectPreflight implements packagemanager.ProjectPreflighter for yarn
+// commands that execute project code without installing packages. The gated
+// verbs are the lifecycle script runners: run, start, test, restart, stop.
+// These execute scripts from node_modules, so veto gates the lockfile's
+// transitive dependency tree before exec'ing the command.
+func (Manager) ProjectPreflight(args []string) (packagemanager.ProjectPreflightPlan, bool) {
+	verb, _, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
+	if !ok {
+		return packagemanager.ProjectPreflightPlan{}, false
+	}
+	switch verb {
+	case "run", "start", "test", "restart", "stop":
+		return packagemanager.ProjectPreflightPlan{ManifestRefs: jsspec.ProjectPreflightRefs()}, true
+	default:
+		return packagemanager.ProjectPreflightPlan{}, false
+	}
+}
 
 // ParseInstalls implements packagemanager.PackageManager.
 //

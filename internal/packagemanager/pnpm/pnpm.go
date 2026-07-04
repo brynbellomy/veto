@@ -47,6 +47,7 @@ var flagsWithValues = argv.FlagsWithValues{
 type Manager struct{}
 
 var _ packagemanager.PackageManager = (*Manager)(nil)
+var _ packagemanager.ProjectPreflighter = (*Manager)(nil)
 
 // New builds a pnpm manager.
 func New() *Manager { return &Manager{} }
@@ -67,4 +68,22 @@ func (Manager) ParseInstalls(args []string) []packagemanager.Install {
 // expander can read the manifest and gate its direct dependencies.
 func (Manager) ManifestRefs(args []string) []packagemanager.ManifestRef {
 	return jsspec.PackageJSONManifestRefs(args, installVerbs, alwaysReadsManifest, flagsWithValues)
+}
+
+// ProjectPreflight implements packagemanager.ProjectPreflighter for pnpm
+// commands that execute project code without installing packages. The gated
+// verbs are the lifecycle script runners: run, start, test, restart, stop.
+// These execute scripts from node_modules, so veto gates the lockfile's
+// transitive dependency tree before exec'ing the command.
+func (Manager) ProjectPreflight(args []string) (packagemanager.ProjectPreflightPlan, bool) {
+	verb, _, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
+	if !ok {
+		return packagemanager.ProjectPreflightPlan{}, false
+	}
+	switch verb {
+	case "run", "start", "test", "restart", "stop":
+		return packagemanager.ProjectPreflightPlan{ManifestRefs: jsspec.ProjectPreflightRefs()}, true
+	default:
+		return packagemanager.ProjectPreflightPlan{}, false
+	}
 }
