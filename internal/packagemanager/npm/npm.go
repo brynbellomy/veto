@@ -72,6 +72,7 @@ type Manager struct{}
 
 var _ packagemanager.PackageManager = (*Manager)(nil)
 var _ packagemanager.ResolverPreScanner = (*Manager)(nil)
+var _ packagemanager.ProjectPreflighter = (*Manager)(nil)
 
 // New builds an npm manager.
 func New() *Manager { return &Manager{} }
@@ -126,6 +127,24 @@ func parseExec(args []string) ([]packagemanager.Install, bool) {
 		return nil, true
 	}
 	return []packagemanager.Install{jsspec.Parse(specs[0])}, true
+}
+
+// ProjectPreflight implements packagemanager.ProjectPreflighter for npm
+// commands that execute project code without installing packages. The gated
+// verbs are the lifecycle script runners: run, start, test, restart, stop.
+// These execute scripts from node_modules, so veto gates the lockfile's
+// transitive dependency tree before exec'ing the command.
+func (Manager) ProjectPreflight(args []string) (packagemanager.ProjectPreflightPlan, bool) {
+	verb, _, ok := argv.FirstNonFlagWithTable(args, flagsWithValues)
+	if !ok {
+		return packagemanager.ProjectPreflightPlan{}, false
+	}
+	switch verb {
+	case "run", "start", "test", "restart", "stop":
+		return packagemanager.ProjectPreflightPlan{ManifestRefs: jsspec.ProjectPreflightRefs()}, true
+	default:
+		return packagemanager.ProjectPreflightPlan{}, false
+	}
 }
 
 // ManifestRefs implements packagemanager.PackageManager. Emits a package.json

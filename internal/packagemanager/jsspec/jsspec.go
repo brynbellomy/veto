@@ -230,6 +230,23 @@ func ParseInstallArgs(args []string, installVerbs map[string]struct{}, flagsTaki
 	return installs
 }
 
+// ProjectPreflightRefs returns ManifestRefs for the full set of files needed
+// to gate a JS-family command that executes project code (run/start/test/etc.)
+// without installing packages. The set is package.json + every JS lockfile
+// format. The expander tolerates missing files, so emitting all speculatively
+// provides full transitive coverage regardless of which PM or lockfile format
+// the project uses.
+func ProjectPreflightRefs() []packagemanager.ManifestRef {
+	return []packagemanager.ManifestRef{
+		{Path: "package.json", Kind: packagemanager.ManifestKindPackageJSON},
+		{Path: "package-lock.json", Kind: packagemanager.ManifestKindPackageLockJSON},
+		{Path: "npm-shrinkwrap.json", Kind: packagemanager.ManifestKindNpmShrinkwrap},
+		{Path: "pnpm-lock.yaml", Kind: packagemanager.ManifestKindPnpmLockYAML},
+		{Path: "yarn.lock", Kind: packagemanager.ManifestKindYarnLock},
+		{Path: "bun.lock", Kind: packagemanager.ManifestKindBunLock},
+	}
+}
+
 // PackageJSONManifestRefs returns ManifestRefs for both the package.json
 // manifest AND each lockfile we know about (package-lock.json,
 // npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock). The expander tolerates
@@ -263,18 +280,19 @@ func PackageJSONManifestRefs(
 	if _, isInstall := installVerbs[verb]; !isInstall {
 		return nil
 	}
-	lockRefs := []packagemanager.ManifestRef{
-		{Path: "package-lock.json", Kind: packagemanager.ManifestKindPackageLockJSON},
-		{Path: "npm-shrinkwrap.json", Kind: packagemanager.ManifestKindNpmShrinkwrap},
-		{Path: "pnpm-lock.yaml", Kind: packagemanager.ManifestKindPnpmLockYAML},
-		{Path: "yarn.lock", Kind: packagemanager.ManifestKindYarnLock},
-		// Phase 1.6: bun.lock (text JSONC) joins the speculative set so
-		// pure-bun projects gate their full transitive tree. bun.lockb
-		// (binary) intentionally not gated until a stable spec exists.
-		{Path: "bun.lock", Kind: packagemanager.ManifestKindBunLock},
+	// Derive lockfile refs from ProjectPreflightRefs, skipping package.json
+	// (which is added conditionally below). This keeps the lockfile list in
+	// one place.
+	allPreflightRefs := ProjectPreflightRefs()
+	lockRefs := make([]packagemanager.ManifestRef, 0, len(allPreflightRefs)-1)
+	for _, r := range allPreflightRefs {
+		if r.Kind != packagemanager.ManifestKindPackageJSON {
+			lockRefs = append(lockRefs, r)
+		}
 	}
+	pkgRef := packagemanager.ManifestRef{Path: "package.json", Kind: packagemanager.ManifestKindPackageJSON}
 	if _, always := alwaysReadsManifest[verb]; always {
-		return append([]packagemanager.ManifestRef{{Path: "package.json", Kind: packagemanager.ManifestKindPackageJSON}}, lockRefs...)
+		return append([]packagemanager.ManifestRef{pkgRef}, lockRefs...)
 	}
 	if specs := argv.CollectPositionalsWithTable(rest, flagsTakingValues); len(specs) > 0 {
 		// User named explicit specs; gate them via argv. Still re-gate
@@ -282,5 +300,5 @@ func PackageJSONManifestRefs(
 		// hide there.
 		return lockRefs
 	}
-	return append([]packagemanager.ManifestRef{{Path: "package.json", Kind: packagemanager.ManifestKindPackageJSON}}, lockRefs...)
+	return append([]packagemanager.ManifestRef{pkgRef}, lockRefs...)
 }

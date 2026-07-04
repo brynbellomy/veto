@@ -14,11 +14,15 @@ import (
 	"github.com/brynbellomy/veto/internal/gate"
 	"github.com/brynbellomy/veto/internal/intel"
 	"github.com/brynbellomy/veto/internal/packagemanager"
+	"github.com/brynbellomy/veto/internal/packagemanager/bun"
 	"github.com/brynbellomy/veto/internal/packagemanager/cargo"
 	"github.com/brynbellomy/veto/internal/packagemanager/golang"
 	"github.com/brynbellomy/veto/internal/packagemanager/jslock"
+	"github.com/brynbellomy/veto/internal/packagemanager/npm"
 	"github.com/brynbellomy/veto/internal/packagemanager/pipreport"
+	"github.com/brynbellomy/veto/internal/packagemanager/pnpm"
 	"github.com/brynbellomy/veto/internal/packagemanager/pylock"
+	"github.com/brynbellomy/veto/internal/packagemanager/yarn"
 )
 
 // TestSanitizedEnv covers the env-scrub helper that execReal applies
@@ -632,6 +636,126 @@ func TestRunResolverPreScanSurfacesPMError(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "resolver pre-scan command failed")
 	require.Contains(t, err.Error(), "ESHRINKWRAPGLOBAL")
+}
+
+func TestProjectPreflightPlanJSFamilyRunReturnsRefs(t *testing.T) {
+	// Verify that run/test verbs for each JS-family PM return a non-empty
+	// preflight plan, while install/add verbs do not (those route through
+	// ParseInstalls/ManifestRefs instead).
+	cases := []struct {
+		pm     packagemanager.PackageManager
+		name   string
+		okArgs [][]string
+		noArgs [][]string
+	}{
+		{
+			pm:   npm.New(),
+			name: "npm",
+			okArgs: [][]string{
+				{"run", "dev"},
+				{"start"},
+				{"test"},
+				{"restart"},
+				{"stop"},
+			},
+			noArgs: [][]string{
+				{"install"},
+				{"install", "lodash"},
+				{"ci"},
+			},
+		},
+		{
+			pm:   pnpm.New(),
+			name: "pnpm",
+			okArgs: [][]string{
+				{"run", "dev"},
+				{"start"},
+				{"test"},
+				{"restart"},
+				{"stop"},
+			},
+			noArgs: [][]string{
+				{"install"},
+				{"add", "lodash"},
+				{"dlx", "some-tool"},
+			},
+		},
+		{
+			pm:   yarn.New(),
+			name: "yarn",
+			okArgs: [][]string{
+				{"run", "dev"},
+				{"start"},
+				{"test"},
+				{"restart"},
+				{"stop"},
+			},
+			noArgs: [][]string{
+				{"install"},
+				{"add", "lodash"},
+			},
+		},
+		{
+			pm:   bun.New(),
+			name: "bun",
+			okArgs: [][]string{
+				{"run", "dev"},
+				{"test"},
+			},
+			noArgs: [][]string{
+				{"install"},
+				{"add", "lodash"},
+				{"x", "some-tool"},
+				{"create", "app"},
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, args := range c.okArgs {
+				plan, ok := projectPreflightPlan(c.pm, args, nil, nil)
+				require.True(t, ok, "expected preflight ok=true for %s %v", c.name, args)
+				require.NotEmpty(t, plan.ManifestRefs, "expected non-empty ManifestRefs for %s %v", c.name, args)
+			}
+			for _, args := range c.noArgs {
+				_, ok := projectPreflightPlan(c.pm, args, nil, nil)
+				require.False(t, ok, "expected preflight ok=false for %s %v", c.name, args)
+			}
+		})
+	}
+}
+
+func TestProjectPreflightPlanJSFamilySkippedWhenInstallsPresent(t *testing.T) {
+	// projectPreflightPlan returns false when installs != nil — the gate
+	// routes through the normal install path instead of the preflight path.
+	// This ensures run/start/test are not double-gated on install commands.
+	npmPM := npm.New()
+	_, ok := projectPreflightPlan(npmPM, []string{"run", "dev"}, []packagemanager.Install{{RawSpec: "lodash"}}, nil)
+	require.False(t, ok)
+}
+
+func TestProjectPreflightPlanJSFamilyFindsPackageJSON(t *testing.T) {
+	// Verify that bun run dev returns a preflight plan with a package.json ref
+	// and at least one lockfile ref. The expander tolerates missing files, so
+	// emitting the full set speculatively is safe.
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"app","version":"1.0.0"}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "bun.lock"), []byte(""), 0o644))
+
+	oldwd, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(root))
+	t.Cleanup(func() { require.NoError(t, os.Chdir(oldwd)) })
+
+	plan, ok := projectPreflightPlan(bun.New(), []string{"run", "dev"}, nil, nil)
+	require.True(t, ok)
+	var kinds []packagemanager.ManifestKind
+	for _, r := range plan.ManifestRefs {
+		kinds = append(kinds, r.Kind)
+	}
+	require.Contains(t, kinds, packagemanager.ManifestKindPackageJSON)
+	require.Contains(t, kinds, packagemanager.ManifestKindBunLock)
 }
 
 func (s fakeSource) ID() string { return "test-feed" }
