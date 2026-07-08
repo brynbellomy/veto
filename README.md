@@ -727,7 +727,14 @@ these):
 - **Toolchain upgrades wiping Layer 4 wrappers**. `brew upgrade node`
   re-installs the real npm binary on top of our symlink. `veto
   doctor` flags this; re-run `veto install-wrappers --force` after
-  upgrades.
+  upgrades. If `brew cleanup` then prunes the now-dead `.veto-original`
+  anchor (it removes dead symlinks under the prefix once an upgrade drops
+  the old keg), the wrapper is *orphaned* — `<pm>` still points at veto
+  but the real-binary pointer is gone. `install-wrappers` refuses to
+  re-wrap an orphaned path — renaming the veto symlink onto
+  `.veto-original` would only create a veto→veto exec loop — and `veto
+  doctor` FAILs it. Restore the real binary first (`brew unlink <pkg> &&
+  brew link --overwrite <pkg>`), then re-run `veto install-wrappers`.
 - **Compromised upstream returning near-empty feeds**. The 1000-report
   floor catches the worst case (literally empty), but a feed that
   omits most malware while still returning hundreds of entries could
@@ -757,8 +764,10 @@ Run `veto doctor` in a fresh terminal. It checks:
   project's Cursor veto rule, and Sirene's launch PATH where inspectable.
 - The native interposer env vars are exported and the library file
   exists.
-- Layer 4 wrappers — every recorded wrapper still points at veto
-  and its `.veto-original` sibling is intact.
+- Layer 4 wrappers — every recorded wrapper still points at veto,
+  its `.veto-original` sibling is intact, and that sibling resolves to a
+  real binary rather than back to veto (a self-referential anchor is a
+  veto→veto exec loop and FAILs).
 - The intel store is above the 1000-report sanity floor and was
   refreshed in the last 24 hours.
 

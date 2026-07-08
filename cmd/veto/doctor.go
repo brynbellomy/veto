@@ -927,6 +927,29 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 				continue
 			}
 		}
+		// Self-referential anchor guard. os.Stat below FOLLOWS the symlink,
+		// so a `.veto-original` that itself points at the veto binary would
+		// resolve to the still-present veto file and PASS — masking a
+		// veto→veto exec loop (the real binary is gone). This is exactly the
+		// state the 2026-07-08 brew-cleanup incident left behind, and the
+		// reason doctor reported "0 failures" while the toolchain was broken.
+		// Classify the anchor explicitly: a healthy anchor is a real binary
+		// (ClassReal) or a Cellar/mise layout symlink (ClassPMLayoutSymlink),
+		// never ours by identity. If it resolves to veto, FAIL loudly.
+		if vetoID != nil {
+			if aclass, _, aerr := pmsurvey.ClassifySymlink(w.OriginalPath, vetoID); aerr == nil {
+				switch aclass {
+				case pmsurvey.ClassOursByPath, pmsurvey.ClassOursByHash:
+					out = append(out, checkResult{
+						status:   statusFail,
+						label:    "wrapper:" + w.PM,
+						detail:   fmt.Sprintf("%s points at the veto binary itself — self-referential anchor, real binary lost (veto→veto exec loop)", w.OriginalPath),
+						howToFix: "Restore the real binary at " + w.OriginalPath + " (reinstall the toolchain, or recreate the symlink to point at the real binary), then re-run `veto install-wrappers`.",
+					})
+					continue
+				}
+			}
+		}
 		if _, err := os.Stat(w.OriginalPath); err != nil {
 			out = append(out, checkResult{
 				status:   statusFail,

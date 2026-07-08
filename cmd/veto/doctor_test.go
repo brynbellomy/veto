@@ -671,6 +671,55 @@ func TestSIPPathIsNotApplicableInWrapperSurvey(t *testing.T) {
 	require.False(t, isSIPProtectedPath(pmPath))
 }
 
+// TestCheckWrappers_SelfReferentialAnchorFails is the doctor half of the
+// 2026-07-08 incident regression: after the anchor was clobbered, doctor
+// reported "0 failures" because it only checked that `.veto-original`
+// EXISTS (os.Stat follows the symlink to the still-present veto binary),
+// not that it resolves to a real, non-veto binary. A `.veto-original`
+// that itself points at veto is a veto→veto exec loop; doctor must FAIL
+// it loudly instead of passing it.
+func TestCheckWrappers_SelfReferentialAnchorFails(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("#!/bin/sh\n# veto\n"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	bin := filepath.Join(tmp, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	// The corrupted on-disk shape: go → veto AND go.veto-original → veto.
+	goBin := filepath.Join(bin, "go")
+	require.NoError(t, os.Symlink(vetoBin, goBin))
+	require.NoError(t, os.Symlink(vetoBin, goBin+wrapperSuffix))
+
+	cfg := config{CacheDir: cacheDir}
+	require.NoError(t, saveWrapperState(cfg, wrapperState{Wrappers: []wrapperEntry{{
+		Path:         goBin,
+		OriginalPath: goBin + wrapperSuffix,
+		PM:           "go",
+		Source:       "homebrew",
+	}}}))
+
+	t.Setenv("HOME", tmp)
+	t.Setenv("PATH", bin)
+
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	var found *checkResult
+	for i := range results {
+		if results[i].label == "wrapper:go" && results[i].status == statusFail &&
+			strings.Contains(results[i].detail, "self-referential") {
+			found = &results[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "expected a FAIL for the self-referential go anchor; got %+v", results)
+	require.Contains(t, found.howToFix, "install-wrappers")
+}
+
 // TestCheckStaleShimSiblings_FlagsPlanted plants the on-disk shape behind
 // the veto-dzk bead (self-referential `*.veto-original` symlinks in
 // ~/.local/bin) and asserts doctor returns one FAIL row per stale entry,

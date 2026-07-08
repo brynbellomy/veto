@@ -799,6 +799,24 @@ func isWrappableTarget(p, vetoPath string) bool {
 	return info.Mode()&0o111 != 0
 }
 
+// orphanedWrapErr builds the error applyWrapper returns when a wrap
+// candidate already resolves to the veto binary but its `.veto-original`
+// real-binary anchor is gone. veto cannot reconstruct where the real
+// binary lived — that pointer existed only in the now-missing sibling —
+// so wrapping would rename the veto symlink onto `.veto-original` and
+// create a veto→veto exec loop with nothing to delegate to. The only
+// safe move is to refuse and tell the user how to restore the real
+// binary. Root cause of the 2026-07-08 incident: `brew cleanup` pruned
+// the dead anchor after an upgrade removed the old keg, then an
+// `install-wrappers --force` re-wrap ran on the orphaned symlink.
+func orphanedWrapErr(path string) error {
+	anchor := path + wrapperSuffix
+	return errors.WithNew("orphaned wrapper: path already points at the veto binary but its .veto-original real-binary anchor is missing; refusing to wrap (would create a veto→veto exec loop)").
+		Set("path", path,
+			"missing_anchor", anchor,
+			"fix", "restore the real binary (reinstall the toolchain, e.g. `brew unlink <pkg> && brew link --overwrite <pkg>`, or recreate "+anchor+" pointing at it), then re-run `veto install-wrappers`")
+}
+
 // applyWrapper does the rename + symlink dance for one candidate.
 // Idempotent against already-installed wrappers (returns
 // wrapperActionSkipAlreadyOurs); refuses to clobber an existing
@@ -854,11 +872,18 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 		// `.veto-original` sibling exists, this is the canonical
 		// "already-ours" state — early-return as a skip so the wrap-loop
 		// below does not race to rename a symlink onto an existing
-		// sibling. If the sibling is missing, fall through to the
-		// regular wrap path which handles the broken-state case.
+		// sibling.
 		if _, err := os.Lstat(c.path + wrapperSuffix); err == nil {
 			return wrapperActionSkipAlreadyOurs, nil
 		}
+		// Sibling missing while c.path already resolves to veto: the
+		// real-binary anchor is gone (e.g. `brew cleanup` pruned the
+		// dead `.veto-original` after an upgrade removed the old keg).
+		// The prior code fell through to the regular wrap path, which
+		// renamed this veto symlink onto `.veto-original` — manufacturing
+		// a self-referential anchor and a veto→veto exec loop with the
+		// real binary permanently lost. Refuse instead.
+		return wrapperActionWrapped, orphanedWrapErr(c.path)
 	}
 
 	original := c.path + wrapperSuffix
@@ -935,6 +960,20 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 	if _, err := os.Lstat(original); err == nil && !force {
 		return wrapperActionWrapped, errors.WithNew(".veto-original already exists; pass --force to overwrite").
 			Set("path", original)
+	}
+
+	// Belt-and-suspenders against the self-referential-anchor footgun (see
+	// orphanedWrapErr and the ClassOurs* branch above). If we reach the
+	// rename with c.path STILL resolving to the veto binary, the re-classify
+	// pass didn't run (nil vetoID) or was degraded. Renaming a veto symlink
+	// onto `.veto-original` would create a veto→veto exec loop with no real
+	// binary to delegate to. This guard is the last line of defense directly
+	// in front of the destructive rename: it sits AFTER the `.veto-original`
+	// existence checks (a populated anchor is handled by the safe-relink
+	// guard) and BEFORE dry-run reporting, so a dry run also surfaces the
+	// orphan instead of falsely reporting "would wrap".
+	if pointsAtVeto(c.path, vetoPath) {
+		return wrapperActionWrapped, orphanedWrapErr(c.path)
 	}
 
 	if dryRun {

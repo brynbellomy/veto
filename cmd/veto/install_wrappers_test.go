@@ -226,6 +226,70 @@ func TestApplyWrapper_NoForceOnForeignVeto_SkipsAndDoesNotMutate(t *testing.T) {
 	require.Equal(t, realContent, body)
 }
 
+// TestApplyWrapper_OrphanedVetoSymlink_RefusesToSelfReference is the
+// regression guard for the 2026-07-08 brew-upgrade incident: a `brew
+// upgrade` of a wrapped formula (go, python@3.13) followed by `brew
+// cleanup` deletes the old keg AND prunes the now-dead `.veto-original`
+// symlink, leaving `<path> → veto` with NO real-binary anchor. The next
+// `install-wrappers --force` used to rename that veto symlink onto
+// `<path>.veto-original`, so BOTH `<path>` and `<path>.veto-original`
+// pointed at veto — a veto→veto exec loop with the real binary lost.
+// applyWrapper must instead refuse loudly and never manufacture a
+// self-referential anchor. Covers the classified path (vetoID provided,
+// re-classify sees ClassOurs*).
+func TestApplyWrapper_OrphanedVetoSymlink_RefusesToSelfReference(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n# veto\n"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// go already wrapped, but the `.veto-original` anchor is GONE.
+	goBin := filepath.Join(dir, "go")
+	require.NoError(t, os.Symlink(veto, goBin))
+
+	c := wrapCandidate{path: goBin, pm: "go", source: "homebrew"}
+
+	// Without --force: refuse.
+	_, err = applyWrapper(c, veto, vetoID, false, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "orphaned")
+	// No self-referential anchor was manufactured.
+	_, lerr := os.Lstat(goBin + wrapperSuffix)
+	require.Error(t, lerr, "must not create a .veto-original anchor when refusing")
+
+	// With --force: still refuse. --force must not corrupt either.
+	_, err = applyWrapper(c, veto, vetoID, false, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "orphaned")
+	_, lerr = os.Lstat(goBin + wrapperSuffix)
+	require.Error(t, lerr, "--force must not create a self-referential anchor")
+}
+
+// TestApplyWrapper_OrphanedVetoSymlink_GuardsRenameWithoutIdentity pins the
+// belt-and-suspenders guard sitting directly in front of the destructive
+// rename: even when no VetoIdentity is available to re-classify (nil
+// vetoID, e.g. older callers), applyWrapper must not rename a path that
+// physically resolves to veto onto its `.veto-original` sibling.
+func TestApplyWrapper_OrphanedVetoSymlink_GuardsRenameWithoutIdentity(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n# veto\n"), 0o755))
+
+	goBin := filepath.Join(dir, "go")
+	require.NoError(t, os.Symlink(veto, goBin))
+
+	// nil vetoID skips the re-classify pass; c.class defaults to ClassReal
+	// so the class switch does not early-return. The pre-rename guard is
+	// the only thing standing between this and a self-referential anchor.
+	c := wrapCandidate{path: goBin, pm: "go", source: "homebrew", class: pmsurvey.ClassReal}
+	_, err := applyWrapper(c, veto, nil, false, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "orphaned")
+	_, lerr := os.Lstat(goBin + wrapperSuffix)
+	require.Error(t, lerr, "guard must prevent renaming a veto symlink onto its anchor")
+}
+
 // TestApplyWrapper_ForceRelinksAlreadyOurs_DryRun: --force --dry-run on
 // an already-ours path should report a would-wrap, not silently succeed
 // and not actually touch the filesystem.
