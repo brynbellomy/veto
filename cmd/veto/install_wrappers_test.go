@@ -290,6 +290,54 @@ func TestApplyWrapper_OrphanedVetoSymlink_GuardsRenameWithoutIdentity(t *testing
 	require.Error(t, lerr, "guard must prevent renaming a veto symlink onto its anchor")
 }
 
+// TestDiscoverWrapCandidates_ExcludesAliasToWrappedSibling pins the fix for
+// the nested self-referential-anchor class (2026-07-08): when an alias is a
+// symlink to a SAME-DIR sibling that is itself a wrap target (pyenv
+// `python -> python3.10`, `bunx -> bun`), veto must NOT wrap the alias
+// independently. Wrapping it makes its `.veto-original` point at the
+// already-wrapped sibling, which resolves back to veto — a self-referential
+// anchor that mis-resolves (wrong interpreter) or loops at runtime. The
+// alias inherits the wrap for free via `alias -> target -> veto`, so it must
+// stay a plain symlink. This generalizes veto's uv-store-only guard in
+// pmsurvey.PathsFor to every dir. Aliases whose target is NOT a wrap target
+// (e.g. `pip -> pip3.10`) must still be wrapped normally.
+func TestDiscoverWrapCandidates_ExcludesAliasToWrappedSibling(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n# veto\n"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// python3.10 (real, a versioned-python wrap target) + python/python3
+	// aliases symlinked to it in the same dir.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "python3.10"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.Symlink("python3.10", filepath.Join(dir, "python")))
+	require.NoError(t, os.Symlink("python3.10", filepath.Join(dir, "python3")))
+	// bun (real, a wrapped manager) + bunx alias symlinked to it.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bun"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.Symlink("bun", filepath.Join(dir, "bunx")))
+	// pip -> pip3.10, where pip3.10 is NOT a wrap target: pip must stay a
+	// candidate (its anchor would point at a real binary, not a wrapper).
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "pip3.10"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.Symlink("pip3.10", filepath.Join(dir, "pip")))
+
+	opts := wrapperFlags{dirs: []string{dir}, only: map[string]struct{}{}}
+	cands, err := discoverWrapCandidatesWith(opts, vetoID)
+	require.NoError(t, err)
+
+	got := map[string]bool{}
+	for _, c := range cands {
+		if filepath.Dir(c.path) == dir {
+			got[filepath.Base(c.path)] = true
+		}
+	}
+	require.False(t, got["python"], "python (alias -> wrapped sibling python3.10) must be excluded")
+	require.False(t, got["python3"], "python3 (alias -> wrapped sibling python3.10) must be excluded")
+	require.False(t, got["bunx"], "bunx (alias -> wrapped sibling bun) must be excluded")
+	require.True(t, got["bun"], "bun (real wrap target) must remain a candidate")
+	require.True(t, got["pip"], "pip (alias -> pip3.10, NOT a wrap target) must remain a candidate")
+}
+
 // TestApplyWrapper_ForceRelinksAlreadyOurs_DryRun: --force --dry-run on
 // an already-ours path should report a would-wrap, not silently succeed
 // and not actually touch the filesystem.
@@ -867,6 +915,63 @@ func TestFindRealBinary_RejectsSelfReferentialSiblingInPathWalk(t *testing.T) {
 	require.Error(t, err,
 		"PATH-walk must refuse self-referential sibling — exec'ing it would loop veto into itself")
 	require.Contains(t, err.Error(), "not found in PATH")
+}
+
+// TestFindWrappedOriginalViaChain_FollowsPlainAliasToRegisteredWrapper pins
+// the directly-invoked-alias fix (2026-07-08). When veto is invoked via a
+// plain alias symlink whose target is a registered wrapper sibling (pyenv
+// `python -> python3.10 -> veto`, `bunx -> bun`), argv[0]'s own
+// `.veto-original` anchor does not exist — so findWrappedOriginal bails and
+// the PATH walk historically found the WRONG interpreter (python3 → 3.14.6)
+// or looped into a shim. The chain follower walks argv[0]'s symlinks to the
+// first registered wrapper with a valid anchor and returns THAT real binary.
+func TestFindWrappedOriginalViaChain_FollowsPlainAliasToRegisteredWrapper(t *testing.T) {
+	dir := t.TempDir()
+	self, err := os.Executable() // stands in for veto, same trick as the sibling tests
+	require.NoError(t, err)
+
+	real := filepath.Join(dir, "python3.10.real")
+	require.NoError(t, os.WriteFile(real, []byte("#!/bin/sh\necho real\n"), 0o755))
+	py310 := filepath.Join(dir, "python3.10")
+	require.NoError(t, os.Symlink(self, py310))                             // python3.10 -> veto
+	require.NoError(t, os.Symlink("python3.10.real", py310+wrapperSuffix))  // anchor -> real
+	py := filepath.Join(dir, "python")
+	require.NoError(t, os.Symlink("python3.10", py)) // python -> python3.10 (plain alias, unregistered)
+
+	// Only the target is registered; the alias is a plain symlink.
+	registered := func(p string) bool { return p == py310 }
+
+	got, ok := findWrappedOriginalViaChain(py, registered)
+	require.True(t, ok, "must follow the plain alias to the registered wrapper's anchor")
+	require.Equal(t, py310+wrapperSuffix, got)
+}
+
+// TestFindWrappedOriginalViaChain_UnregisteredTargetBails: if the alias's
+// target chain never reaches a registered wrapper, the follower must bail
+// (false) so the caller falls through to the PATH walk — provenance is
+// preserved, no unregistered anchor is honored.
+func TestFindWrappedOriginalViaChain_UnregisteredTargetBails(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "python3.10")
+	require.NoError(t, os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755))
+	py := filepath.Join(dir, "python")
+	require.NoError(t, os.Symlink("python3.10", py))
+
+	_, ok := findWrappedOriginalViaChain(py, func(string) bool { return false })
+	require.False(t, ok, "no registered wrapper in the chain → must bail to PATH walk")
+}
+
+// TestFindWrappedOriginalViaChain_CycleBails guards termination: a symlink
+// cycle in argv[0]'s chain must return false, not loop forever.
+func TestFindWrappedOriginalViaChain_CycleBails(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	require.NoError(t, os.Symlink("b", a)) // a -> b
+	require.NoError(t, os.Symlink("a", b)) // b -> a  (cycle)
+
+	_, ok := findWrappedOriginalViaChain(a, func(string) bool { return true })
+	require.False(t, ok, "cyclic symlink chain must bail, not loop")
 }
 
 // TestWrapperRegisteredFunc_MissingStateFailsClosed: when wrappers.json

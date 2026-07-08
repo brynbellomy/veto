@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -585,6 +586,52 @@ type wrapCandidate struct {
 	target string                  // resolved symlink target when class != ClassReal; "" otherwise
 }
 
+// isWrapTargetName reports whether basename is a package-manager binary
+// veto wraps directly — either a static wrapped-manager name or a
+// versioned python (python3.X). Used by aliasInheritsSiblingWrap to
+// decide whether an alias symlink's target is itself a wrap target.
+func isWrapTargetName(basename string) bool {
+	return slices.Contains(wrappedManagers, basename) || pmlist.IsVersionedPython(basename)
+}
+
+// aliasInheritsSiblingWrap reports whether candidatePath is an alias that
+// must NOT be wrapped independently because it is a symlink to a SAME-DIR
+// sibling that is itself a wrap target (e.g. pyenv `python -> python3.10`,
+// `bunx -> bun`). Wrapping such an alias moves the alias symlink aside as
+// its `.veto-original` anchor, which then points at the already-wrapped
+// sibling and resolves back to veto — a self-referential anchor that
+// mis-resolves (wrong interpreter) or loops at runtime. The alias inherits
+// the wrap for free via the chain `alias -> target -> veto`, so leaving it
+// a plain symlink is both correct and cheaper.
+//
+// This generalizes the uv-canonical-store guard in pmsurvey.PathsFor —
+// which only excludes python/python3 aliases inside the uv cpython store —
+// to every discovery dir. That narrow gating was the root cause of the
+// pyenv/bun nested-anchor corruption surfaced 2026-07-08.
+//
+// Only SAME-directory aliases are excluded. A symlink whose target lives
+// in a different dir (e.g. /opt/homebrew/bin/python3 -> ../Cellar/.../
+// python3.14) is a distinct layout: the target is not independently
+// wrapped at that path, so the alias remains a legitimate wrap candidate.
+func aliasInheritsSiblingWrap(candidatePath string) bool {
+	fi, err := os.Lstat(candidatePath)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	target, err := os.Readlink(candidatePath)
+	if err != nil {
+		return false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(candidatePath), target)
+	}
+	target = filepath.Clean(target)
+	if filepath.Dir(target) != filepath.Dir(filepath.Clean(candidatePath)) {
+		return false
+	}
+	return isWrapTargetName(filepath.Base(target))
+}
+
 // discoverWrapCandidates walks the well-known install-dir patterns
 // AND $PATH looking for files whose basename matches one of
 // wrappedManagers. Thin shim over discoverWrapCandidatesWith; tests use
@@ -639,6 +686,12 @@ func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([
 			return
 		}
 		if inShimDir(c.path) {
+			return
+		}
+		// Never wrap an alias that inherits a same-dir sibling's wrap
+		// (e.g. `python -> python3.10`, `bunx -> bun`). Wrapping it would
+		// manufacture a self-referential `.veto-original` anchor.
+		if aliasInheritsSiblingWrap(c.path) {
 			return
 		}
 		seen[c.path] = struct{}{}

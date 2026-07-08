@@ -1286,14 +1286,83 @@ func isSelfReferential(path string) bool {
 	return resolved == selfReal
 }
 
+// findWrappedOriginalViaChain resolves the alias-invocation case:
+// argv[0] is a plain symlink whose target chain leads to a registered
+// veto wrapper sibling (pyenv `python -> python3.10 -> veto`,
+// `bunx -> bun`). findWrappedOriginal only inspects
+// `<argv0>.veto-original`, which does not exist for a plain alias — so
+// without this the resolver falls through to the PATH walk and finds the
+// WRONG binary (python3 → the homebrew 3.14 interpreter) or loops into a
+// shim. That was the runtime symptom of the 2026-07-08 nested-wrap class.
+//
+// We walk argv[0]'s symlink chain one hop at a time. The FIRST hop that
+// is a registered wrapper site with a valid, non-self-referential
+// `.veto-original` wins — that anchor is the real binary to exec.
+// Provenance is preserved exactly as in findWrappedOriginal: only
+// wrapper sites recorded in wrappers.json are honored, so a plain alias
+// pointing at an attacker-planted sibling is not trusted. Bounded by a
+// visited-set so a cyclic symlink chain returns ("", false) rather than
+// looping.
+//
+// This complements the discovery-side fix (aliasInheritsSiblingWrap in
+// install_wrappers.go), which keeps such aliases as plain symlinks
+// instead of wrapping them: the alias stays native on disk and resolves
+// through its target's wrap here at runtime.
+func findWrappedOriginalViaChain(argv0 string, registered func(string) bool) (string, bool) {
+	if argv0 == "" || !strings.ContainsRune(argv0, '/') {
+		return "", false
+	}
+	cur, err := filepath.Abs(argv0)
+	if err != nil {
+		return "", false
+	}
+	visited := map[string]struct{}{}
+	for {
+		cur = filepath.Clean(cur)
+		if _, seen := visited[cur]; seen {
+			return "", false // cyclic chain
+		}
+		visited[cur] = struct{}{}
+
+		// Is this hop itself a registered wrapper with a usable anchor?
+		if registered != nil && registered(cur) {
+			original := cur + wrapperSuffix
+			if isExecutableRegularOrSymlink(original) && !isSelfReferential(original) {
+				return original, true
+			}
+		}
+		// Otherwise follow one symlink hop toward the next sibling.
+		fi, err := os.Lstat(cur)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			return "", false // chain ended without a registered wrapper
+		}
+		target, err := os.Readlink(cur)
+		if err != nil {
+			return "", false
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(cur), target)
+		}
+		cur = target
+	}
+}
+
 // findRealBinary returns the path veto should exec to satisfy a
 // gated install. Prefers a wrapped-original sibling (Layer 4), then
-// falls back to a PATH walk that skips any veto-pointing entries.
+// the alias chain-follower (for plain aliases into a wrapped sibling),
+// then falls back to a PATH walk that skips any veto-pointing entries.
 //
 // `registered` is a wrappers.json membership predicate; see
 // findWrappedOriginal for the provenance rationale.
 func findRealBinary(name string, registered func(string) bool) (string, error) {
 	if wrapped, ok := findWrappedOriginal(os.Args[0], registered); ok {
+		return wrapped, nil
+	}
+	// Alias case: argv[0] is a plain symlink into a registered wrapper
+	// sibling (pyenv `python -> python3.10`, `bunx -> bun`). Follow the
+	// chain before falling back to the PATH walk, which would otherwise
+	// resolve to the wrong interpreter.
+	if wrapped, ok := findWrappedOriginalViaChain(os.Args[0], registered); ok {
 		return wrapped, nil
 	}
 	self, err := os.Executable()
