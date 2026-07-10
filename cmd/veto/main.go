@@ -1250,18 +1250,58 @@ func findWrappedOriginal(argv0 string, registered func(string) bool) (string, bo
 	if err != nil {
 		return "", false
 	}
-	if registered == nil || !registered(abs) {
-		return "", false
+	// Walk the symlink chain starting at abs. At each step, the
+	// current path is a candidate wrap site: if it is registered in
+	// wrappers.json AND has a `.veto-original` sibling that is an
+	// executable non-directory and not self-referential, return it.
+	//
+	// Without the chain walk, a venv that symlinks
+	// `.venv/bin/python` → `.venv/bin/python3` → `.venv/bin/python3.12`
+	// → <uv canonical cpython bin>/python3.12 (a registered Layer 4
+	// wrap site) cannot resolve: findWrappedOriginal checked only the
+	// venv path, which is not registered, and fell through to the
+	// PATH walk which found only Layer 2 shims (veto itself, skipped).
+	// The result was "cannot find real python: not found in PATH"
+	// whenever uv inspected a venv whose bin/python chains through a
+	// wrapped canonical cpython — the normal uv-managed venv shape.
+	// Chain walking discovers the registered wrap site at the far end.
+	//
+	// Provenance holds at every step: only `.veto-original` siblings
+	// at REGISTERED paths are trusted, so an attacker planting a
+	// sibling at an unregistered path cannot hijack resolution — the
+	// walk passes through unregistered paths without honoring any
+	// sibling they happen to carry. The self-reference guard at the
+	// final candidate closes the same loop findWrappedOriginal always
+	// defended against.
+	const maxChainSteps = 40 // bound against pathological / malicious cycles
+	current := abs
+	for i := 0; i < maxChainSteps; i++ {
+		if registered != nil && registered(current) {
+			original := current + ".veto-original"
+			if info, err := os.Stat(original); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+				if !isSelfReferential(original) {
+					return original, true
+				}
+			}
+		}
+		linkTarget, err := os.Readlink(current)
+		if err != nil {
+			// Not a symlink (or unreadable) — chain ends here.
+			return "", false
+		}
+		// Resolve the link target relative to the current path's
+		// directory, then absolutize for the next iteration's
+		// registered/sibling checks. Absolute link targets pass
+		// through filepath.Join unchanged; relative targets (the
+		// venv's `python3 -> python` alias) resolve against the
+		// current path's dir so the next loop's registered() check
+		// sees the full absolute path.
+		if !filepath.IsAbs(linkTarget) {
+			linkTarget = filepath.Join(filepath.Dir(current), linkTarget)
+		}
+		current = filepath.Clean(linkTarget)
 	}
-	original := abs + ".veto-original"
-	info, err := os.Stat(original)
-	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
-		return "", false
-	}
-	if isSelfReferential(original) {
-		return "", false
-	}
-	return original, true
+	return "", false
 }
 
 // isSelfReferential reports whether the given path resolves through

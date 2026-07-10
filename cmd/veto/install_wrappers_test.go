@@ -595,6 +595,125 @@ func TestUnwrap_BailsIfSymlinkRetargeted(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestFindWrappedOriginal_FollowsSymlinkChain resolves the
+// uv-venv-python-shim bug (bead veto-veto-uv-run-venv-python-shim-0w8).
+//
+// When uv creates a venv, .venv/bin/python is a symlink chain that
+// ends at the canonical uv-managed cpython binary
+// (~/.local/share/uv/python/cpython-3.X.Y-.../bin/python3.X). That
+// canonical binary is a Layer 4 wrap site registered in wrappers.json,
+// with a .veto-original sibling preserving the real interpreter. uv
+// inspects the venv's bin/python as an interpreter probe; veto's main()
+// dispatches as a python shim and resolves to the real binary via
+// findWrappedOriginal.
+//
+// Before the chain-walk fix, findWrappedOriginal checked only the
+// starting argv[0] path. The venv bin/python path is NOT registered,
+// so the check failed and the resolver fell through to the PATH walk,
+// which found only Layer 2 shims (veto itself, skipped). The user
+// saw "cannot find real python: not found in PATH" and uv refused to
+// use the venv.
+//
+// The fix walks the symlink chain: at each step, if the current path
+// is registered AND has an executable .veto-original sibling, return
+// it. Provenance holds at every step (unregistered siblings ignored).
+//
+// Test shape mirrors the real on-disk layout:
+//
+//	venv/bin/python   -> python3            (intra-dir alias)
+//	venv/bin/python3  -> python3.12         (intra-dir alias)
+//	venv/bin/python3.12 -> <uvcpython>/bin/python3.12   (absolute)
+//	<uvcpython>/bin/python3.12 is a regular file at a registered path
+//	<uvcpython>/bin/python3.12.veto-original holds the real interpreter
+func TestFindWrappedOriginal_FollowsSymlinkChain(t *testing.T) {
+	root := t.TempDir()
+
+	// Stand-in for the canonical uv cpython bin dir.
+	uvBin := filepath.Join(root, "uv", "cpython-3.12.11", "bin")
+	require.NoError(t, os.MkdirAll(uvBin, 0o755))
+	realPython := filepath.Join(uvBin, "python3.12")
+	require.NoError(t, os.WriteFile(realPython, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	// The Layer 4 wrap state: python3.12 is now a symlink to veto and
+	// the real bytes live at python3.12.veto-original. Use the test
+	// binary as a stand-in for veto (same trick as the self-reference
+	// tests above) so the chain ends at an executable sibling.
+	self, err := os.Executable()
+	require.NoError(t, err)
+	require.NoError(t, os.Rename(realPython, realPython+".veto-original"))
+	require.NoError(t, os.Symlink(self, realPython))
+
+	// The venv shape: bin/python -> python3 -> python3.12 -> <abs>/python3.12.
+	venvBin := filepath.Join(root, "venv", "bin")
+	require.NoError(t, os.MkdirAll(venvBin, 0o755))
+	require.NoError(t, os.Symlink("python3", filepath.Join(venvBin, "python")))
+	require.NoError(t, os.Symlink("python3.12", filepath.Join(venvBin, "python3")))
+	require.NoError(t, os.Symlink(realPython, filepath.Join(venvBin, "python3.12")))
+
+	// Registered set: ONLY the canonical uv cpython path. The venv
+	// paths are not registered (they are not wrap sites).
+	registered := func(p string) bool { return p == realPython }
+
+	got, ok := findWrappedOriginal(filepath.Join(venvBin, "python"), registered)
+	require.True(t, ok, "chain walk must find the registered .veto-original at the canonical uv cpython path")
+	require.Equal(t, realPython+".veto-original", got)
+}
+
+// TestFindWrappedOriginal_ChainUnregisteredSiblingNotHonored guards
+// the provenance property through the chain walk: an unregistered
+// intermediate path carrying a .veto-original sibling must NOT be
+// honored. Otherwise an attacker could plant a sibling anywhere along
+// a symlink chain and hijack resolution.
+//
+// Shape:
+//
+//	start -> mid (unregistered, has planted sibling) -> veto
+//
+// The walk passes through `mid` (no registered sibling honored) and
+// terminates at `veto` with no legitimate sibling found.
+func TestFindWrappedOriginal_ChainUnregisteredSiblingNotHonored(t *testing.T) {
+	root := t.TempDir()
+
+	// mid: unregistered path with a planted attacker sibling.
+	mid := filepath.Join(root, "mid")
+	require.NoError(t, os.WriteFile(mid, []byte("real or impostor"), 0o755))
+	require.NoError(t, os.WriteFile(mid+".veto-original", []byte("#!/bin/sh\necho pwned\n"), 0o755))
+
+	// start symlinks to mid.
+	start := filepath.Join(root, "start")
+	require.NoError(t, os.Symlink(mid, start))
+
+	// Registered predicate returns false for everything.
+	notRegistered := func(string) bool { return false }
+	got, ok := findWrappedOriginal(start, notRegistered)
+	require.False(t, ok, "unregistered sibling anywhere in the chain must NOT be honored")
+	require.Empty(t, got)
+}
+
+// TestFindWrappedOriginal_ChainSelfReferentialRejected ensures the
+// self-reference guard fires when a registered path in the chain has a
+// .veto-original sibling that resolves back to veto itself. Without
+// the guard, exec'ing the sibling would loop veto into itself.
+func TestFindWrappedOriginal_ChainSelfReferentialRejected(t *testing.T) {
+	root := t.TempDir()
+	self, err := os.Executable()
+	require.NoError(t, err)
+
+	// A registered path whose .veto-original sibling chains back to veto.
+	registered := filepath.Join(root, "python3.12")
+	require.NoError(t, os.WriteFile(registered, []byte(""), 0o755))
+	require.NoError(t, os.Symlink(self, registered+".veto-original"))
+
+	// start -> registered (self-referential sibling).
+	start := filepath.Join(root, "start")
+	require.NoError(t, os.Symlink(registered, start))
+
+	pred := func(p string) bool { return p == registered }
+	got, ok := findWrappedOriginal(start, pred)
+	require.False(t, ok, "self-referential sibling in the chain must be rejected")
+	require.Empty(t, got)
+}
+
 // TestFindWrappedOriginal exercises the resolver used by execReal. When
 // veto is invoked through a wrapper symlink, argv[0] is the wrapper
 // path; we want to find the sibling `.veto-original` — but ONLY if the
