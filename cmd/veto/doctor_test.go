@@ -560,8 +560,8 @@ func TestPrintResults_NAMarkerRendered(t *testing.T) {
 
 func TestIsSIPProtectedPath(t *testing.T) {
 	cases := []struct {
-		path     string
-		wantSIP  bool
+		path    string
+		wantSIP bool
 	}{
 		// Canonical SIP roots — binaries inside them are SIP-protected.
 		{"/usr/bin/pip3", true},
@@ -802,4 +802,221 @@ func TestCheckStaleShimSiblings_AfterScrubPasses(t *testing.T) {
 	// Doctor reports clean AFTER scrub.
 	post := checkStaleShimSiblings(shimDir)
 	require.Empty(t, post)
+}
+
+// TestCheckWrappers_DiscoveredOrphanedWrapperFails is the regression
+// guard for the fabricated-anchor bug (2026-07-24 incident, live
+// /usr/local/bin/npm case): the Phase-2 host survey PASSed any
+// discovered veto-pointing symlink with a detail string "original at
+// <path>.veto-original" WITHOUT ever stat-ing that anchor. An orphaned
+// wrapper — veto symlink on disk, anchor pruned, path not in
+// wrappers.json — surveyed all-green while the real binary was
+// unreachable. Doctor must FAIL it, matching install-wrappers'
+// orphaned-wrapper refusal.
+func TestCheckWrappers_DiscoveredOrphanedWrapperFails(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	// The live shape: npm -> veto, NO .veto-original anchor, and no
+	// wrappers.json entry covering it.
+	bin := filepath.Join(tmp, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	npm := filepath.Join(bin, "npm")
+	require.NoError(t, os.Symlink(vetoBin, npm))
+	t.Setenv("PATH", bin)
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	r := findResult(t, results, "wrapper:npm", "orphaned wrapper")
+	require.Equal(t, statusFail, r.status, "discovered veto symlink with no anchor must FAIL, not PASS")
+	require.Contains(t, r.detail, npm)
+	require.Contains(t, r.detail, "real binary unreachable")
+	require.Contains(t, r.howToFix, "install-wrappers")
+
+	// And no fabricated PASS row for the same path.
+	for _, res := range results {
+		if res.label == "wrapper:npm" && res.status == statusPass {
+			t.Fatalf("fabricated PASS for orphaned wrapper: %+v", res)
+		}
+	}
+}
+
+// TestCheckWrappers_DiscoveredSelfReferentialAnchorFails is the Phase-2
+// (discovered, non-state) mirror of
+// TestCheckWrappers_SelfReferentialAnchorFails: an anchor that itself
+// resolves to veto means the real binary is lost and exec'ing through
+// the wrapper loops veto into itself. The survey used to PASS it
+// because it never classified the anchor.
+func TestCheckWrappers_DiscoveredSelfReferentialAnchorFails(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	bin := filepath.Join(tmp, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	npm := filepath.Join(bin, "npm")
+	require.NoError(t, os.Symlink(vetoBin, npm))
+	require.NoError(t, os.Symlink(vetoBin, npm+wrapperSuffix))
+	t.Setenv("PATH", bin)
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	r := findResult(t, results, "wrapper:npm", "orphaned wrapper")
+	require.Equal(t, statusFail, r.status, "self-referential discovered anchor must FAIL, not PASS")
+}
+
+// TestCheckWrappers_SurveySkipsShimDirPaths enforces territory parity:
+// the Layer-4 host survey must not report on paths inside the Layer-2
+// shim dir at all. Before the fix it emitted BOTH lies for shim-dir
+// entries: a PASS with a fabricated "original at ...veto-original"
+// detail for a healthy shim (which has no such anchor), and a WARN
+// advising `veto install-wrappers` for a displaced shim — advice
+// install-wrappers refuses to follow (territory guard). The dedicated
+// shim:<pm> checks own that directory.
+func TestCheckWrappers_SurveySkipsShimDirPaths(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	// A healthy Layer-2 shim (uv -> veto, no anchor — shims never have
+	// one) inside the default shim dir, which is on PATH.
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(vetoBin, uv))
+	t.Setenv("PATH", shimDir)
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	for _, r := range results {
+		require.NotContains(t, r.detail, uv,
+			"Layer-4 survey must not report on shim-dir paths; got %+v", r)
+	}
+	// The truthful Layer-4 verdict for a PM that only exists as a shim
+	// is N/A ("no absolute-path install").
+	r := findResult(t, results, "wrapper:uv", "no absolute-path install")
+	require.Equal(t, statusNotApplicable, r.status)
+}
+
+// TestCheckShimDir_NotASymlinkFixSuggestsForceDisplacement: the
+// "exists but is not a symlink" FAIL used to advise moving the real
+// file aside by hand. Now that findRealBinary resolves
+// `.veto-displaced` siblings, `veto install-shims --force` is safe and
+// sufficient — the howToFix must say so and explain the displacement.
+func TestCheckShimDir_NotASymlinkFixSuggestsForceDisplacement(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	t.Setenv("PATH", shimDir)
+
+	// uv self-installed a real binary at the shim path.
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.WriteFile(uv, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	results := checkShimDir()
+	r := findResult(t, results, "shim:uv", "not a symlink")
+	require.Equal(t, statusFail, r.status)
+	require.Contains(t, r.howToFix, "veto install-shims --force")
+	require.Contains(t, r.howToFix, ".veto-displaced")
+}
+
+// TestCheckShimDir_SelfReferentialDisplacedSiblingFails: a healthy shim
+// symlink whose `.veto-displaced` sibling resolves back to veto means
+// the real binary is LOST — the same class of lie as a
+// self-referential `.veto-original` anchor. Doctor must FAIL loudly
+// instead of PASSing the shim.
+func TestCheckShimDir_SelfReferentialDisplacedSiblingFails(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	t.Setenv("PATH", shimDir)
+
+	// Healthy-looking shim: target string contains "veto" (the check's
+	// identity heuristic).
+	fakeVeto := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(fakeVeto, []byte("#!/bin/sh\n"), 0o755))
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(fakeVeto, uv))
+
+	// Displaced sibling chains back into the RUNNING veto (the test
+	// binary stands in for it, same trick as the resolver tests).
+	self, err := os.Executable()
+	require.NoError(t, err)
+	require.NoError(t, os.Symlink(self, uv+".veto-displaced"))
+
+	results := checkShimDir()
+	r := findResult(t, results, "shim:uv", "veto-displaced")
+	require.Equal(t, statusFail, r.status, "self-referential displaced sibling must FAIL")
+	require.Contains(t, r.detail, "resolves back to the veto binary")
+}
+
+// TestCheckShimDir_NonExecutableDisplacedSiblingFails: a displaced
+// original that is no longer executable cannot be resolved by
+// findRealBinary — the shim would gate and then fail to delegate.
+func TestCheckShimDir_NonExecutableDisplacedSiblingFails(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	t.Setenv("PATH", shimDir)
+
+	fakeVeto := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(fakeVeto, []byte("#!/bin/sh\n"), 0o755))
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(fakeVeto, uv))
+	require.NoError(t, os.WriteFile(uv+".veto-displaced", []byte("data"), 0o644))
+
+	results := checkShimDir()
+	r := findResult(t, results, "shim:uv", "veto-displaced")
+	require.Equal(t, statusFail, r.status, "non-executable displaced sibling must FAIL")
+}
+
+// TestCheckShimDir_HealthyDisplacedSiblingPasses: displacement is a
+// legitimate steady state now that the resolver honors it — a healthy
+// shim with a healthy displaced original must PASS, and the PASS row
+// should surface the displacement so the user knows where the real
+// binary lives.
+func TestCheckShimDir_HealthyDisplacedSiblingPasses(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	t.Setenv("PATH", shimDir)
+
+	fakeVeto := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(fakeVeto, []byte("#!/bin/sh\n"), 0o755))
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(fakeVeto, uv))
+	require.NoError(t, os.WriteFile(uv+".veto-displaced", []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	results := checkShimDir()
+	r := findResult(t, results, "shim:uv", "veto-displaced")
+	require.Equal(t, statusPass, r.status, "healthy displaced sibling must not fail the shim; got %+v", r)
 }

@@ -34,6 +34,16 @@ import (
 	"github.com/brynbellomy/veto/internal/packagemanager/pmlist"
 )
 
+// displacedSuffix is the rename target install-shims --force uses when
+// a REAL binary already occupies a shim path (uv self-installs into
+// ~/.local/bin/uv). The real binary moves to `<pm>.veto-displaced`
+// before the `<pm> -> veto` symlink lands; uninstall-shims restores it,
+// and findRealBinary (main.go) resolves it at exec time. Only
+// install-shims ever writes this suffix, and only inside the Layer-2
+// shim dir — that pairing is the provenance rule the resolver and
+// doctor both enforce.
+const displacedSuffix = ".veto-displaced"
+
 // shimmedManagers is an alias for the canonical pmlist.Shimmed slice.
 // Kept as a package-local name so the existing call sites read
 // naturally; the source of truth lives in
@@ -448,7 +458,7 @@ func ensureShim(target, vetoPath string, force bool) (string, error) {
 				return "", errors.WithNew("file exists and is not a symlink; pass --force to overwrite").
 					Set("path", target)
 			}
-			displaced := target + ".veto-displaced"
+			displaced := target + displacedSuffix
 			if err := os.Rename(target, displaced); err != nil {
 				return "", errors.With(err, "rename pre-existing real binary to .veto-displaced").
 					Set("path", target, "displaced", displaced)
@@ -466,7 +476,7 @@ func ensureShim(target, vetoPath string, force bool) (string, error) {
 	if err := os.Symlink(vetoPath, target); err != nil {
 		// Roll back the displacement on symlink failure so the user
 		// isn't left with a missing binary.
-		displaced := target + ".veto-displaced"
+		displaced := target + displacedSuffix
 		if _, derr := os.Lstat(displaced); derr == nil {
 			_ = os.Rename(displaced, target)
 		}
@@ -544,7 +554,7 @@ func removeShim(target, vetoPath string) (bool, error) {
 	}
 	// Phase 1.3: restore any pre-existing real binary that install-shims
 	// --force displaced to <target>.veto-displaced.
-	displaced := target + ".veto-displaced"
+	displaced := target + displacedSuffix
 	if _, derr := os.Lstat(displaced); derr == nil {
 		if err := os.Rename(displaced, target); err != nil {
 			return true, errors.With(err, "restore .veto-displaced after removing shim").
@@ -627,6 +637,28 @@ func defaultShimDir() string {
 		return filepath.Join(os.TempDir(), "veto-bin")
 	}
 	return filepath.Join(home, ".local", "bin")
+}
+
+// inShimDir reports whether path lies inside the Layer-2 shim dir
+// (defaultShimDir). This is the containment test behind every
+// territory rule: install-wrappers refuses to enroll shim-dir paths
+// into wrappers.json, doctor's Layer-4 host survey must not report on
+// them (the dedicated shim checks own that directory), and
+// findRealBinary trusts `.veto-displaced` siblings ONLY here. One
+// shared helper so all three call sites agree on the boundary instead
+// of re-deriving it.
+func inShimDir(path string) bool {
+	return pathInsideDir(path, defaultShimDir())
+}
+
+// pathInsideDir reports whether p equals dir or lies inside it, after
+// filepath.Clean on both sides. Purely lexical — no symlink
+// resolution — matching how wrappers.json records paths and how the
+// install-wrappers territory guard has always compared them.
+func pathInsideDir(p, dir string) bool {
+	cleanDir := filepath.Clean(dir)
+	clean := filepath.Clean(p)
+	return clean == cleanDir || strings.HasPrefix(clean, cleanDir+string(filepath.Separator))
 }
 
 // printPathOrderingHint warns when the shim directory comes AFTER a

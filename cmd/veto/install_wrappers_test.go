@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 
@@ -933,8 +934,8 @@ func TestFindWrappedOriginalViaChain_FollowsPlainAliasToRegisteredWrapper(t *tes
 	real := filepath.Join(dir, "python3.10.real")
 	require.NoError(t, os.WriteFile(real, []byte("#!/bin/sh\necho real\n"), 0o755))
 	py310 := filepath.Join(dir, "python3.10")
-	require.NoError(t, os.Symlink(self, py310))                             // python3.10 -> veto
-	require.NoError(t, os.Symlink("python3.10.real", py310+wrapperSuffix))  // anchor -> real
+	require.NoError(t, os.Symlink(self, py310))                            // python3.10 -> veto
+	require.NoError(t, os.Symlink("python3.10.real", py310+wrapperSuffix)) // anchor -> real
 	py := filepath.Join(dir, "python")
 	require.NoError(t, os.Symlink("python3.10", py)) // python -> python3.10 (plain alias, unregistered)
 
@@ -1587,4 +1588,171 @@ func TestApplyWrapper_ForeignWrapperStillSkipsWithoutForce(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipForeignWrapper, action,
 		"non-PM-dir foreign wrapper must still SKIP without --force")
+}
+
+// TestFindRealBinary_ResolvesDisplacedShimOriginal pins the Layer-2
+// displacement resolver (2026-07-24 uv incident). `install-shims
+// --force` renames a real binary occupying a shim path to
+// `<pm>.veto-displaced` before planting the `<pm> -> veto` symlink —
+// but the resolver only ever consulted `.veto-original` siblings gated
+// on wrappers.json, which by territory rule never covers the shim dir.
+// A host whose ONLY real copy of the PM was the displaced file got
+// "cannot find real uv: not found in PATH" (or, with a second wrapper
+// tool on PATH, an infinite exec ping-pong). The PATH walk must
+// resolve the displaced sibling for shim-dir candidates.
+func TestFindRealBinary_ResolvesDisplacedShimOriginal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shimDir := filepath.Join(home, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	// The shim: uv -> veto (test binary stands in for veto, same trick
+	// as the sibling tests — the PATH walk's resolved==selfReal branch
+	// fires).
+	self, err := os.Executable()
+	require.NoError(t, err)
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(self, uv))
+
+	// The displaced real binary install-shims --force left behind.
+	displaced := uv + ".veto-displaced"
+	require.NoError(t, os.WriteFile(displaced, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	t.Setenv("PATH", shimDir)
+
+	// Shim-dir paths are NEVER in wrappers.json (territory guard).
+	notRegistered := func(string) bool { return false }
+	got, err := findRealBinary("uv", notRegistered)
+	require.NoError(t, err, "displaced shim original must be resolvable")
+	require.Equal(t, displaced, got)
+}
+
+// TestFindDisplacedOriginal_DirectShimInvocation covers the argv[0]
+// variant of the displacement resolver: someone runs `~/.local/bin/uv`
+// by absolute path with a PATH that doesn't contain the shim dir, so
+// the PATH walk never sees the shim. findDisplacedOriginal must honor
+// the healthy sibling for a shim-dir path and reject bare names
+// (they go through the PATH walk).
+func TestFindDisplacedOriginal_DirectShimInvocation(t *testing.T) {
+	home := t.TempDir()
+	shimDir := filepath.Join(home, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	uv := filepath.Join(shimDir, "uv")
+	displaced := uv + ".veto-displaced"
+	require.NoError(t, os.WriteFile(displaced, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	got, ok := findDisplacedOriginal(uv, shimDir)
+	require.True(t, ok, "healthy displaced sibling of a shim-dir path must resolve")
+	require.Equal(t, displaced, got)
+
+	// Bare name: no path separator, not a shim-dir site.
+	_, ok = findDisplacedOriginal("uv", shimDir)
+	require.False(t, ok, "bare-name argv[0] must not consult displaced siblings")
+
+	// Missing sibling: fail closed.
+	pip := filepath.Join(shimDir, "pip")
+	_, ok = findDisplacedOriginal(pip, shimDir)
+	require.False(t, ok, "no displaced sibling means no resolution")
+}
+
+// TestFindRealBinary_SkipsSelfReferentialDisplaced: a
+// `<pm>.veto-displaced` that resolves back into veto itself would
+// re-enter veto in an exec loop — the same failure class the
+// `.veto-original` self-reference guards close. The walk must skip it
+// and fail closed with "not found in PATH".
+func TestFindRealBinary_SkipsSelfReferentialDisplaced(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shimDir := filepath.Join(home, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	self, err := os.Executable()
+	require.NoError(t, err)
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(self, uv))
+	// Displaced sibling ALSO chains back to veto (the test binary).
+	require.NoError(t, os.Symlink(self, uv+".veto-displaced"))
+
+	t.Setenv("PATH", shimDir)
+
+	_, err = findRealBinary("uv", func(string) bool { return false })
+	require.Error(t, err, "self-referential displaced sibling must be skipped")
+	require.Contains(t, err.Error(), "not found in PATH")
+}
+
+// TestFindRealBinary_IgnoresDisplacedOutsideShimDir enforces the
+// provenance gate: `.veto-displaced` files are only ever created by
+// install-shims inside the Layer-2 shim dir, so a displaced sibling
+// planted ANYWHERE else is not veto-authored and must be ignored —
+// exactly as unregistered `.veto-original` siblings are. Otherwise a
+// same-UID attacker could plant `<dir>/npm.veto-displaced` at any
+// veto-pointing PATH entry and hijack execution.
+func TestFindRealBinary_IgnoresDisplacedOutsideShimDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// A veto-pointing candidate OUTSIDE the shim dir with a planted
+	// displaced sibling.
+	otherBin := filepath.Join(home, "otherbin")
+	require.NoError(t, os.MkdirAll(otherBin, 0o755))
+	self, err := os.Executable()
+	require.NoError(t, err)
+	npm := filepath.Join(otherBin, "npm")
+	require.NoError(t, os.Symlink(self, npm))
+	require.NoError(t, os.WriteFile(npm+".veto-displaced", []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	t.Setenv("PATH", otherBin)
+
+	_, err = findRealBinary("npm", func(string) bool { return false })
+	require.Error(t, err, "displaced sibling outside the shim dir must be ignored (provenance gate)")
+	require.Contains(t, err.Error(), "not found in PATH")
+}
+
+// TestClassifyWriteSkip_SIPPathIsReadOnlyFSNotSudo pins the sudo-hint
+// fix: an unprivileged write under a SIP root (/usr/bin, ...) fails
+// with EPERM/EACCES — the kernel never gets far enough to return
+// EROFS — so classifying on errno alone filed SIP candidates under
+// "needs sudo" and the epilogue printed `sudo veto install-wrappers
+// --dir /usr/bin ...`, which cannot work (SIP blocks root too). The
+// classifier must consult SIP-ness before conceding the sudo hint.
+func TestClassifyWriteSkip_SIPPathIsReadOnlyFSNotSudo(t *testing.T) {
+	permErr := &fs.PathError{Op: "rename", Path: "/usr/bin/pip3", Err: syscall.EPERM}
+
+	action, ok := classifyWriteSkip("/usr/bin/pip3", permErr)
+	require.True(t, ok)
+	if runtime.GOOS == "darwin" {
+		require.Equal(t, wrapperActionSkipReadOnlyFS, action,
+			"SIP-protected path must classify as read-only FS — sudo cannot bypass SIP")
+	} else {
+		// isSIPProtectedPath is runtime-gated: SIP does not exist off
+		// darwin, so the plain permission classification stands.
+		require.Equal(t, wrapperActionSkipUnwritable, action)
+	}
+}
+
+// TestClassifyWriteSkip_NonSIPPermissionStillWantsSudo: a permission
+// error in a plain root-owned dir is still the "needs sudo" category —
+// the remediation hint is genuinely actionable there.
+func TestClassifyWriteSkip_NonSIPPermissionStillWantsSudo(t *testing.T) {
+	dir := t.TempDir()
+	permErr := &fs.PathError{Op: "rename", Path: filepath.Join(dir, "npm"), Err: syscall.EACCES}
+
+	action, ok := classifyWriteSkip(filepath.Join(dir, "npm"), permErr)
+	require.True(t, ok)
+	require.Equal(t, wrapperActionSkipUnwritable, action)
+}
+
+// TestClassifyWriteSkip_EROFSAndGenuineFailures: EROFS is always the
+// read-only-FS category regardless of path, and any other error is not
+// a skip at all — it propagates as a genuine failure.
+func TestClassifyWriteSkip_EROFSAndGenuineFailures(t *testing.T) {
+	erofs := &fs.PathError{Op: "rename", Path: "/anywhere/npm", Err: syscall.EROFS}
+	action, ok := classifyWriteSkip("/anywhere/npm", erofs)
+	require.True(t, ok)
+	require.Equal(t, wrapperActionSkipReadOnlyFS, action)
+
+	other := &fs.PathError{Op: "rename", Path: "/anywhere/npm", Err: syscall.EIO}
+	_, ok = classifyWriteSkip("/anywhere/npm", other)
+	require.False(t, ok, "non-permission, non-EROFS errors are genuine failures, not skips")
 }

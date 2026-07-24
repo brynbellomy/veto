@@ -69,6 +69,34 @@ func isReadOnlyFS(err error) bool {
 // what made it instead of guessing.
 const wrapperSuffix = ".veto-original"
 
+// classifyWriteSkip maps a failed filesystem mutation on a wrap
+// candidate to its skip category, or ok=false when the error is a
+// genuine failure the caller must surface.
+//
+// EROFS is always the read-only-FS category. Permission errors are
+// split on SIP-ness: an unprivileged write under a SIP root
+// (/usr/bin, /usr/sbin, ...) fails with EPERM/EACCES — the access
+// check rejects the caller before the kernel ever reports EROFS — so
+// the errno alone under-classifies the path as "unwritable, needs
+// sudo". That category drives the end-of-run `sudo veto
+// install-wrappers --dir /usr/bin ...` epilogue, which for a SIP dir
+// is a lie: SIP blocks root too (isSIPProtectedPath, doctor.go, is the
+// same knowledge doctor uses to render these paths N/A). Consult it
+// before conceding the sudo hint so SIP candidates land in the
+// read-only-FS category, whose messaging is honest about the limit.
+func classifyWriteSkip(path string, err error) (wrapAction, bool) {
+	if isReadOnlyFS(err) {
+		return wrapperActionSkipReadOnlyFS, true
+	}
+	if !os.IsPermission(err) {
+		return 0, false
+	}
+	if isSIPProtectedPath(path) {
+		return wrapperActionSkipReadOnlyFS, true
+	}
+	return wrapperActionSkipUnwritable, true
+}
+
 // stateFileName is the JSON registry of every wrapper veto has
 // installed. Kept alongside the intel cache so a single
 // VETO_CACHE_DIR override moves both. uninstall-wrappers replays
@@ -668,18 +696,13 @@ func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([
 	}
 
 	// Defense in depth: refuse to enroll any candidate whose path lies
-	// inside the Layer 2 shim dir. Layer 2 and Layer 4 must not share
-	// territory; if a previous install-wrappers version walked $PATH and
-	// scooped up shim-dir entries (the bug that broke veto-dzk recovery),
-	// this guard prevents the regression even before install-shims
-	// reconciles the registry.
-	shimDirCanonical := filepath.Clean(defaultShimDir())
-	shimPrefix := shimDirCanonical + string(filepath.Separator)
-	inShimDir := func(p string) bool {
-		clean := filepath.Clean(p)
-		return strings.HasPrefix(clean, shimPrefix) || clean == shimDirCanonical
-	}
-
+	// inside the Layer 2 shim dir (inShimDir, shims.go — the shared
+	// territory test doctor's survey and findRealBinary also apply).
+	// Layer 2 and Layer 4 must not share territory; if a previous
+	// install-wrappers version walked $PATH and scooped up shim-dir
+	// entries (the bug that broke veto-dzk recovery), this guard
+	// prevents the regression even before install-shims reconciles the
+	// registry.
 	seen := map[string]struct{}{}
 	add := func(c wrapCandidate) {
 		if _, dup := seen[c.path]; dup {
@@ -983,20 +1006,14 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 				return wrapperActionSkipDryRun, nil
 			}
 			if err := os.Remove(c.path); err != nil {
-				if isReadOnlyFS(err) {
-					return wrapperActionSkipReadOnlyFS, nil
-				}
-				if os.IsPermission(err) {
-					return wrapperActionSkipUnwritable, nil
+				if action, ok := classifyWriteSkip(c.path, err); ok {
+					return action, nil
 				}
 				return wrapperActionWrapped, errors.With(err, "remove existing symlink for safe relink").Set("path", c.path)
 			}
 			if err := os.Symlink(vetoPath, c.path); err != nil {
-				if isReadOnlyFS(err) {
-					return wrapperActionSkipReadOnlyFS, nil
-				}
-				if os.IsPermission(err) {
-					return wrapperActionSkipUnwritable, nil
+				if action, ok := classifyWriteSkip(c.path, err); ok {
+					return action, nil
 				}
 				return wrapperActionWrapped, errors.With(err, "recreate veto symlink").Set("path", c.path)
 			}
@@ -1033,19 +1050,17 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 		return wrapperActionSkipDryRun, nil
 	}
 
-	// 1) Move the real binary aside. EROFS (read-only filesystem,
-	// typically SIP-protected dirs like /usr/bin on macOS) and permission
-	// errors are both environmental — classify them as skips (not
-	// failures) so install-all keeps going. The two cases route to
-	// different actions because sudo helps with one (permission) but not
-	// the other (SIP). Check raw os errors: os.IsPermission and
-	// stderrors.Is do not see through errors.With wrappers.
+	// 1) Move the real binary aside. EROFS (read-only filesystem) and
+	// permission errors are both environmental — classify them as skips
+	// (not failures) so install-all keeps going. classifyWriteSkip routes
+	// the two categories: sudo helps with a plain unwritable dir but not
+	// with SIP (which surfaces as EPERM for unprivileged callers and
+	// EROFS for root — both must land in the no-sudo-hint category).
+	// Check raw os errors: os.IsPermission and stderrors.Is do not see
+	// through errors.With wrappers.
 	if err := os.Rename(c.path, original); err != nil {
-		if isReadOnlyFS(err) {
-			return wrapperActionSkipReadOnlyFS, nil
-		}
-		if os.IsPermission(err) {
-			return wrapperActionSkipUnwritable, nil
+		if action, ok := classifyWriteSkip(c.path, err); ok {
+			return action, nil
 		}
 		return wrapperActionWrapped, errors.With(err, "rename real binary aside").Set("from", c.path, "to", original)
 	}
@@ -1054,11 +1069,8 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 		// Best-effort rollback so we don't strand the user with a
 		// PM that's invisible.
 		_ = os.Rename(original, c.path)
-		if isReadOnlyFS(err) {
-			return wrapperActionSkipReadOnlyFS, nil
-		}
-		if os.IsPermission(err) {
-			return wrapperActionSkipUnwritable, nil
+		if action, ok := classifyWriteSkip(c.path, err); ok {
+			return action, nil
 		}
 		return wrapperActionWrapped, errors.With(err, "create veto symlink").Set("path", c.path)
 	}

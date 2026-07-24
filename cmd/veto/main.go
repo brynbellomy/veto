@@ -1347,10 +1347,65 @@ func findWrappedOriginalViaChain(argv0 string, registered func(string) bool) (st
 	}
 }
 
+// findDisplacedOriginal returns the `.veto-displaced` sibling of path
+// when path lies inside the Layer-2 shim dir and the sibling is a
+// healthy real binary, or ("", false) otherwise.
+//
+// `install-shims --force` is the ONLY writer of the `.veto-displaced`
+// suffix: when a real binary already occupies a shim path (uv
+// self-installs into ~/.local/bin/uv), it renames the binary aside
+// before planting the `<pm> -> veto` symlink. Until this resolver
+// existed the displaced file was invisible at exec time — only
+// uninstall-shims ever read the suffix back. wrappers.json never
+// covers shim-dir paths (install-wrappers' territory guard refuses to
+// enroll there), so the `.veto-original` lookups can't apply, and a
+// host whose ONLY real copy of a PM was the displaced file got
+// "cannot find real uv: not found in PATH" — or, with a second
+// wrapper tool (safe-chain) on PATH, an infinite exec ping-pong
+// between the two wrappers.
+//
+// Provenance gate: shim-dir membership plays exactly the role
+// wrappers.json membership plays for `.veto-original` siblings. The
+// shim dir is veto's exclusive Layer-2 territory and only install-shims
+// writes the `.veto-displaced` suffix, so a displaced sibling inside
+// the shim dir is veto-authored by construction. A `.veto-displaced`
+// planted anywhere else is NOT trusted — a same-UID attacker could
+// otherwise drop `<dir>/npm.veto-displaced` next to any veto-pointing
+// PATH entry and hijack execution. Callers continue their walk when
+// this returns false (fail closed).
+//
+// Health gate: the sibling must be an executable regular file or
+// symlink AND must not resolve back into veto itself — a
+// self-referential displaced file would re-enter veto in an exec
+// loop, the same failure class the `.veto-original` guards close.
+func findDisplacedOriginal(path, shimDir string) (string, bool) {
+	if path == "" || !strings.ContainsRune(path, '/') {
+		return "", false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false
+	}
+	if !pathInsideDir(abs, shimDir) {
+		return "", false
+	}
+	displaced := abs + displacedSuffix
+	if !isExecutableRegularOrSymlink(displaced) {
+		return "", false
+	}
+	if isSelfReferential(displaced) {
+		return "", false
+	}
+	return displaced, true
+}
+
 // findRealBinary returns the path veto should exec to satisfy a
 // gated install. Prefers a wrapped-original sibling (Layer 4), then
 // the alias chain-follower (for plain aliases into a wrapped sibling),
-// then falls back to a PATH walk that skips any veto-pointing entries.
+// then a Layer-2 `.veto-displaced` sibling when argv[0] is itself a
+// shim-dir path, then falls back to a PATH walk that skips any
+// veto-pointing entries (consulting `.veto-original` /
+// `.veto-displaced` siblings per their respective provenance gates).
 //
 // `registered` is a wrappers.json membership predicate; see
 // findWrappedOriginal for the provenance rationale.
@@ -1364,6 +1419,22 @@ func findRealBinary(name string, registered func(string) bool) (string, error) {
 	// resolve to the wrong interpreter.
 	if wrapped, ok := findWrappedOriginalViaChain(os.Args[0], registered); ok {
 		return wrapped, nil
+	}
+	shimDir := defaultShimDir()
+	// Direct shim invocation: argv[0] IS a shim-dir path (someone ran
+	// `~/.local/bin/uv` by absolute path, possibly with a PATH that
+	// doesn't contain the shim dir — the walk below would never see
+	// it). Mirrors the findWrappedOriginal argv[0] lookup above, with
+	// shim-dir membership as the provenance gate instead of
+	// wrappers.json — see findDisplacedOriginal. The basename must
+	// match the PM being resolved so an unrelated argv[0] (e.g. a veto
+	// binary that itself lives in the shim dir, invoked as
+	// `veto npm install`) can never route resolution through its own
+	// siblings.
+	if argv0 := os.Args[0]; filepath.Base(argv0) == name {
+		if displaced, ok := findDisplacedOriginal(argv0, shimDir); ok {
+			return displaced, nil
+		}
 	}
 	self, err := os.Executable()
 	if err != nil {
@@ -1420,6 +1491,21 @@ func findRealBinary(name string, registered func(string) bool) (string, error) {
 				if sibling := candidate + ".veto-original"; isExecutableRegularOrSymlink(sibling) && !isSelfReferential(sibling) {
 					return sibling, nil
 				}
+			}
+			// Layer-2 displacement: the candidate is a shim-dir entry
+			// whose real binary was moved aside by `install-shims
+			// --force` (`<pm>.veto-displaced`). The `.veto-original`
+			// gate above can never fire for these paths — wrappers.json
+			// refuses shim-dir territory by construction — so without
+			// this check a PM whose ONLY real copy is the displaced
+			// file resolves to "not found in PATH" even though the
+			// binary sits right next to its shim. Shim-dir membership
+			// is the provenance gate here, exactly as wrappers.json
+			// membership gates `.veto-original`; see
+			// findDisplacedOriginal. Unhealthy or absent siblings fall
+			// through and the walk continues (fail closed).
+			if displaced, ok := findDisplacedOriginal(candidate, shimDir); ok {
+				return displaced, nil
 			}
 			continue
 		}
@@ -1748,7 +1834,10 @@ Layer 1 — Claude Code hook (Bash tool interception):
 
 Layer 2 — PATH shims (any agent shell, Codex, CI):
   veto install-shims [--dir DIR] [--force] [--dry-run]
-                               symlinks ~/.local/bin/{npm,pip,…} → veto
+                               symlinks ~/.local/bin/{npm,pip,…} → veto.
+                               --force displaces a real binary occupying a
+                               shim path to <pm>.veto-displaced; veto
+                               resolves it, uninstall-shims restores it
   veto uninstall-shims [--dir DIR]
                                remove veto-managed symlinks
   veto install-codex        install-shims + a ~/.codex/config.toml scan
