@@ -300,3 +300,71 @@ func TestExpandPackageJSONWorkspaceMembers(t *testing.T) {
 		assertMembers(t, expandRoot(t, root))
 	})
 }
+
+// TestExpandBundleDependenciesBooleanForm is the regression for the
+// fail-closed crash: npm documents `"bundleDependencies": true` (bundle
+// every dependency) and `false` (bundle none). Modeling the field as a
+// []string made json.Unmarshal abort the whole package.json on the boolean
+// form, fail-closing the install. The manifest must parse and its
+// dependency maps must still be gated.
+func TestExpandBundleDependenciesBooleanForm(t *testing.T) {
+	for _, tc := range []struct{ name, value string }{
+		{"true", "true"},
+		{"false", "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "package.json")
+			contents := `{
+  "name": "demo",
+  "dependencies": {"lodash": "4.17.21"},
+  "bundleDependencies": ` + tc.value + `
+}`
+			require.NoError(t, os.WriteFile(path, []byte(contents), 0o644))
+
+			exp := jsmanifest.New()
+			installs, err := exp.Expand(packagemanager.ManifestRef{
+				Path: path,
+				Kind: packagemanager.ManifestKindPackageJSON,
+			})
+			require.NoError(t, err, "boolean bundleDependencies must not fail-close the parse")
+			byName := make(map[string]packagemanager.Install, len(installs))
+			for _, ins := range installs {
+				byName[ins.Ref.Name] = ins
+			}
+			require.Contains(t, byName, "lodash", "regular deps must still be gated")
+			require.Equal(t, "4.17.21", byName["lodash"].Ref.Version)
+		})
+	}
+}
+
+// TestExpandBundleDependenciesArrayForms covers the array form (names are
+// gated) under both the `bundleDependencies` spelling and npm's honored
+// `bundledDependencies` alias.
+func TestExpandBundleDependenciesArrayForms(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "package.json")
+	contents := `{
+  "name": "demo",
+  "dependencies": {"lodash": "4.17.21"},
+  "bundleDependencies": ["bundled-a", "bundled-b"],
+  "bundledDependencies": ["aliased-bundle"]
+}`
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o644))
+
+	exp := jsmanifest.New()
+	installs, err := exp.Expand(packagemanager.ManifestRef{
+		Path: path,
+		Kind: packagemanager.ManifestKindPackageJSON,
+	})
+	require.NoError(t, err)
+	byName := make(map[string]packagemanager.Install, len(installs))
+	for _, ins := range installs {
+		require.Equal(t, intel.EcosystemNPM, ins.Ref.Ecosystem)
+		byName[ins.Ref.Name] = ins
+	}
+	require.Contains(t, byName, "lodash")
+	require.Contains(t, byName, "bundled-a")
+	require.Contains(t, byName, "bundled-b")
+	require.Contains(t, byName, "aliased-bundle", "npm honors the bundledDependencies alias")
+}
