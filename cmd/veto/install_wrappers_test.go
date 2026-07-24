@@ -1756,3 +1756,45 @@ func TestClassifyWriteSkip_EROFSAndGenuineFailures(t *testing.T) {
 	_, ok = classifyWriteSkip("/anywhere/npm", other)
 	require.False(t, ok, "non-permission, non-EROFS errors are genuine failures, not skips")
 }
+
+// TestAliasSiblingWrapTarget_RelativeAndAbsoluteShapes pins the helper
+// behind both aliasInheritsSiblingWrap (discovery) and doctor's
+// alias-aware survey row: it must recognize the RELATIVE pyenv shape
+// (`python -> python3.10`) and the ABSOLUTE bunx shape
+// (`bunx -> /abs/dir/bun`), returning the resolved same-dir sibling
+// path, and reject cross-directory symlinks and regular files.
+func TestAliasSiblingWrapTarget_RelativeAndAbsoluteShapes(t *testing.T) {
+	dir := t.TempDir()
+
+	// Relative same-dir alias.
+	python310 := filepath.Join(dir, "python3.10")
+	require.NoError(t, os.WriteFile(python310, []byte("#!/bin/sh\n"), 0o755))
+	python := filepath.Join(dir, "python")
+	require.NoError(t, os.Symlink("python3.10", python))
+	got, ok := aliasSiblingWrapTarget(python)
+	require.True(t, ok, "relative same-dir alias must be recognized")
+	require.Equal(t, python310, got)
+
+	// Absolute same-dir alias.
+	bun := filepath.Join(dir, "bun")
+	require.NoError(t, os.WriteFile(bun, []byte("#!/bin/sh\n"), 0o755))
+	bunx := filepath.Join(dir, "bunx")
+	require.NoError(t, os.Symlink(bun, bunx))
+	got, ok = aliasSiblingWrapTarget(bunx)
+	require.True(t, ok, "absolute same-dir alias must be recognized")
+	require.Equal(t, bun, got)
+
+	// Cross-directory symlink: not a same-dir alias.
+	otherDir := filepath.Join(dir, "other")
+	require.NoError(t, os.MkdirAll(otherDir, 0o755))
+	crossTarget := filepath.Join(otherDir, "npm")
+	require.NoError(t, os.WriteFile(crossTarget, []byte("#!/bin/sh\n"), 0o755))
+	cross := filepath.Join(dir, "npm")
+	require.NoError(t, os.Symlink(crossTarget, cross))
+	_, ok = aliasSiblingWrapTarget(cross)
+	require.False(t, ok, "cross-directory symlinks are wrap candidates, not aliases")
+
+	// Regular file: not an alias at all.
+	_, ok = aliasSiblingWrapTarget(python310)
+	require.False(t, ok)
+}

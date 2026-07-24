@@ -642,22 +642,38 @@ func isWrapTargetName(basename string) bool {
 // python3.14) is a distinct layout: the target is not independently
 // wrapped at that path, so the alias remains a legitimate wrap candidate.
 func aliasInheritsSiblingWrap(candidatePath string) bool {
+	_, ok := aliasSiblingWrapTarget(candidatePath)
+	return ok
+}
+
+// aliasSiblingWrapTarget returns the SAME-DIR wrap-target sibling that
+// candidatePath is a plain alias for, or ("", false) when candidatePath
+// is not such an alias. This is the shape test behind
+// aliasInheritsSiblingWrap; it additionally exposes the resolved
+// sibling path because doctor's host survey names it in the alias PASS
+// row. One symlink hop only, relative or absolute — the pyenv
+// `python -> python3.10` and bun `bunx -> /abs/dir/bun` layouts both
+// reduce to a cleaned same-dir target.
+func aliasSiblingWrapTarget(candidatePath string) (string, bool) {
 	fi, err := os.Lstat(candidatePath)
 	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		return false
+		return "", false
 	}
 	target, err := os.Readlink(candidatePath)
 	if err != nil {
-		return false
+		return "", false
 	}
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(filepath.Dir(candidatePath), target)
 	}
 	target = filepath.Clean(target)
 	if filepath.Dir(target) != filepath.Dir(filepath.Clean(candidatePath)) {
-		return false
+		return "", false
 	}
-	return isWrapTargetName(filepath.Base(target))
+	if !isWrapTargetName(filepath.Base(target)) {
+		return "", false
+	}
+	return target, true
 }
 
 // discoverWrapCandidates walks the well-known install-dir patterns

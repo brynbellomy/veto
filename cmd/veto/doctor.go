@@ -1087,6 +1087,10 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 			pmHadDiscovery = true
 			switch class {
 			case pmsurvey.ClassOursByPath:
+				if alias := discoveredAliasPassRow(pm, path); alias != nil {
+					out = append(out, *alias)
+					continue
+				}
 				if bad := discoveredAnchorFailure(pm, path, vetoID); bad != nil {
 					out = append(out, *bad)
 					continue
@@ -1098,6 +1102,10 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 				})
 				continue
 			case pmsurvey.ClassOursByHash:
+				if alias := discoveredAliasPassRow(pm, path); alias != nil {
+					out = append(out, *alias)
+					continue
+				}
 				if bad := discoveredAnchorFailure(pm, path, vetoID); bad != nil {
 					out = append(out, *bad)
 					continue
@@ -1206,6 +1214,38 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 	}
 
 	return out
+}
+
+// discoveredAliasPassRow returns a PASS row when path is a plain alias
+// into a wrapped SAME-DIR sibling (pyenv `python -> python3.10`, bun
+// `bunx -> /abs/dir/bun`), or nil when path is not such an alias.
+//
+// These aliases have no `.veto-original` of their own BY DESIGN:
+// discovery deliberately keeps them plain (aliasInheritsSiblingWrap —
+// wrapping one would manufacture a self-referential anchor), and the
+// resolver follows them through the sibling's wrap at runtime
+// (findWrappedOriginalViaChain). ClassifySymlink resolves the full
+// chain alias -> sibling -> veto, so without this guard the
+// discovered-anchor verification reads the alias as an orphaned
+// wrapper — the false positive the 2026-07-24 live doctor run
+// surfaced on ~/.bun/bin/bunx and pyenv's python/python3 aliases.
+//
+// The sibling's anchor is deliberately NOT validated here: the sibling
+// is itself surveyed (or state-checked) and FAILs on its own row if
+// orphaned. One defect, one row — the alias is not independently
+// repairable, and duplicating the orphan FAIL onto every alias would
+// turn a single broken anchor into N rows naming paths the user must
+// not touch.
+func discoveredAliasPassRow(pm, path string) *checkResult {
+	target, ok := aliasSiblingWrapTarget(path)
+	if !ok {
+		return nil
+	}
+	return &checkResult{
+		status: statusPass,
+		label:  "wrapper:" + pm,
+		detail: fmt.Sprintf("%s (plain alias into wrapped sibling %s; inherits the wrap — no own anchor by design)", path, target),
+	}
 }
 
 // discoveredAnchorFailure validates the `.veto-original` anchor behind
