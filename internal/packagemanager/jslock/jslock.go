@@ -207,6 +207,32 @@ type pnpmImporterEntry struct {
 	Version   string `yaml:"version"`
 }
 
+// UnmarshalYAML accepts both pnpm importer-entry shapes so a valid
+// lockfile of either schema parses instead of aborting the whole file:
+//
+//   - lockfileVersion 6+ : a mapping, `pkg: {specifier: ^1, version: 1.2.3}`
+//   - lockfileVersion 5.x: a bare version string, `pkg: 1.2.3`
+//
+// Modeling only the v6 mapping made yaml.Unmarshal fail with "cannot
+// unmarshal !!str into pnpmImporterEntry" on any v5 workspace lockfile,
+// which the caller treats as fatal — fail-closing every install in that
+// repo. A scalar node is taken as the resolved version.
+func (e *pnpmImporterEntry) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		e.Version = node.Value
+		return nil
+	}
+	// rawEntry strips the UnmarshalYAML method so node.Decode does the
+	// default struct decode (no recursion).
+	type rawEntry pnpmImporterEntry
+	var r rawEntry
+	if err := node.Decode(&r); err != nil {
+		return err
+	}
+	*e = pnpmImporterEntry(r)
+	return nil
+}
+
 func expandPnpmLock(path string) ([]packagemanager.Install, error) {
 	data, ok, err := readFile(path)
 	if err != nil || !ok {
