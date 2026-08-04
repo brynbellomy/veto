@@ -6,6 +6,7 @@
 //	veto <pm> <pm-args...>     gate an install command, then exec the real PM
 //	veto sync                  refresh the intel store from all sources
 //	veto status                show source health and store size
+//	veto update                self-update the veto binary (via go install)
 //	veto help                  print this message
 //
 // The "<pm> <pm-args...>" form is the same shape safe-chain uses, so shims
@@ -263,6 +264,8 @@ func run(args []string) int {
 		return runSync(logger, cfg)
 	case "status":
 		return runStatus(logger, cfg)
+	case "update":
+		return runUpdate(logger, cfg, args[1:])
 	case "install-shims":
 		return runInstallShims(logger, cfg, args[1:])
 	case "uninstall-shims":
@@ -1689,6 +1692,9 @@ Usage:
   veto <pm> <pm-args...>    gate a package-manager invocation, then exec it
   veto sync                 refresh malware intel from all configured sources
   veto status               print configured sources and cache location
+  veto update [--check] [--full] [--ref REF]
+                            self-update: build the latest veto via `+"`go install`"+`
+                            and replace this binary in place
   veto doctor               verify defense layers + intel state (run after install)
   veto scan [--root DIR] [--json] [--no-projects] [--no-caches] [--no-agent-surface]
                             scan projects, package-manager caches, and agent
@@ -1770,6 +1776,24 @@ Install everything:
                                  10  a user-scoped layer failed
                                  20  wrappers need elevation (rerun under sudo)
                                  30  wrappers attempted and genuinely failed
+
+Self-update:
+  veto update [--check] [--full] [--binary-only] [--ref REF] [--repo URL] [--module PATH]
+                               build the latest veto with `+"`go install <module>@<ref>`"+`
+                               (checksum-verified via the module proxy; no source
+                               tree or prebuilt-binary download) and atomically
+                               replace this binary. Layer 2 shims (symlinks) and the
+                               Layer 3 interposer (routes via VETO_PATH) pick up the
+                               new binary automatically; by default we also re-point
+                               shims (`+"`install-shims --force`"+`).
+                               --check       report current vs latest, change nothing
+                               --full        also run `+"`install-all`"+` (rebuilds the
+                                             interposer; use if the shadowed-PM set
+                                             changed)
+                               --binary-only replace the binary only, touch no layer
+                               --ref REF     branch/tag/commit to install (default: main)
+                               Requires a Go toolchain on PATH (veto ships no
+                               prebuilt binaries).
 
 Supported package managers:
   npm, pnpm, yarn, bun, pip, pip3, uv, poetry, pdm, go, cargo,

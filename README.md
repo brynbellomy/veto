@@ -64,6 +64,35 @@ veto doctor                        # confirm green
 case; the granular commands above let you skip layers that haven't
 changed.
 
+#### `veto update` — one-command self-update
+
+If all you want is to move to the latest published `veto`, `veto update`
+does it without a source checkout. It builds the requested ref with
+`go install github.com/brynbellomy/veto/cmd/veto@<ref>` (default `main` —
+the repo publishes no semver tags, so `@latest` won't resolve; the build
+is checksum-verified through the Go module proxy, with no prebuilt-binary
+download) and atomically replaces the running binary in place. Because
+every Layer 2 shim is a symlink to that binary path and the Layer 3
+interposer routes execs to `$VETO_PATH` (the same path), the replace alone
+makes all layers use the new binary immediately — no re-source. `veto
+update` also re-points shims (`install-shims --force`) so any
+newly-shadowed package managers get their shim.
+
+```sh
+veto update              # build latest main, replace this binary in place
+veto update --check      # report current vs latest, change nothing
+veto update --full       # also run install-all (rebuilds the C interposer;
+                         # use when the set of shadowed PMs changed)
+veto update --ref v1.2.3 # install a specific branch, tag, or commit
+veto update --binary-only  # replace the binary only, touch no other layer
+```
+
+Requires a Go toolchain on PATH (veto ships no prebuilt binaries). The
+granular `make install` sequence above remains the path when you're
+developing veto from a local checkout, or when a release changed the
+shadowed-PM set and you want to rebuild the interposer from that tree
+rather than via `--full`.
+
 If `veto doctor` reports drift — stray `*.veto-original` siblings in
 the Layer 2 shim dir, stale wrappers.json entries, foreign-wrapper
 FAILs on the canonical Homebrew install — just run:
