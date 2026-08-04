@@ -54,7 +54,15 @@ type packageJSON struct {
 	DevDependencies      map[string]string `json:"devDependencies"`
 	PeerDependencies     map[string]string `json:"peerDependencies"`
 	OptionalDependencies map[string]string `json:"optionalDependencies"`
-	BundleDependencies   []string          `json:"bundleDependencies"`
+	// BundleDependencies is npm's bundleDependencies (npm also honors the
+	// "bundledDependencies" alias). It is EITHER an array of package names
+	// OR a boolean — `true` bundles every entry in `dependencies` (already
+	// covered by the maps above), `false` bundles none. Modeling it as a
+	// []string made json.Unmarshal abort the ENTIRE package.json on the
+	// documented boolean form, fail-closing the install. Kept raw and
+	// parsed leniently by bundleDependencyNames.
+	BundleDependencies  json.RawMessage `json:"bundleDependencies"`
+	BundledDependencies json.RawMessage `json:"bundledDependencies"`
 	// Workspaces is the npm/yarn/pnpm monorepo member list. It is either a
 	// JSON array of directory globs (npm, yarn classic) or an object with a
 	// "packages" array (yarn berry), so it is kept raw and parsed by
@@ -155,8 +163,8 @@ func collectDeps(pkg packageJSON) []packagemanager.Install {
 	// Phase 1.6: bundleDependencies is a JSON array of names that get
 	// bundled into the published tarball. The names exist in the
 	// registry and can be flagged by intel; gate by name (no version
-	// is recorded in this field).
-	for _, name := range pkg.BundleDependencies {
+	// is recorded in this field). The boolean form carries no names.
+	for _, name := range bundleDependencyNames(pkg.BundleDependencies, pkg.BundledDependencies) {
 		installs = append(installs, packagemanager.Install{
 			Ref:     intel.PackageRef{Ecosystem: intel.EcosystemNPM, Name: strings.TrimSpace(name)},
 			RawSpec: name,
@@ -190,6 +198,28 @@ func workspacePatterns(raw json.RawMessage) []string {
 		return obj.Packages
 	}
 	return nil
+}
+
+// bundleDependencyNames extracts the package names from package.json's
+// bundleDependencies / bundledDependencies fields. Each is EITHER a JSON
+// array of names OR a boolean (npm: `true` bundles every entry already in
+// `dependencies`; `false` bundles none) — so the array form yields names
+// and every other shape (bool, null, absent) yields none, without
+// erroring. This mirrors workspacePatterns' lenient dual-shape parse and
+// is what lets a valid `"bundleDependencies": true` manifest through
+// instead of fail-closing the install.
+func bundleDependencyNames(raws ...json.RawMessage) []string {
+	var names []string
+	for _, raw := range raws {
+		if len(raw) == 0 {
+			continue
+		}
+		var arr []string
+		if err := json.Unmarshal(raw, &arr); err == nil {
+			names = append(names, arr...)
+		}
+	}
+	return names
 }
 
 // workspaceMemberManifests expands the workspace directory globs (relative to

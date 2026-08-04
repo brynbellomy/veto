@@ -110,6 +110,42 @@ source = { registry = "https://pypi.org/simple" }
 	requireNotContains(t, out, "my-lib")
 }
 
+// TestExpand_UvLockLocalDirectoryAndPath completes the editable/virtual
+// skip: uv.lock also emits `source = { directory = ... }` for a
+// non-editable local path dependency and `source = { path = ... }` for an
+// on-disk sdist/wheel. Both are local, first-party artifacts, so gating
+// them against PyPI by name is the same false-positive class the
+// editable/virtual skip already avoids. They must be skipped; registry
+// packages must still be emitted.
+func TestExpand_UvLockLocalDirectoryAndPath(t *testing.T) {
+	const body = `version = 1
+
+[[package]]
+name = "my-local-lib"
+version = "0.1.0"
+source = { directory = "libs/my-local-lib" }
+
+[[package]]
+name = "vendored-wheel"
+version = "2.3.0"
+source = { path = "vendor/vendored_wheel-2.3.0-py3-none-any.whl" }
+
+[[package]]
+name = "requests"
+version = "2.31.0"
+source = { registry = "https://pypi.org/simple" }
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "uv.lock")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+
+	out, err := pylock.New().Expand(packagemanager.ManifestRef{Path: path, Kind: packagemanager.ManifestKindUvLock})
+	require.NoError(t, err)
+	requireContains(t, out, "requests", "2.31.0")
+	requireNotContains(t, out, "my-local-lib")
+	requireNotContains(t, out, "vendored-wheel")
+}
+
 // TestExpand_MissingFile_ReturnsNilNil: PMs emit lock refs speculatively,
 // so missing files must not error.
 func TestExpand_MissingFile_ReturnsNilNil(t *testing.T) {

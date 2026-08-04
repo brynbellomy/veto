@@ -57,16 +57,28 @@ type packageEntry struct {
 	Source  *packageSource `toml:"source"`
 }
 
-// packageSource models the per-package source block. uv.lock emits
-// `source = { editable = "<path>" }` for workspace-member / editable entries
-// and `source = { virtual = "<path>" }` for venv-only synthetic entries — the
-// values are PATH STRINGS, not booleans. Gating those against PyPI is a
+// packageSource models the per-package source block. uv.lock emits a
+// single-key table whose value is a PATH STRING (never a boolean) for
+// local sources: `editable` / `virtual` for workspace-member and venv-only
+// synthetic entries, `directory` for a non-editable local path dependency,
+// and `path` for an on-disk sdist/wheel. All four are local, first-party
+// artifacts — NOT PyPI packages — so gating them against PyPI by name is a
 // false-positive risk (a local name might collide with a real malicious
-// package on PyPI), so we skip any entry whose source is editable or virtual.
-// Registry/git/url sources leave both empty and are scanned normally.
+// package on PyPI). We skip any entry with one of these local sources.
+// Registry / git / url sources leave every field empty and are scanned
+// normally.
 type packageSource struct {
-	Editable string `toml:"editable"`
-	Virtual  string `toml:"virtual"`
+	Editable  string `toml:"editable"`
+	Virtual   string `toml:"virtual"`
+	Directory string `toml:"directory"`
+	Path      string `toml:"path"`
+}
+
+// isLocal reports whether the source points at a local, first-party
+// artifact (editable / virtual / directory / on-disk path) rather than a
+// remote registry / git / url artifact.
+func (s *packageSource) isLocal() bool {
+	return s.Editable != "" || s.Virtual != "" || s.Directory != "" || s.Path != ""
 }
 
 func expand(path string) ([]packagemanager.Install, error) {
@@ -88,8 +100,8 @@ func expand(path string) ([]packagemanager.Install, error) {
 		if p.Name == "" || p.Version == "" {
 			continue
 		}
-		// Phase 1.7: skip editable/virtual workspace-member entries.
-		if p.Source != nil && (p.Source.Editable != "" || p.Source.Virtual != "") {
+		// Phase 1.7: skip local (editable/virtual/directory/path) entries.
+		if p.Source != nil && p.Source.isLocal() {
 			continue
 		}
 		out = append(out, packagemanager.Install{

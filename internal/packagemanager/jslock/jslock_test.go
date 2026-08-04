@@ -209,6 +209,64 @@ func TestExpandMalformedJSON_Errors(t *testing.T) {
 	require.Contains(t, err.Error(), "parse package-lock.json")
 }
 
+// TestExpandPnpmLockV5Importers is the regression for the fail-closed
+// crash: pnpm lockfileVersion 5.x records importer dependencies as bare
+// version STRINGS (`dependencies: {is-odd: 3.0.1}`), whereas 6+ uses a
+// {specifier, version} mapping. Modeling only the mapping made
+// yaml.Unmarshal abort the whole pnpm-lock.yaml on any v5 workspace
+// lockfile, fail-closing every install in that repo. The v5 file must
+// parse, and its importer deps must be gated.
+func TestExpandPnpmLockV5Importers(t *testing.T) {
+	const lock = `lockfileVersion: 5.4
+
+importers:
+
+  .:
+    specifiers:
+      is-odd: ^3.0.1
+    dependencies:
+      is-odd: 3.0.1
+
+  packages/app:
+    specifiers:
+      lodash: ^4.17.21
+    dependencies:
+      lodash: 4.17.21
+
+packages:
+
+  /is-odd/3.0.1:
+    resolution: {integrity: sha512-xxx}
+    dev: false
+
+  /lodash/4.17.21:
+    resolution: {integrity: sha512-yyy}
+    dev: false
+`
+	got := mustExpand(t, "pnpm-lock.yaml", packagemanager.ManifestKindPnpmLockYAML, lock)
+	requireContains(t, got, intel.EcosystemNPM, "is-odd", "3.0.1")
+	requireContains(t, got, intel.EcosystemNPM, "lodash", "4.17.21")
+}
+
+// TestExpandPnpmLockV6Importers confirms the v6 {specifier, version}
+// mapping form still parses through the dual-shape UnmarshalYAML. This
+// file has no `packages` section, so it exercises the importers fallback
+// (the mapping branch) directly.
+func TestExpandPnpmLockV6Importers(t *testing.T) {
+	const lock = `lockfileVersion: '6.0'
+
+importers:
+
+  .:
+    dependencies:
+      is-odd:
+        specifier: ^3.0.1
+        version: 3.0.1
+`
+	got := mustExpand(t, "pnpm-lock.yaml", packagemanager.ManifestKindPnpmLockYAML, lock)
+	requireContains(t, got, intel.EcosystemNPM, "is-odd", "3.0.1")
+}
+
 func mustExpand(t *testing.T, name string, kind packagemanager.ManifestKind, contents string) []packagemanager.Install {
 	t.Helper()
 	dir := t.TempDir()
