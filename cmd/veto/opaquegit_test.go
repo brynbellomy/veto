@@ -36,6 +36,11 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 	cmd.Env = append(os.Environ(),
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
 		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		// Ignore the host's global/system git config so the test stays
+		// hermetic. Without this a developer with commit.gpgsign=true (e.g.
+		// an SSH/FIDO2 signing key) fails `git commit` in these temp repos.
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_SYSTEM="+os.DevNull,
 	)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "git %v: %s", args, out)

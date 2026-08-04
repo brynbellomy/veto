@@ -560,8 +560,8 @@ func TestPrintResults_NAMarkerRendered(t *testing.T) {
 
 func TestIsSIPProtectedPath(t *testing.T) {
 	cases := []struct {
-		path     string
-		wantSIP  bool
+		path    string
+		wantSIP bool
 	}{
 		// Canonical SIP roots — binaries inside them are SIP-protected.
 		{"/usr/bin/pip3", true},
@@ -671,6 +671,55 @@ func TestSIPPathIsNotApplicableInWrapperSurvey(t *testing.T) {
 	require.False(t, isSIPProtectedPath(pmPath))
 }
 
+// TestCheckWrappers_SelfReferentialAnchorFails is the doctor half of the
+// 2026-07-08 incident regression: after the anchor was clobbered, doctor
+// reported "0 failures" because it only checked that `.veto-original`
+// EXISTS (os.Stat follows the symlink to the still-present veto binary),
+// not that it resolves to a real, non-veto binary. A `.veto-original`
+// that itself points at veto is a veto→veto exec loop; doctor must FAIL
+// it loudly instead of passing it.
+func TestCheckWrappers_SelfReferentialAnchorFails(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("#!/bin/sh\n# veto\n"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	bin := filepath.Join(tmp, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	// The corrupted on-disk shape: go → veto AND go.veto-original → veto.
+	goBin := filepath.Join(bin, "go")
+	require.NoError(t, os.Symlink(vetoBin, goBin))
+	require.NoError(t, os.Symlink(vetoBin, goBin+wrapperSuffix))
+
+	cfg := config{CacheDir: cacheDir}
+	require.NoError(t, saveWrapperState(cfg, wrapperState{Wrappers: []wrapperEntry{{
+		Path:         goBin,
+		OriginalPath: goBin + wrapperSuffix,
+		PM:           "go",
+		Source:       "homebrew",
+	}}}))
+
+	t.Setenv("HOME", tmp)
+	t.Setenv("PATH", bin)
+
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	var found *checkResult
+	for i := range results {
+		if results[i].label == "wrapper:go" && results[i].status == statusFail &&
+			strings.Contains(results[i].detail, "self-referential") {
+			found = &results[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "expected a FAIL for the self-referential go anchor; got %+v", results)
+	require.Contains(t, found.howToFix, "install-wrappers")
+}
+
 // TestCheckStaleShimSiblings_FlagsPlanted plants the on-disk shape behind
 // the veto-dzk bead (self-referential `*.veto-original` symlinks in
 // ~/.local/bin) and asserts doctor returns one FAIL row per stale entry,
@@ -753,4 +802,361 @@ func TestCheckStaleShimSiblings_AfterScrubPasses(t *testing.T) {
 	// Doctor reports clean AFTER scrub.
 	post := checkStaleShimSiblings(shimDir)
 	require.Empty(t, post)
+}
+
+// TestCheckWrappers_DiscoveredOrphanedWrapperFails is the regression
+// guard for the fabricated-anchor bug (2026-07-24 incident, live
+// /usr/local/bin/npm case): the Phase-2 host survey PASSed any
+// discovered veto-pointing symlink with a detail string "original at
+// <path>.veto-original" WITHOUT ever stat-ing that anchor. An orphaned
+// wrapper — veto symlink on disk, anchor pruned, path not in
+// wrappers.json — surveyed all-green while the real binary was
+// unreachable. Doctor must FAIL it, matching install-wrappers'
+// orphaned-wrapper refusal.
+func TestCheckWrappers_DiscoveredOrphanedWrapperFails(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	// The live shape: npm -> veto, NO .veto-original anchor, and no
+	// wrappers.json entry covering it.
+	bin := filepath.Join(tmp, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	npm := filepath.Join(bin, "npm")
+	require.NoError(t, os.Symlink(vetoBin, npm))
+	t.Setenv("PATH", bin)
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	r := findResult(t, results, "wrapper:npm", "orphaned wrapper")
+	require.Equal(t, statusFail, r.status, "discovered veto symlink with no anchor must FAIL, not PASS")
+	require.Contains(t, r.detail, npm)
+	require.Contains(t, r.detail, "real binary unreachable")
+	require.Contains(t, r.howToFix, "install-wrappers")
+
+	// And no fabricated PASS row for the same path.
+	for _, res := range results {
+		if res.label == "wrapper:npm" && res.status == statusPass {
+			t.Fatalf("fabricated PASS for orphaned wrapper: %+v", res)
+		}
+	}
+}
+
+// TestCheckWrappers_DiscoveredSelfReferentialAnchorFails is the Phase-2
+// (discovered, non-state) mirror of
+// TestCheckWrappers_SelfReferentialAnchorFails: an anchor that itself
+// resolves to veto means the real binary is lost and exec'ing through
+// the wrapper loops veto into itself. The survey used to PASS it
+// because it never classified the anchor.
+func TestCheckWrappers_DiscoveredSelfReferentialAnchorFails(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	bin := filepath.Join(tmp, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	npm := filepath.Join(bin, "npm")
+	require.NoError(t, os.Symlink(vetoBin, npm))
+	require.NoError(t, os.Symlink(vetoBin, npm+wrapperSuffix))
+	t.Setenv("PATH", bin)
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	r := findResult(t, results, "wrapper:npm", "orphaned wrapper")
+	require.Equal(t, statusFail, r.status, "self-referential discovered anchor must FAIL, not PASS")
+}
+
+// TestCheckWrappers_SurveySkipsShimDirPaths enforces territory parity:
+// the Layer-4 host survey must not report on paths inside the Layer-2
+// shim dir at all. Before the fix it emitted BOTH lies for shim-dir
+// entries: a PASS with a fabricated "original at ...veto-original"
+// detail for a healthy shim (which has no such anchor), and a WARN
+// advising `veto install-wrappers` for a displaced shim — advice
+// install-wrappers refuses to follow (territory guard). The dedicated
+// shim:<pm> checks own that directory.
+func TestCheckWrappers_SurveySkipsShimDirPaths(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	// A healthy Layer-2 shim (uv -> veto, no anchor — shims never have
+	// one) inside the default shim dir, which is on PATH.
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(vetoBin, uv))
+	t.Setenv("PATH", shimDir)
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	for _, r := range results {
+		require.NotContains(t, r.detail, uv,
+			"Layer-4 survey must not report on shim-dir paths; got %+v", r)
+	}
+	// The truthful Layer-4 verdict for a PM that only exists as a shim
+	// is N/A ("no absolute-path install").
+	r := findResult(t, results, "wrapper:uv", "no absolute-path install")
+	require.Equal(t, statusNotApplicable, r.status)
+}
+
+// TestCheckShimDir_NotASymlinkFixSuggestsForceDisplacement: the
+// "exists but is not a symlink" FAIL used to advise moving the real
+// file aside by hand. Now that findRealBinary resolves
+// `.veto-displaced` siblings, `veto install-shims --force` is safe and
+// sufficient — the howToFix must say so and explain the displacement.
+func TestCheckShimDir_NotASymlinkFixSuggestsForceDisplacement(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	t.Setenv("PATH", shimDir)
+
+	// uv self-installed a real binary at the shim path.
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.WriteFile(uv, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	results := checkShimDir()
+	r := findResult(t, results, "shim:uv", "not a symlink")
+	require.Equal(t, statusFail, r.status)
+	require.Contains(t, r.howToFix, "veto install-shims --force")
+	require.Contains(t, r.howToFix, ".veto-displaced")
+}
+
+// TestCheckShimDir_SelfReferentialDisplacedSiblingFails: a healthy shim
+// symlink whose `.veto-displaced` sibling resolves back to veto means
+// the real binary is LOST — the same class of lie as a
+// self-referential `.veto-original` anchor. Doctor must FAIL loudly
+// instead of PASSing the shim.
+func TestCheckShimDir_SelfReferentialDisplacedSiblingFails(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	t.Setenv("PATH", shimDir)
+
+	// Healthy-looking shim: target string contains "veto" (the check's
+	// identity heuristic).
+	fakeVeto := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(fakeVeto, []byte("#!/bin/sh\n"), 0o755))
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(fakeVeto, uv))
+
+	// Displaced sibling chains back into the RUNNING veto (the test
+	// binary stands in for it, same trick as the resolver tests).
+	self, err := os.Executable()
+	require.NoError(t, err)
+	require.NoError(t, os.Symlink(self, uv+".veto-displaced"))
+
+	results := checkShimDir()
+	r := findResult(t, results, "shim:uv", "veto-displaced")
+	require.Equal(t, statusFail, r.status, "self-referential displaced sibling must FAIL")
+	require.Contains(t, r.detail, "resolves back to the veto binary")
+}
+
+// TestCheckShimDir_NonExecutableDisplacedSiblingFails: a displaced
+// original that is no longer executable cannot be resolved by
+// findRealBinary — the shim would gate and then fail to delegate.
+func TestCheckShimDir_NonExecutableDisplacedSiblingFails(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	t.Setenv("PATH", shimDir)
+
+	fakeVeto := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(fakeVeto, []byte("#!/bin/sh\n"), 0o755))
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(fakeVeto, uv))
+	require.NoError(t, os.WriteFile(uv+".veto-displaced", []byte("data"), 0o644))
+
+	results := checkShimDir()
+	r := findResult(t, results, "shim:uv", "veto-displaced")
+	require.Equal(t, statusFail, r.status, "non-executable displaced sibling must FAIL")
+}
+
+// TestCheckShimDir_HealthyDisplacedSiblingPasses: displacement is a
+// legitimate steady state now that the resolver honors it — a healthy
+// shim with a healthy displaced original must PASS, and the PASS row
+// should surface the displacement so the user knows where the real
+// binary lives.
+func TestCheckShimDir_HealthyDisplacedSiblingPasses(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	shimDir := filepath.Join(tmp, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+	t.Setenv("PATH", shimDir)
+
+	fakeVeto := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(fakeVeto, []byte("#!/bin/sh\n"), 0o755))
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(fakeVeto, uv))
+	require.NoError(t, os.WriteFile(uv+".veto-displaced", []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	results := checkShimDir()
+	r := findResult(t, results, "shim:uv", "veto-displaced")
+	require.Equal(t, statusPass, r.status, "healthy displaced sibling must not fail the shim; got %+v", r)
+}
+
+// TestCheckWrappers_AliasIntoWrappedSibling_PyenvRelativeShape pins the
+// false positive the 2026-07-24 live doctor run surfaced after the
+// discovered-anchor verification landed: pyenv's `python ->
+// python3.10` (a RELATIVE same-dir symlink) resolves through its
+// wrapped sibling to veto, so ClassifySymlink says ours — but the
+// alias has no `.veto-original` of its own BY DESIGN. Discovery
+// deliberately keeps such aliases plain (aliasInheritsSiblingWrap,
+// install_wrappers.go) and the resolver follows them via
+// findWrappedOriginalViaChain. Doctor must PASS the alias row, not
+// flag it as an orphaned wrapper.
+func TestCheckWrappers_AliasIntoWrappedSibling_PyenvRelativeShape(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+	emptyBin := filepath.Join(tmp, "emptybin")
+	require.NoError(t, os.MkdirAll(emptyBin, 0o755))
+	t.Setenv("PATH", emptyBin)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	// The live pyenv layout: python3.10 is wrapped with a healthy
+	// anchor; python is a plain RELATIVE alias into it.
+	bin := filepath.Join(tmp, ".pyenv", "versions", "3.10.14", "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	py310 := filepath.Join(bin, "python3.10")
+	require.NoError(t, os.Symlink(vetoBin, py310))
+	require.NoError(t, os.WriteFile(py310+wrapperSuffix, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	python := filepath.Join(bin, "python")
+	require.NoError(t, os.Symlink("python3.10", python))
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	r := findResult(t, results, "wrapper:python", "plain alias")
+	require.Equal(t, statusPass, r.status, "pyenv alias into wrapped sibling must PASS; got %+v", r)
+	require.Contains(t, r.detail, python)
+	require.Contains(t, r.detail, py310, "detail should name the wrapped sibling the alias inherits from")
+	for _, res := range results {
+		if res.status == statusFail && strings.Contains(res.detail, python) {
+			t.Fatalf("alias falsely flagged as orphaned wrapper: %+v", res)
+		}
+	}
+}
+
+// TestCheckWrappers_AliasIntoWrappedSibling_BunxAbsoluteShape is the
+// ABSOLUTE-target variant of the same false positive (`~/.bun/bin/bunx
+// -> /abs/path/.bun/bin/bun`, live shape from the 2026-07-24 doctor
+// run). Both alias shapes must PASS; the wrapped sibling keeps its own
+// independently-verified row.
+func TestCheckWrappers_AliasIntoWrappedSibling_BunxAbsoluteShape(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+	emptyBin := filepath.Join(tmp, "emptybin")
+	require.NoError(t, os.MkdirAll(emptyBin, 0o755))
+	t.Setenv("PATH", emptyBin)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	bunDir := filepath.Join(tmp, ".bun", "bin")
+	require.NoError(t, os.MkdirAll(bunDir, 0o755))
+	bun := filepath.Join(bunDir, "bun")
+	require.NoError(t, os.Symlink(vetoBin, bun))
+	require.NoError(t, os.WriteFile(bun+wrapperSuffix, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	bunx := filepath.Join(bunDir, "bunx")
+	require.NoError(t, os.Symlink(bun, bunx)) // absolute target
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	r := findResult(t, results, "wrapper:bunx", "plain alias")
+	require.Equal(t, statusPass, r.status, "bunx alias into wrapped bun must PASS; got %+v", r)
+	require.Contains(t, r.detail, bunx)
+
+	// The wrapped sibling still gets its own healthy row.
+	sibling := findResult(t, results, "wrapper:bun", "wrapped, original at")
+	require.Equal(t, statusPass, sibling.status)
+
+	for _, res := range results {
+		if res.status == statusFail && strings.Contains(res.detail, bunx) {
+			t.Fatalf("alias falsely flagged as orphaned wrapper: %+v", res)
+		}
+	}
+}
+
+// TestCheckWrappers_AliasIntoOrphanedSibling_SiblingOwnsTheFailRow: when
+// the SIBLING behind an alias is orphaned (bun -> veto, anchor gone),
+// the defect belongs to the sibling's row — doctor must FAIL wrapper:bun
+// and must NOT duplicate the orphan FAIL onto the alias row. One
+// defect, one row: the alias is not independently repairable (it has no
+// anchor by design), and N alias FAILs for one broken anchor would send
+// the user chasing paths they must not touch.
+func TestCheckWrappers_AliasIntoOrphanedSibling_SiblingOwnsTheFailRow(t *testing.T) {
+	tmp := t.TempDir()
+	cacheDir := filepath.Join(tmp, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
+	t.Setenv("HOME", tmp)
+	emptyBin := filepath.Join(tmp, "emptybin")
+	require.NoError(t, os.MkdirAll(emptyBin, 0o755))
+	t.Setenv("PATH", emptyBin)
+
+	vetoBin := filepath.Join(tmp, "veto")
+	require.NoError(t, os.WriteFile(vetoBin, []byte("veto"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(vetoBin)
+	require.NoError(t, err)
+
+	bunDir := filepath.Join(tmp, ".bun", "bin")
+	require.NoError(t, os.MkdirAll(bunDir, 0o755))
+	bun := filepath.Join(bunDir, "bun")
+	require.NoError(t, os.Symlink(vetoBin, bun)) // orphaned: no anchor
+	bunx := filepath.Join(bunDir, "bunx")
+	require.NoError(t, os.Symlink(bun, bunx))
+
+	cfg := config{CacheDir: cacheDir}
+	results := checkWrappersWith(cfg, vetoID, nil)
+
+	// The sibling's own row carries the orphan FAIL.
+	r := findResult(t, results, "wrapper:bun", "orphaned wrapper")
+	require.Equal(t, statusFail, r.status)
+	require.Contains(t, r.detail, bun)
+
+	// No FAIL row for the alias path.
+	for _, res := range results {
+		if res.status == statusFail && strings.Contains(res.detail, bunx) {
+			t.Fatalf("orphan FAIL duplicated onto the alias row: %+v", res)
+		}
+	}
 }

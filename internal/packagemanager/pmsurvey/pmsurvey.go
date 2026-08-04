@@ -55,6 +55,29 @@ func IsShimDir(dir string) bool {
 	return false
 }
 
+// SystemBinDirsEnv overrides the hardcoded SYSTEM bin-dir prefixes
+// (/opt/homebrew/bin, /usr/local/bin) with an explicit colon-separated
+// list; an empty value means "no system prefixes". It exists for test
+// isolation: those prefixes are absolute paths independent of $HOME, so a
+// test exercising wrapper discovery would otherwise walk — and
+// install-wrappers would MUTATE — the real /opt/homebrew/bin on the
+// developer's machine, breaking it. Tests set this (usually to "") so
+// discovery sees only their temp $HOME-derived fixtures. Advanced users
+// may also point veto at a non-standard prefix. The $HOME-derived
+// version-manager dirs (mise/asdf/pyenv/nvm/bun/cargo) are unaffected — a
+// test that sets $HOME to a temp dir already confines those.
+const SystemBinDirsEnv = "VETO_SYSTEM_BIN_DIRS"
+
+// systemBinDirs returns the hardcoded system prefixes, honoring the
+// SystemBinDirsEnv override. LookupEnv distinguishes set-to-empty (no
+// system dirs) from unset (the real defaults).
+func systemBinDirs() []string {
+	if v, ok := os.LookupEnv(SystemBinDirsEnv); ok {
+		return filepath.SplitList(v)
+	}
+	return []string{"/opt/homebrew/bin", "/usr/local/bin"}
+}
+
 // WellKnownBinDirs returns every bin-dir pattern on this host where a
 // system or version-manager-installed PM could live: the homebrew
 // prefixes plus mise/asdf install bin dirs (one per installed
@@ -64,8 +87,10 @@ func IsShimDir(dir string) bool {
 // Patterns that depend on $HOME silently return empty when $HOME is
 // unset; callers fall back to whatever WellKnownBinDirs returned plus
 // $PATH discovery (PathsFor handles this).
+//
+// VETO_SYSTEM_BIN_DIRS overrides the system prefixes — see SystemBinDirsEnv.
 func WellKnownBinDirs() []string {
-	out := []string{"/opt/homebrew/bin", "/usr/local/bin"}
+	out := systemBinDirs()
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return out

@@ -712,6 +712,14 @@ these):
   a sibling whose parent path isn't a registered wrapper. A same-UID
   attacker dropping `~/.local/bin/npm.veto-original` cannot convert
   one tricked install into permanent gate-defeat.
+- **Layer 2 `.veto-displaced` provenance**: when `install-shims --force`
+  displaces a real binary that occupied a shim path (uv self-installs
+  into `~/.local/bin/uv`), the displaced original is resolvable at exec
+  time — but ONLY from inside the shim dir, veto's exclusive Layer 2
+  territory. A `<pm>.veto-displaced` planted next to any other
+  veto-pointing PATH entry is ignored, and a displaced file that
+  resolves back into veto is skipped (fail closed) rather than exec'd
+  into a loop.
 - **Etag persistence**: each feed source writes the upstream etag
   ONLY after the body parses successfully. A transient malformed
   payload doesn't poison the cache — the next refresh re-downloads
@@ -736,6 +744,9 @@ these):
   `SKIP /usr/bin/<pm> — read-only filesystem (SIP-protected)` line
   for these paths and exits 0 (a previous version reported them as
   `FAIL`, aborting `install-all` even though no remediation exists).
+  SIP-ness is classified by path, not just errno, so the end-of-run
+  "needs sudo" hint never suggests `sudo veto install-wrappers --dir
+  /usr/bin …` — sudo cannot bypass SIP.
 - **Per-python-invocation cost** (intentional). Layer 4 now wraps
   every canonical `python` / `python3` / `python3.X` binary on disk
   — including uv's `~/.local/share/uv/python/cpython-*/bin/*` store
@@ -756,7 +767,14 @@ these):
 - **Toolchain upgrades wiping Layer 4 wrappers**. `brew upgrade node`
   re-installs the real npm binary on top of our symlink. `veto
   doctor` flags this; re-run `veto install-wrappers --force` after
-  upgrades.
+  upgrades. If `brew cleanup` then prunes the now-dead `.veto-original`
+  anchor (it removes dead symlinks under the prefix once an upgrade drops
+  the old keg), the wrapper is *orphaned* — `<pm>` still points at veto
+  but the real-binary pointer is gone. `install-wrappers` refuses to
+  re-wrap an orphaned path — renaming the veto symlink onto
+  `.veto-original` would only create a veto→veto exec loop — and `veto
+  doctor` FAILs it. Restore the real binary first (`brew unlink <pkg> &&
+  brew link --overwrite <pkg>`), then re-run `veto install-wrappers`.
 - **Compromised upstream returning near-empty feeds**. The 1000-report
   floor catches the worst case (literally empty), but a feed that
   omits most malware while still returning hundreds of entries could
@@ -780,14 +798,23 @@ Run `veto doctor` in a fresh terminal. It checks:
 - The shim directory is on PATH, and each PM shim wins the PATH
   lookup (no mise/homebrew binary shadowing it earlier). If a mise
   shadow is detected, the `veto install-shell` fix
-  appears inline in the output.
+  appears inline in the output. Shims that displaced a real binary
+  (`<pm>.veto-displaced`) are validated too: the displaced original
+  must be executable and must not resolve back into veto (a lost real
+  binary FAILs loudly instead of passing as a healthy shim).
 - The Claude Code Bash hook is wired in `~/.claude/settings.json`.
 - Agent posture beyond Claude: Codex shell PATH policy, the current
   project's Cursor veto rule, and Sirene's launch PATH where inspectable.
 - The native interposer env vars are exported and the library file
   exists.
-- Layer 4 wrappers — every recorded wrapper still points at veto
-  and its `.veto-original` sibling is intact.
+- Layer 4 wrappers — every recorded wrapper still points at veto,
+  its `.veto-original` sibling is intact, and that sibling resolves to a
+  real binary rather than back to veto (a self-referential anchor is a
+  veto→veto exec loop and FAILs). Discovered veto-pointing symlinks that
+  wrappers.json does NOT cover get the same anchor verification —
+  symlink direction alone is never trusted, so an orphaned wrapper
+  (anchor pruned, real binary unreachable) FAILs instead of surveying
+  green.
 - The intel store is above the 1000-report sanity floor and was
   refreshed in the last 24 hours.
 

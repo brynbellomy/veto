@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -67,6 +68,34 @@ func isReadOnlyFS(err error) bool {
 // purpose — a colleague who finds it during debugging needs to see
 // what made it instead of guessing.
 const wrapperSuffix = ".veto-original"
+
+// classifyWriteSkip maps a failed filesystem mutation on a wrap
+// candidate to its skip category, or ok=false when the error is a
+// genuine failure the caller must surface.
+//
+// EROFS is always the read-only-FS category. Permission errors are
+// split on SIP-ness: an unprivileged write under a SIP root
+// (/usr/bin, /usr/sbin, ...) fails with EPERM/EACCES — the access
+// check rejects the caller before the kernel ever reports EROFS — so
+// the errno alone under-classifies the path as "unwritable, needs
+// sudo". That category drives the end-of-run `sudo veto
+// install-wrappers --dir /usr/bin ...` epilogue, which for a SIP dir
+// is a lie: SIP blocks root too (isSIPProtectedPath, doctor.go, is the
+// same knowledge doctor uses to render these paths N/A). Consult it
+// before conceding the sudo hint so SIP candidates land in the
+// read-only-FS category, whose messaging is honest about the limit.
+func classifyWriteSkip(path string, err error) (wrapAction, bool) {
+	if isReadOnlyFS(err) {
+		return wrapperActionSkipReadOnlyFS, true
+	}
+	if !os.IsPermission(err) {
+		return 0, false
+	}
+	if isSIPProtectedPath(path) {
+		return wrapperActionSkipReadOnlyFS, true
+	}
+	return wrapperActionSkipUnwritable, true
+}
 
 // stateFileName is the JSON registry of every wrapper veto has
 // installed. Kept alongside the intel cache so a single
@@ -585,6 +614,68 @@ type wrapCandidate struct {
 	target string                  // resolved symlink target when class != ClassReal; "" otherwise
 }
 
+// isWrapTargetName reports whether basename is a package-manager binary
+// veto wraps directly — either a static wrapped-manager name or a
+// versioned python (python3.X). Used by aliasInheritsSiblingWrap to
+// decide whether an alias symlink's target is itself a wrap target.
+func isWrapTargetName(basename string) bool {
+	return slices.Contains(wrappedManagers, basename) || pmlist.IsVersionedPython(basename)
+}
+
+// aliasInheritsSiblingWrap reports whether candidatePath is an alias that
+// must NOT be wrapped independently because it is a symlink to a SAME-DIR
+// sibling that is itself a wrap target (e.g. pyenv `python -> python3.10`,
+// `bunx -> bun`). Wrapping such an alias moves the alias symlink aside as
+// its `.veto-original` anchor, which then points at the already-wrapped
+// sibling and resolves back to veto — a self-referential anchor that
+// mis-resolves (wrong interpreter) or loops at runtime. The alias inherits
+// the wrap for free via the chain `alias -> target -> veto`, so leaving it
+// a plain symlink is both correct and cheaper.
+//
+// This generalizes the uv-canonical-store guard in pmsurvey.PathsFor —
+// which only excludes python/python3 aliases inside the uv cpython store —
+// to every discovery dir. That narrow gating was the root cause of the
+// pyenv/bun nested-anchor corruption surfaced 2026-07-08.
+//
+// Only SAME-directory aliases are excluded. A symlink whose target lives
+// in a different dir (e.g. /opt/homebrew/bin/python3 -> ../Cellar/.../
+// python3.14) is a distinct layout: the target is not independently
+// wrapped at that path, so the alias remains a legitimate wrap candidate.
+func aliasInheritsSiblingWrap(candidatePath string) bool {
+	_, ok := aliasSiblingWrapTarget(candidatePath)
+	return ok
+}
+
+// aliasSiblingWrapTarget returns the SAME-DIR wrap-target sibling that
+// candidatePath is a plain alias for, or ("", false) when candidatePath
+// is not such an alias. This is the shape test behind
+// aliasInheritsSiblingWrap; it additionally exposes the resolved
+// sibling path because doctor's host survey names it in the alias PASS
+// row. One symlink hop only, relative or absolute — the pyenv
+// `python -> python3.10` and bun `bunx -> /abs/dir/bun` layouts both
+// reduce to a cleaned same-dir target.
+func aliasSiblingWrapTarget(candidatePath string) (string, bool) {
+	fi, err := os.Lstat(candidatePath)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return "", false
+	}
+	target, err := os.Readlink(candidatePath)
+	if err != nil {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(candidatePath), target)
+	}
+	target = filepath.Clean(target)
+	if filepath.Dir(target) != filepath.Dir(filepath.Clean(candidatePath)) {
+		return "", false
+	}
+	if !isWrapTargetName(filepath.Base(target)) {
+		return "", false
+	}
+	return target, true
+}
+
 // discoverWrapCandidates walks the well-known install-dir patterns
 // AND $PATH looking for files whose basename matches one of
 // wrappedManagers. Thin shim over discoverWrapCandidatesWith; tests use
@@ -621,24 +712,25 @@ func discoverWrapCandidatesWith(opts wrapperFlags, id *pmsurvey.VetoIdentity) ([
 	}
 
 	// Defense in depth: refuse to enroll any candidate whose path lies
-	// inside the Layer 2 shim dir. Layer 2 and Layer 4 must not share
-	// territory; if a previous install-wrappers version walked $PATH and
-	// scooped up shim-dir entries (the bug that broke veto-dzk recovery),
-	// this guard prevents the regression even before install-shims
-	// reconciles the registry.
-	shimDirCanonical := filepath.Clean(defaultShimDir())
-	shimPrefix := shimDirCanonical + string(filepath.Separator)
-	inShimDir := func(p string) bool {
-		clean := filepath.Clean(p)
-		return strings.HasPrefix(clean, shimPrefix) || clean == shimDirCanonical
-	}
-
+	// inside the Layer 2 shim dir (inShimDir, shims.go — the shared
+	// territory test doctor's survey and findRealBinary also apply).
+	// Layer 2 and Layer 4 must not share territory; if a previous
+	// install-wrappers version walked $PATH and scooped up shim-dir
+	// entries (the bug that broke veto-dzk recovery), this guard
+	// prevents the regression even before install-shims reconciles the
+	// registry.
 	seen := map[string]struct{}{}
 	add := func(c wrapCandidate) {
 		if _, dup := seen[c.path]; dup {
 			return
 		}
 		if inShimDir(c.path) {
+			return
+		}
+		// Never wrap an alias that inherits a same-dir sibling's wrap
+		// (e.g. `python -> python3.10`, `bunx -> bun`). Wrapping it would
+		// manufacture a self-referential `.veto-original` anchor.
+		if aliasInheritsSiblingWrap(c.path) {
 			return
 		}
 		seen[c.path] = struct{}{}
@@ -799,6 +891,24 @@ func isWrappableTarget(p, vetoPath string) bool {
 	return info.Mode()&0o111 != 0
 }
 
+// orphanedWrapErr builds the error applyWrapper returns when a wrap
+// candidate already resolves to the veto binary but its `.veto-original`
+// real-binary anchor is gone. veto cannot reconstruct where the real
+// binary lived — that pointer existed only in the now-missing sibling —
+// so wrapping would rename the veto symlink onto `.veto-original` and
+// create a veto→veto exec loop with nothing to delegate to. The only
+// safe move is to refuse and tell the user how to restore the real
+// binary. Root cause of the 2026-07-08 incident: `brew cleanup` pruned
+// the dead anchor after an upgrade removed the old keg, then an
+// `install-wrappers --force` re-wrap ran on the orphaned symlink.
+func orphanedWrapErr(path string) error {
+	anchor := path + wrapperSuffix
+	return errors.WithNew("orphaned wrapper: path already points at the veto binary but its .veto-original real-binary anchor is missing; refusing to wrap (would create a veto→veto exec loop)").
+		Set("path", path,
+			"missing_anchor", anchor,
+			"fix", "restore the real binary (reinstall the toolchain, e.g. `brew unlink <pkg> && brew link --overwrite <pkg>`, or recreate "+anchor+" pointing at it), then re-run `veto install-wrappers`")
+}
+
 // applyWrapper does the rename + symlink dance for one candidate.
 // Idempotent against already-installed wrappers (returns
 // wrapperActionSkipAlreadyOurs); refuses to clobber an existing
@@ -854,11 +964,18 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 		// `.veto-original` sibling exists, this is the canonical
 		// "already-ours" state — early-return as a skip so the wrap-loop
 		// below does not race to rename a symlink onto an existing
-		// sibling. If the sibling is missing, fall through to the
-		// regular wrap path which handles the broken-state case.
+		// sibling.
 		if _, err := os.Lstat(c.path + wrapperSuffix); err == nil {
 			return wrapperActionSkipAlreadyOurs, nil
 		}
+		// Sibling missing while c.path already resolves to veto: the
+		// real-binary anchor is gone (e.g. `brew cleanup` pruned the
+		// dead `.veto-original` after an upgrade removed the old keg).
+		// The prior code fell through to the regular wrap path, which
+		// renamed this veto symlink onto `.veto-original` — manufacturing
+		// a self-referential anchor and a veto→veto exec loop with the
+		// real binary permanently lost. Refuse instead.
+		return wrapperActionWrapped, orphanedWrapErr(c.path)
 	}
 
 	original := c.path + wrapperSuffix
@@ -905,20 +1022,14 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 				return wrapperActionSkipDryRun, nil
 			}
 			if err := os.Remove(c.path); err != nil {
-				if isReadOnlyFS(err) {
-					return wrapperActionSkipReadOnlyFS, nil
-				}
-				if os.IsPermission(err) {
-					return wrapperActionSkipUnwritable, nil
+				if action, ok := classifyWriteSkip(c.path, err); ok {
+					return action, nil
 				}
 				return wrapperActionWrapped, errors.With(err, "remove existing symlink for safe relink").Set("path", c.path)
 			}
 			if err := os.Symlink(vetoPath, c.path); err != nil {
-				if isReadOnlyFS(err) {
-					return wrapperActionSkipReadOnlyFS, nil
-				}
-				if os.IsPermission(err) {
-					return wrapperActionSkipUnwritable, nil
+				if action, ok := classifyWriteSkip(c.path, err); ok {
+					return action, nil
 				}
 				return wrapperActionWrapped, errors.With(err, "recreate veto symlink").Set("path", c.path)
 			}
@@ -937,23 +1048,35 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 			Set("path", original)
 	}
 
+	// Belt-and-suspenders against the self-referential-anchor footgun (see
+	// orphanedWrapErr and the ClassOurs* branch above). If we reach the
+	// rename with c.path STILL resolving to the veto binary, the re-classify
+	// pass didn't run (nil vetoID) or was degraded. Renaming a veto symlink
+	// onto `.veto-original` would create a veto→veto exec loop with no real
+	// binary to delegate to. This guard is the last line of defense directly
+	// in front of the destructive rename: it sits AFTER the `.veto-original`
+	// existence checks (a populated anchor is handled by the safe-relink
+	// guard) and BEFORE dry-run reporting, so a dry run also surfaces the
+	// orphan instead of falsely reporting "would wrap".
+	if pointsAtVeto(c.path, vetoPath) {
+		return wrapperActionWrapped, orphanedWrapErr(c.path)
+	}
+
 	if dryRun {
 		return wrapperActionSkipDryRun, nil
 	}
 
-	// 1) Move the real binary aside. EROFS (read-only filesystem,
-	// typically SIP-protected dirs like /usr/bin on macOS) and permission
-	// errors are both environmental — classify them as skips (not
-	// failures) so install-all keeps going. The two cases route to
-	// different actions because sudo helps with one (permission) but not
-	// the other (SIP). Check raw os errors: os.IsPermission and
-	// stderrors.Is do not see through errors.With wrappers.
+	// 1) Move the real binary aside. EROFS (read-only filesystem) and
+	// permission errors are both environmental — classify them as skips
+	// (not failures) so install-all keeps going. classifyWriteSkip routes
+	// the two categories: sudo helps with a plain unwritable dir but not
+	// with SIP (which surfaces as EPERM for unprivileged callers and
+	// EROFS for root — both must land in the no-sudo-hint category).
+	// Check raw os errors: os.IsPermission and stderrors.Is do not see
+	// through errors.With wrappers.
 	if err := os.Rename(c.path, original); err != nil {
-		if isReadOnlyFS(err) {
-			return wrapperActionSkipReadOnlyFS, nil
-		}
-		if os.IsPermission(err) {
-			return wrapperActionSkipUnwritable, nil
+		if action, ok := classifyWriteSkip(c.path, err); ok {
+			return action, nil
 		}
 		return wrapperActionWrapped, errors.With(err, "rename real binary aside").Set("from", c.path, "to", original)
 	}
@@ -962,11 +1085,8 @@ func applyWrapper(c wrapCandidate, vetoPath string, vetoID *pmsurvey.VetoIdentit
 		// Best-effort rollback so we don't strand the user with a
 		// PM that's invisible.
 		_ = os.Rename(original, c.path)
-		if isReadOnlyFS(err) {
-			return wrapperActionSkipReadOnlyFS, nil
-		}
-		if os.IsPermission(err) {
-			return wrapperActionSkipUnwritable, nil
+		if action, ok := classifyWriteSkip(c.path, err); ok {
+			return action, nil
 		}
 		return wrapperActionWrapped, errors.With(err, "create veto symlink").Set("path", c.path)
 	}

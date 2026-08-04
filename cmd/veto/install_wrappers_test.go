@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 
@@ -226,6 +227,118 @@ func TestApplyWrapper_NoForceOnForeignVeto_SkipsAndDoesNotMutate(t *testing.T) {
 	require.Equal(t, realContent, body)
 }
 
+// TestApplyWrapper_OrphanedVetoSymlink_RefusesToSelfReference is the
+// regression guard for the 2026-07-08 brew-upgrade incident: a `brew
+// upgrade` of a wrapped formula (go, python@3.13) followed by `brew
+// cleanup` deletes the old keg AND prunes the now-dead `.veto-original`
+// symlink, leaving `<path> → veto` with NO real-binary anchor. The next
+// `install-wrappers --force` used to rename that veto symlink onto
+// `<path>.veto-original`, so BOTH `<path>` and `<path>.veto-original`
+// pointed at veto — a veto→veto exec loop with the real binary lost.
+// applyWrapper must instead refuse loudly and never manufacture a
+// self-referential anchor. Covers the classified path (vetoID provided,
+// re-classify sees ClassOurs*).
+func TestApplyWrapper_OrphanedVetoSymlink_RefusesToSelfReference(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n# veto\n"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// go already wrapped, but the `.veto-original` anchor is GONE.
+	goBin := filepath.Join(dir, "go")
+	require.NoError(t, os.Symlink(veto, goBin))
+
+	c := wrapCandidate{path: goBin, pm: "go", source: "homebrew"}
+
+	// Without --force: refuse.
+	_, err = applyWrapper(c, veto, vetoID, false, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "orphaned")
+	// No self-referential anchor was manufactured.
+	_, lerr := os.Lstat(goBin + wrapperSuffix)
+	require.Error(t, lerr, "must not create a .veto-original anchor when refusing")
+
+	// With --force: still refuse. --force must not corrupt either.
+	_, err = applyWrapper(c, veto, vetoID, false, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "orphaned")
+	_, lerr = os.Lstat(goBin + wrapperSuffix)
+	require.Error(t, lerr, "--force must not create a self-referential anchor")
+}
+
+// TestApplyWrapper_OrphanedVetoSymlink_GuardsRenameWithoutIdentity pins the
+// belt-and-suspenders guard sitting directly in front of the destructive
+// rename: even when no VetoIdentity is available to re-classify (nil
+// vetoID, e.g. older callers), applyWrapper must not rename a path that
+// physically resolves to veto onto its `.veto-original` sibling.
+func TestApplyWrapper_OrphanedVetoSymlink_GuardsRenameWithoutIdentity(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n# veto\n"), 0o755))
+
+	goBin := filepath.Join(dir, "go")
+	require.NoError(t, os.Symlink(veto, goBin))
+
+	// nil vetoID skips the re-classify pass; c.class defaults to ClassReal
+	// so the class switch does not early-return. The pre-rename guard is
+	// the only thing standing between this and a self-referential anchor.
+	c := wrapCandidate{path: goBin, pm: "go", source: "homebrew", class: pmsurvey.ClassReal}
+	_, err := applyWrapper(c, veto, nil, false, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "orphaned")
+	_, lerr := os.Lstat(goBin + wrapperSuffix)
+	require.Error(t, lerr, "guard must prevent renaming a veto symlink onto its anchor")
+}
+
+// TestDiscoverWrapCandidates_ExcludesAliasToWrappedSibling pins the fix for
+// the nested self-referential-anchor class (2026-07-08): when an alias is a
+// symlink to a SAME-DIR sibling that is itself a wrap target (pyenv
+// `python -> python3.10`, `bunx -> bun`), veto must NOT wrap the alias
+// independently. Wrapping it makes its `.veto-original` point at the
+// already-wrapped sibling, which resolves back to veto — a self-referential
+// anchor that mis-resolves (wrong interpreter) or loops at runtime. The
+// alias inherits the wrap for free via `alias -> target -> veto`, so it must
+// stay a plain symlink. This generalizes veto's uv-store-only guard in
+// pmsurvey.PathsFor to every dir. Aliases whose target is NOT a wrap target
+// (e.g. `pip -> pip3.10`) must still be wrapped normally.
+func TestDiscoverWrapCandidates_ExcludesAliasToWrappedSibling(t *testing.T) {
+	dir := t.TempDir()
+	veto := filepath.Join(dir, "veto")
+	require.NoError(t, os.WriteFile(veto, []byte("#!/bin/sh\n# veto\n"), 0o755))
+	vetoID, err := pmsurvey.VetoIdentityFor(veto)
+	require.NoError(t, err)
+
+	// python3.10 (real, a versioned-python wrap target) + python/python3
+	// aliases symlinked to it in the same dir.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "python3.10"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.Symlink("python3.10", filepath.Join(dir, "python")))
+	require.NoError(t, os.Symlink("python3.10", filepath.Join(dir, "python3")))
+	// bun (real, a wrapped manager) + bunx alias symlinked to it.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bun"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.Symlink("bun", filepath.Join(dir, "bunx")))
+	// pip -> pip3.10, where pip3.10 is NOT a wrap target: pip must stay a
+	// candidate (its anchor would point at a real binary, not a wrapper).
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "pip3.10"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.Symlink("pip3.10", filepath.Join(dir, "pip")))
+
+	opts := wrapperFlags{dirs: []string{dir}, only: map[string]struct{}{}}
+	cands, err := discoverWrapCandidatesWith(opts, vetoID)
+	require.NoError(t, err)
+
+	got := map[string]bool{}
+	for _, c := range cands {
+		if filepath.Dir(c.path) == dir {
+			got[filepath.Base(c.path)] = true
+		}
+	}
+	require.False(t, got["python"], "python (alias -> wrapped sibling python3.10) must be excluded")
+	require.False(t, got["python3"], "python3 (alias -> wrapped sibling python3.10) must be excluded")
+	require.False(t, got["bunx"], "bunx (alias -> wrapped sibling bun) must be excluded")
+	require.True(t, got["bun"], "bun (real wrap target) must remain a candidate")
+	require.True(t, got["pip"], "pip (alias -> pip3.10, NOT a wrap target) must remain a candidate")
+}
+
 // TestApplyWrapper_ForceRelinksAlreadyOurs_DryRun: --force --dry-run on
 // an already-ours path should report a would-wrap, not silently succeed
 // and not actually touch the filesystem.
@@ -395,6 +508,10 @@ func TestRunInstallWrappers_WrapsUVCanonicalPython(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("PATH", "")
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// The uv canonical python is discovered via the uv-store walk (under
+	// the temp $HOME), independent of the system prefixes; confine those so
+	// the test never wraps the real /opt/homebrew/bin/python3.12.
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
 
 	veto := filepath.Join(home, ".local", "bin", "veto")
 	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
@@ -442,6 +559,9 @@ func TestRunInstallWrappers_ReentrantOnUVCanonicalPython(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("PATH", "")
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// See TestRunInstallWrappers_WrapsUVCanonicalPython: confine system
+	// prefixes so the reentrant run never touches real homebrew binaries.
+	t.Setenv(pmsurvey.SystemBinDirsEnv, "")
 
 	veto := filepath.Join(home, ".local", "bin", "veto")
 	require.NoError(t, os.MkdirAll(filepath.Dir(veto), 0o755))
@@ -915,6 +1035,63 @@ func TestFindRealBinary_RejectsSelfReferentialSiblingInPathWalk(t *testing.T) {
 	require.Error(t, err,
 		"PATH-walk must refuse self-referential sibling — exec'ing it would loop veto into itself")
 	require.Contains(t, err.Error(), "not found in PATH")
+}
+
+// TestFindWrappedOriginalViaChain_FollowsPlainAliasToRegisteredWrapper pins
+// the directly-invoked-alias fix (2026-07-08). When veto is invoked via a
+// plain alias symlink whose target is a registered wrapper sibling (pyenv
+// `python -> python3.10 -> veto`, `bunx -> bun`), argv[0]'s own
+// `.veto-original` anchor does not exist — so findWrappedOriginal bails and
+// the PATH walk historically found the WRONG interpreter (python3 → 3.14.6)
+// or looped into a shim. The chain follower walks argv[0]'s symlinks to the
+// first registered wrapper with a valid anchor and returns THAT real binary.
+func TestFindWrappedOriginalViaChain_FollowsPlainAliasToRegisteredWrapper(t *testing.T) {
+	dir := t.TempDir()
+	self, err := os.Executable() // stands in for veto, same trick as the sibling tests
+	require.NoError(t, err)
+
+	real := filepath.Join(dir, "python3.10.real")
+	require.NoError(t, os.WriteFile(real, []byte("#!/bin/sh\necho real\n"), 0o755))
+	py310 := filepath.Join(dir, "python3.10")
+	require.NoError(t, os.Symlink(self, py310))                            // python3.10 -> veto
+	require.NoError(t, os.Symlink("python3.10.real", py310+wrapperSuffix)) // anchor -> real
+	py := filepath.Join(dir, "python")
+	require.NoError(t, os.Symlink("python3.10", py)) // python -> python3.10 (plain alias, unregistered)
+
+	// Only the target is registered; the alias is a plain symlink.
+	registered := func(p string) bool { return p == py310 }
+
+	got, ok := findWrappedOriginalViaChain(py, registered)
+	require.True(t, ok, "must follow the plain alias to the registered wrapper's anchor")
+	require.Equal(t, py310+wrapperSuffix, got)
+}
+
+// TestFindWrappedOriginalViaChain_UnregisteredTargetBails: if the alias's
+// target chain never reaches a registered wrapper, the follower must bail
+// (false) so the caller falls through to the PATH walk — provenance is
+// preserved, no unregistered anchor is honored.
+func TestFindWrappedOriginalViaChain_UnregisteredTargetBails(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "python3.10")
+	require.NoError(t, os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755))
+	py := filepath.Join(dir, "python")
+	require.NoError(t, os.Symlink("python3.10", py))
+
+	_, ok := findWrappedOriginalViaChain(py, func(string) bool { return false })
+	require.False(t, ok, "no registered wrapper in the chain → must bail to PATH walk")
+}
+
+// TestFindWrappedOriginalViaChain_CycleBails guards termination: a symlink
+// cycle in argv[0]'s chain must return false, not loop forever.
+func TestFindWrappedOriginalViaChain_CycleBails(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	require.NoError(t, os.Symlink("b", a)) // a -> b
+	require.NoError(t, os.Symlink("a", b)) // b -> a  (cycle)
+
+	_, ok := findWrappedOriginalViaChain(a, func(string) bool { return true })
+	require.False(t, ok, "cyclic symlink chain must bail, not loop")
 }
 
 // TestWrapperRegisteredFunc_MissingStateFailsClosed: when wrappers.json
@@ -1530,4 +1707,213 @@ func TestApplyWrapper_ForeignWrapperStillSkipsWithoutForce(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, wrapperActionSkipForeignWrapper, action,
 		"non-PM-dir foreign wrapper must still SKIP without --force")
+}
+
+// TestFindRealBinary_ResolvesDisplacedShimOriginal pins the Layer-2
+// displacement resolver (2026-07-24 uv incident). `install-shims
+// --force` renames a real binary occupying a shim path to
+// `<pm>.veto-displaced` before planting the `<pm> -> veto` symlink —
+// but the resolver only ever consulted `.veto-original` siblings gated
+// on wrappers.json, which by territory rule never covers the shim dir.
+// A host whose ONLY real copy of the PM was the displaced file got
+// "cannot find real uv: not found in PATH" (or, with a second wrapper
+// tool on PATH, an infinite exec ping-pong). The PATH walk must
+// resolve the displaced sibling for shim-dir candidates.
+func TestFindRealBinary_ResolvesDisplacedShimOriginal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shimDir := filepath.Join(home, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	// The shim: uv -> veto (test binary stands in for veto, same trick
+	// as the sibling tests — the PATH walk's resolved==selfReal branch
+	// fires).
+	self, err := os.Executable()
+	require.NoError(t, err)
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(self, uv))
+
+	// The displaced real binary install-shims --force left behind.
+	displaced := uv + ".veto-displaced"
+	require.NoError(t, os.WriteFile(displaced, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	t.Setenv("PATH", shimDir)
+
+	// Shim-dir paths are NEVER in wrappers.json (territory guard).
+	notRegistered := func(string) bool { return false }
+	got, err := findRealBinary("uv", notRegistered)
+	require.NoError(t, err, "displaced shim original must be resolvable")
+	require.Equal(t, displaced, got)
+}
+
+// TestFindDisplacedOriginal_DirectShimInvocation covers the argv[0]
+// variant of the displacement resolver: someone runs `~/.local/bin/uv`
+// by absolute path with a PATH that doesn't contain the shim dir, so
+// the PATH walk never sees the shim. findDisplacedOriginal must honor
+// the healthy sibling for a shim-dir path and reject bare names
+// (they go through the PATH walk).
+func TestFindDisplacedOriginal_DirectShimInvocation(t *testing.T) {
+	home := t.TempDir()
+	shimDir := filepath.Join(home, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	uv := filepath.Join(shimDir, "uv")
+	displaced := uv + ".veto-displaced"
+	require.NoError(t, os.WriteFile(displaced, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	got, ok := findDisplacedOriginal(uv, shimDir)
+	require.True(t, ok, "healthy displaced sibling of a shim-dir path must resolve")
+	require.Equal(t, displaced, got)
+
+	// Bare name: no path separator, not a shim-dir site.
+	_, ok = findDisplacedOriginal("uv", shimDir)
+	require.False(t, ok, "bare-name argv[0] must not consult displaced siblings")
+
+	// Missing sibling: fail closed.
+	pip := filepath.Join(shimDir, "pip")
+	_, ok = findDisplacedOriginal(pip, shimDir)
+	require.False(t, ok, "no displaced sibling means no resolution")
+}
+
+// TestFindRealBinary_SkipsSelfReferentialDisplaced: a
+// `<pm>.veto-displaced` that resolves back into veto itself would
+// re-enter veto in an exec loop — the same failure class the
+// `.veto-original` self-reference guards close. The walk must skip it
+// and fail closed with "not found in PATH".
+func TestFindRealBinary_SkipsSelfReferentialDisplaced(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shimDir := filepath.Join(home, ".local", "bin")
+	require.NoError(t, os.MkdirAll(shimDir, 0o755))
+
+	self, err := os.Executable()
+	require.NoError(t, err)
+	uv := filepath.Join(shimDir, "uv")
+	require.NoError(t, os.Symlink(self, uv))
+	// Displaced sibling ALSO chains back to veto (the test binary).
+	require.NoError(t, os.Symlink(self, uv+".veto-displaced"))
+
+	t.Setenv("PATH", shimDir)
+
+	_, err = findRealBinary("uv", func(string) bool { return false })
+	require.Error(t, err, "self-referential displaced sibling must be skipped")
+	require.Contains(t, err.Error(), "not found in PATH")
+}
+
+// TestFindRealBinary_IgnoresDisplacedOutsideShimDir enforces the
+// provenance gate: `.veto-displaced` files are only ever created by
+// install-shims inside the Layer-2 shim dir, so a displaced sibling
+// planted ANYWHERE else is not veto-authored and must be ignored —
+// exactly as unregistered `.veto-original` siblings are. Otherwise a
+// same-UID attacker could plant `<dir>/npm.veto-displaced` at any
+// veto-pointing PATH entry and hijack execution.
+func TestFindRealBinary_IgnoresDisplacedOutsideShimDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// A veto-pointing candidate OUTSIDE the shim dir with a planted
+	// displaced sibling.
+	otherBin := filepath.Join(home, "otherbin")
+	require.NoError(t, os.MkdirAll(otherBin, 0o755))
+	self, err := os.Executable()
+	require.NoError(t, err)
+	npm := filepath.Join(otherBin, "npm")
+	require.NoError(t, os.Symlink(self, npm))
+	require.NoError(t, os.WriteFile(npm+".veto-displaced", []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	t.Setenv("PATH", otherBin)
+
+	_, err = findRealBinary("npm", func(string) bool { return false })
+	require.Error(t, err, "displaced sibling outside the shim dir must be ignored (provenance gate)")
+	require.Contains(t, err.Error(), "not found in PATH")
+}
+
+// TestClassifyWriteSkip_SIPPathIsReadOnlyFSNotSudo pins the sudo-hint
+// fix: an unprivileged write under a SIP root (/usr/bin, ...) fails
+// with EPERM/EACCES — the kernel never gets far enough to return
+// EROFS — so classifying on errno alone filed SIP candidates under
+// "needs sudo" and the epilogue printed `sudo veto install-wrappers
+// --dir /usr/bin ...`, which cannot work (SIP blocks root too). The
+// classifier must consult SIP-ness before conceding the sudo hint.
+func TestClassifyWriteSkip_SIPPathIsReadOnlyFSNotSudo(t *testing.T) {
+	permErr := &fs.PathError{Op: "rename", Path: "/usr/bin/pip3", Err: syscall.EPERM}
+
+	action, ok := classifyWriteSkip("/usr/bin/pip3", permErr)
+	require.True(t, ok)
+	if runtime.GOOS == "darwin" {
+		require.Equal(t, wrapperActionSkipReadOnlyFS, action,
+			"SIP-protected path must classify as read-only FS — sudo cannot bypass SIP")
+	} else {
+		// isSIPProtectedPath is runtime-gated: SIP does not exist off
+		// darwin, so the plain permission classification stands.
+		require.Equal(t, wrapperActionSkipUnwritable, action)
+	}
+}
+
+// TestClassifyWriteSkip_NonSIPPermissionStillWantsSudo: a permission
+// error in a plain root-owned dir is still the "needs sudo" category —
+// the remediation hint is genuinely actionable there.
+func TestClassifyWriteSkip_NonSIPPermissionStillWantsSudo(t *testing.T) {
+	dir := t.TempDir()
+	permErr := &fs.PathError{Op: "rename", Path: filepath.Join(dir, "npm"), Err: syscall.EACCES}
+
+	action, ok := classifyWriteSkip(filepath.Join(dir, "npm"), permErr)
+	require.True(t, ok)
+	require.Equal(t, wrapperActionSkipUnwritable, action)
+}
+
+// TestClassifyWriteSkip_EROFSAndGenuineFailures: EROFS is always the
+// read-only-FS category regardless of path, and any other error is not
+// a skip at all — it propagates as a genuine failure.
+func TestClassifyWriteSkip_EROFSAndGenuineFailures(t *testing.T) {
+	erofs := &fs.PathError{Op: "rename", Path: "/anywhere/npm", Err: syscall.EROFS}
+	action, ok := classifyWriteSkip("/anywhere/npm", erofs)
+	require.True(t, ok)
+	require.Equal(t, wrapperActionSkipReadOnlyFS, action)
+
+	other := &fs.PathError{Op: "rename", Path: "/anywhere/npm", Err: syscall.EIO}
+	_, ok = classifyWriteSkip("/anywhere/npm", other)
+	require.False(t, ok, "non-permission, non-EROFS errors are genuine failures, not skips")
+}
+
+// TestAliasSiblingWrapTarget_RelativeAndAbsoluteShapes pins the helper
+// behind both aliasInheritsSiblingWrap (discovery) and doctor's
+// alias-aware survey row: it must recognize the RELATIVE pyenv shape
+// (`python -> python3.10`) and the ABSOLUTE bunx shape
+// (`bunx -> /abs/dir/bun`), returning the resolved same-dir sibling
+// path, and reject cross-directory symlinks and regular files.
+func TestAliasSiblingWrapTarget_RelativeAndAbsoluteShapes(t *testing.T) {
+	dir := t.TempDir()
+
+	// Relative same-dir alias.
+	python310 := filepath.Join(dir, "python3.10")
+	require.NoError(t, os.WriteFile(python310, []byte("#!/bin/sh\n"), 0o755))
+	python := filepath.Join(dir, "python")
+	require.NoError(t, os.Symlink("python3.10", python))
+	got, ok := aliasSiblingWrapTarget(python)
+	require.True(t, ok, "relative same-dir alias must be recognized")
+	require.Equal(t, python310, got)
+
+	// Absolute same-dir alias.
+	bun := filepath.Join(dir, "bun")
+	require.NoError(t, os.WriteFile(bun, []byte("#!/bin/sh\n"), 0o755))
+	bunx := filepath.Join(dir, "bunx")
+	require.NoError(t, os.Symlink(bun, bunx))
+	got, ok = aliasSiblingWrapTarget(bunx)
+	require.True(t, ok, "absolute same-dir alias must be recognized")
+	require.Equal(t, bun, got)
+
+	// Cross-directory symlink: not a same-dir alias.
+	otherDir := filepath.Join(dir, "other")
+	require.NoError(t, os.MkdirAll(otherDir, 0o755))
+	crossTarget := filepath.Join(otherDir, "npm")
+	require.NoError(t, os.WriteFile(crossTarget, []byte("#!/bin/sh\n"), 0o755))
+	cross := filepath.Join(dir, "npm")
+	require.NoError(t, os.Symlink(crossTarget, cross))
+	_, ok = aliasSiblingWrapTarget(cross)
+	require.False(t, ok, "cross-directory symlinks are wrap candidates, not aliases")
+
+	// Regular file: not an alias at all.
+	_, ok = aliasSiblingWrapTarget(python310)
+	require.False(t, ok)
 }

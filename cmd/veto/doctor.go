@@ -204,11 +204,17 @@ func checkShimDir() []checkResult {
 			continue
 		}
 		if info.Mode()&os.ModeSymlink == 0 {
+			// A real binary occupies the shim path (uv self-installs
+			// into ~/.local/bin/uv). install-shims --force handles this
+			// safely: it displaces the real binary to
+			// `<name>.veto-displaced`, which findRealBinary resolves at
+			// exec time — no manual move-aside needed.
 			out = append(out, checkResult{
-				status:   statusFail,
-				label:    "shim:" + name,
-				detail:   shimPath + " exists but is not a symlink",
-				howToFix: "Move the real file aside and run `veto install-shims --force`.",
+				status: statusFail,
+				label:  "shim:" + name,
+				detail: shimPath + " exists but is not a symlink",
+				howToFix: "Run `veto install-shims --force` — it displaces the real binary to " +
+					shimPath + displacedSuffix + ", which veto resolves when the shim runs.",
 			})
 			continue
 		}
@@ -249,10 +255,25 @@ func checkShimDir() []checkResult {
 				continue
 			}
 		}
+		// Displacement integrity: install-shims --force moves a real
+		// binary occupying the shim path aside to `<name>.veto-displaced`
+		// before planting the symlink, and findRealBinary resolves
+		// through that sibling at exec time. If the displaced file has
+		// itself been clobbered into a veto symlink (or is no longer
+		// executable), the shim LOOKS healthy but the real binary is
+		// lost — the same class of lie as a self-referential
+		// `.veto-original` anchor. Verify before emitting PASS.
+		detail := fmt.Sprintf("%s → %s", shimPath, target)
+		if fail, displaced := checkDisplacedShimSibling(shimPath); fail != nil {
+			out = append(out, *fail)
+			continue
+		} else if displaced != "" {
+			detail += fmt.Sprintf(" (real %s displaced to %s; veto resolves it)", name, displaced)
+		}
 		out = append(out, checkResult{
 			status: statusPass,
 			label:  "shim:" + name,
-			detail: fmt.Sprintf("%s → %s", shimPath, target),
+			detail: detail,
 		})
 	}
 
@@ -266,6 +287,44 @@ func checkShimDir() []checkResult {
 	out = append(out, checkStaleShimSiblings(shimDir)...)
 
 	return out
+}
+
+// checkDisplacedShimSibling validates the `.veto-displaced` sibling of
+// a healthy shim symlink, if one exists. Returns (nil, "") when there
+// is no sibling, (nil, path) when the sibling is a healthy real binary
+// (callers surface it in the PASS detail), and a FAIL row otherwise.
+//
+// Only install-shims --force writes the suffix (displacing a real
+// binary that occupied the shim path), and findRealBinary trusts it as
+// the real PM for shim-dir paths — so a sibling that is not executable
+// or that resolves back into the running veto binary means the ONLY
+// on-disk copy of the real PM is gone. The self-reference test is
+// isSelfReferential (main.go), the same identity check the resolver
+// applies before exec'ing the sibling: doctor and the resolver must
+// agree on which displaced files are trustworthy.
+func checkDisplacedShimSibling(shimPath string) (*checkResult, string) {
+	displaced := shimPath + displacedSuffix
+	if _, err := os.Lstat(displaced); err != nil {
+		return nil, "" // no displacement at this shim; nothing to verify
+	}
+	name := filepath.Base(shimPath)
+	if !isExecutableRegularOrSymlink(displaced) {
+		return &checkResult{
+			status:   statusFail,
+			label:    "shim:" + name,
+			detail:   displaced + " exists but is not an executable binary — displaced original unusable, real " + name + " unreachable",
+			howToFix: "Restore a working " + name + " at " + displaced + " (reinstall the tool), then re-run `veto doctor`.",
+		}, ""
+	}
+	if isSelfReferential(displaced) {
+		return &checkResult{
+			status:   statusFail,
+			label:    "shim:" + name,
+			detail:   displaced + " resolves back to the veto binary — real " + name + " lost (resolving it would loop veto into itself)",
+			howToFix: "Restore the real " + name + " at " + displaced + " (reinstall the tool), then re-run `veto install-shims --force`.",
+		}, ""
+	}
+	return nil, displaced
 }
 
 // checkStaleShimSiblings scans the Layer 2 shim dir for any
@@ -927,6 +986,29 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 				continue
 			}
 		}
+		// Self-referential anchor guard. os.Stat below FOLLOWS the symlink,
+		// so a `.veto-original` that itself points at the veto binary would
+		// resolve to the still-present veto file and PASS — masking a
+		// veto→veto exec loop (the real binary is gone). This is exactly the
+		// state the 2026-07-08 brew-cleanup incident left behind, and the
+		// reason doctor reported "0 failures" while the toolchain was broken.
+		// Classify the anchor explicitly: a healthy anchor is a real binary
+		// (ClassReal) or a Cellar/mise layout symlink (ClassPMLayoutSymlink),
+		// never ours by identity. If it resolves to veto, FAIL loudly.
+		if vetoID != nil {
+			if aclass, _, aerr := pmsurvey.ClassifySymlink(w.OriginalPath, vetoID); aerr == nil {
+				switch aclass {
+				case pmsurvey.ClassOursByPath, pmsurvey.ClassOursByHash:
+					out = append(out, checkResult{
+						status:   statusFail,
+						label:    "wrapper:" + w.PM,
+						detail:   fmt.Sprintf("%s points at the veto binary itself — self-referential anchor, real binary lost (veto→veto exec loop)", w.OriginalPath),
+						howToFix: "Restore the real binary at " + w.OriginalPath + " (reinstall the toolchain, or recreate the symlink to point at the real binary), then re-run `veto install-wrappers`.",
+					})
+					continue
+				}
+			}
+		}
 		if _, err := os.Stat(w.OriginalPath); err != nil {
 			out = append(out, checkResult{
 				status:   statusFail,
@@ -971,6 +1053,20 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 				continue
 			}
 			seen[path] = true
+			if inShimDir(path) {
+				// Layer-2 territory: the dedicated shim:<pm> checks own
+				// this directory (symlink identity, PATH shadowing,
+				// `.veto-displaced` validation). Surveying it as a
+				// Layer-4 wrap site produced two lies: a PASS with a
+				// fabricated "original at <path>.veto-original" detail
+				// for a shim that has no such anchor, and a WARN
+				// advising `veto install-wrappers` — advice
+				// install-wrappers refuses to follow (territory guard,
+				// install_wrappers.go). Skip without marking discovery:
+				// "no absolute-path install" (N/A) is the truthful
+				// Layer-4 verdict for a PM that only exists as a shim.
+				continue
+			}
 			if coveredByState[path] {
 				// Already reported by the state-drift phase; don't
 				// double-report.
@@ -991,6 +1087,14 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 			pmHadDiscovery = true
 			switch class {
 			case pmsurvey.ClassOursByPath:
+				if alias := discoveredAliasPassRow(pm, path); alias != nil {
+					out = append(out, *alias)
+					continue
+				}
+				if bad := discoveredAnchorFailure(pm, path, vetoID); bad != nil {
+					out = append(out, *bad)
+					continue
+				}
 				out = append(out, checkResult{
 					status: statusPass,
 					label:  "wrapper:" + pm,
@@ -998,6 +1102,14 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 				})
 				continue
 			case pmsurvey.ClassOursByHash:
+				if alias := discoveredAliasPassRow(pm, path); alias != nil {
+					out = append(out, *alias)
+					continue
+				}
+				if bad := discoveredAnchorFailure(pm, path, vetoID); bad != nil {
+					out = append(out, *bad)
+					continue
+				}
 				out = append(out, checkResult{
 					status: statusPass,
 					label:  "wrapper:" + pm,
@@ -1102,6 +1214,80 @@ func checkWrappersWith(cfg config, vetoID *pmsurvey.VetoIdentity, vetoErr error)
 	}
 
 	return out
+}
+
+// discoveredAliasPassRow returns a PASS row when path is a plain alias
+// into a wrapped SAME-DIR sibling (pyenv `python -> python3.10`, bun
+// `bunx -> /abs/dir/bun`), or nil when path is not such an alias.
+//
+// These aliases have no `.veto-original` of their own BY DESIGN:
+// discovery deliberately keeps them plain (aliasInheritsSiblingWrap —
+// wrapping one would manufacture a self-referential anchor), and the
+// resolver follows them through the sibling's wrap at runtime
+// (findWrappedOriginalViaChain). ClassifySymlink resolves the full
+// chain alias -> sibling -> veto, so without this guard the
+// discovered-anchor verification reads the alias as an orphaned
+// wrapper — the false positive the 2026-07-24 live doctor run
+// surfaced on ~/.bun/bin/bunx and pyenv's python/python3 aliases.
+//
+// The sibling's anchor is deliberately NOT validated here: the sibling
+// is itself surveyed (or state-checked) and FAILs on its own row if
+// orphaned. One defect, one row — the alias is not independently
+// repairable, and duplicating the orphan FAIL onto every alias would
+// turn a single broken anchor into N rows naming paths the user must
+// not touch.
+func discoveredAliasPassRow(pm, path string) *checkResult {
+	target, ok := aliasSiblingWrapTarget(path)
+	if !ok {
+		return nil
+	}
+	return &checkResult{
+		status: statusPass,
+		label:  "wrapper:" + pm,
+		detail: fmt.Sprintf("%s (plain alias into wrapped sibling %s; inherits the wrap — no own anchor by design)", path, target),
+	}
+}
+
+// discoveredAnchorFailure validates the `.veto-original` anchor behind
+// a DISCOVERED veto-pointing symlink — one the Phase-2 host survey
+// found but wrappers.json does not cover. Returns nil when the anchor
+// holds a healthy real binary; otherwise a FAIL row.
+//
+// The survey used to emit PASS with a detail string naming
+// "<path>.veto-original" WITHOUT ever stat-ing that anchor — trusting
+// symlink direction alone. An orphaned wrapper (veto symlink on disk,
+// anchor pruned, no registry entry — the live /usr/local/bin/npm case
+// from the 2026-07-24 incident) therefore surveyed all-green while the
+// real binary was unreachable. This is the discovered-path mirror of
+// the state-phase anchor classification in checkWrappersWith: missing
+// / non-executable anchors and anchors that classify as veto itself
+// (self-referential — a veto→veto exec loop) both mean the wrapper has
+// nothing real to delegate to.
+//
+// Classification errors on an existing, executable anchor are treated
+// as healthy, matching the state-phase prior art — an I/O hiccup on
+// the hash pass must not convert a working wrapper into a FAIL.
+func discoveredAnchorFailure(pm, path string, vetoID *pmsurvey.VetoIdentity) *checkResult {
+	anchor := path + wrapperSuffix
+	fail := &checkResult{
+		status: statusFail,
+		label:  "wrapper:" + pm,
+		detail: fmt.Sprintf("%s is an orphaned wrapper: points at veto but its .veto-original anchor is missing/self-referential — real binary unreachable", path),
+		howToFix: "Restore the real binary (reinstall the toolchain, or recreate " + anchor +
+			" pointing at it) or delete the orphaned symlink, then re-run `veto install-wrappers`.",
+	}
+	if !isExecutableRegularOrSymlink(anchor) {
+		return fail
+	}
+	if vetoID != nil {
+		if aclass, _, aerr := pmsurvey.ClassifySymlink(anchor, vetoID); aerr == nil {
+			switch aclass {
+			case pmsurvey.ClassOursByPath, pmsurvey.ClassOursByHash:
+				return fail
+			}
+		}
+	}
+	return nil
 }
 
 // layer4ExampleHints returns the platform-correct example path and
