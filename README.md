@@ -16,12 +16,21 @@ maintainer-account takeover and hides install-time code execution in a
 
 ## Quickstart
 
+Install the latest release binary, then run `install-all`:
+
 ```sh
-git clone https://github.com/brynbellomy/veto.git
-cd veto
-make install
+TAG=$(curl -fsSL https://api.github.com/repos/brynbellomy/veto/releases/latest | jq -r .tag_name)
+OS=$(uname -s | tr A-Z a-z)                                      # linux | darwin
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')        # amd64 | arm64
+curl -fsSL "https://github.com/brynbellomy/veto/releases/download/${TAG}/veto_${TAG#v}_${OS}_${ARCH}.tar.gz" \
+  | tar -xz -C /tmp veto
+install -m 0755 /tmp/veto "$HOME/.local/bin/veto"
 veto install-all --force
 ```
+
+Verify the tarball against `checksums.txt` on the same release page
+before installing. To build from source instead, see [Installation
+Details](#installation-details) below.
 
 `install-all` installs the shims, managed shell block, Claude hook,
 native interposer, real-binary wrappers, intel cache, and doctor checks.
@@ -157,6 +166,23 @@ otherwise-legitimate name. For an unversioned query, ANY flagged
 version of the name refuses, since the caller hasn't pinned.
 
 ## Installation Details
+
+### From a release (recommended)
+
+The [Quickstart](#quickstart) snippet pulls the latest tagged release
+tarball for your `(OS, arch)` from
+`https://github.com/brynbellomy/veto/releases` and drops the `veto`
+binary into `~/.local/bin/`. Each release ships `linux_amd64`,
+`linux_arm64`, `darwin_amd64`, and `darwin_arm64` tarballs alongside
+a `checksums.txt` with SHA256 sums.
+
+### From source
+
+```sh
+git clone https://github.com/brynbellomy/veto.git
+cd veto
+make install   # runs `go test -race ./...` then installs to ~/.local/bin/veto
+```
 
 `make install` builds `veto` into `~/.local/bin/veto`. `install-all`
 builds `libveto_interpose.dylib`/`.so` with `make interposer` when
