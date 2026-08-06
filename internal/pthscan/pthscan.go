@@ -412,6 +412,31 @@ var knownLegitLines = []*regexp.Regexp{
 	// pattern is "import os; <hack-import>".
 	regexp.MustCompile(`^import\s+os\s*;\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*os\.environ\.get\(.+?\)\s*;\s*)?__import__\(\s*['"]_distutils_hack['"]\s*\)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\(\s*\))?\s*$`),
 
+	// Current setuptools (>=60) distutils-precedence shim. The shipped
+	// shape gates the hack behind an env-var comparison:
+	//
+	//	import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim();
+	//
+	// The older regex above models at most one `<name> = os.environ.get(…);`
+	// clause sitting immediately before `__import__`, so it does not cover
+	// the bare string assignment, the `== 'local'` comparison, or the
+	// `<name> and` guard. Without this entry the line falls through to the
+	// payload scanner and trips pth-payload-dynamic-exec on its
+	// `__import__(` — a Critical false positive that fail-closes every
+	// pip/uv/poetry/pdm install in any environment carrying current
+	// setuptools, which is effectively all of them.
+	regexp.MustCompile(`^import\s+os\s*;\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*['"]SETUPTOOLS_USE_DISTUTILS['"]\s*;\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*os\.environ\.get\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*['"](?:local|stdlib)['"]\s*\)\s*==\s*['"](?:local|stdlib)['"]\s*;\s*[A-Za-z_][A-Za-z0-9_]*\s+and\s+__import__\(\s*['"]_distutils_hack['"]\s*\)\s*\.\s*add_shim\(\s*\)\s*;?\s*$`),
+
+	// coverage.py's subprocess-support hook, shipped as a1_coverage.pth in
+	// the coverage wheel (verified present in coverage 7.15.3's RECORD, and
+	// `process_startup` genuinely takes the `slug` kwarg there). It legitimately
+	// calls exec() on a string literal, which trips pth-payload-dynamic-exec.
+	// Anchored to the exact upstream payload rather than a structural shape:
+	// an `exec(` allowlist entry must not generalize, so a future coverage
+	// release with a different body correctly falls back to flagging instead
+	// of being silently allowed.
+	regexp.MustCompile(`^` + regexp.QuoteMeta(`import sys; exec('import os\n\nif os.getenv("COVERAGE_PROCESS_START") or os.getenv("COVERAGE_PROCESS_CONFIG"):\n try:\n  import coverage\n except:\n  pass\n else:\n  coverage.process_startup(slug="pth")')`) + `\s*$`),
+
 	// PEP 660 editable installs — pip writes __editable___<name>_finder.py
 	// plus a one-line .pth that imports and installs the finder.
 	regexp.MustCompile(`^import\s+__editable___[A-Za-z0-9_]+_finder\s*;\s*__editable___[A-Za-z0-9_]+_finder\.install\(\s*\)\s*$`),
