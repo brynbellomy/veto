@@ -130,10 +130,13 @@ func TestEnvRecursionRisk_Go(t *testing.T) {
 		want packagemanager.EnvRecursionRiskLevel
 	}{
 		{"go run", []string{"run", "./cmd/foo"}, packagemanager.RecursionRiskLow},
-		{"go build", []string{"build", "./..."}, packagemanager.RecursionRiskLow},
-		{"go test", []string{"test", "./..."}, packagemanager.RecursionRiskLow},
-		{"go vet", []string{"vet", "./..."}, packagemanager.RecursionRiskLow},
-		{"go get modern", []string{"get", "./..."}, packagemanager.RecursionRiskLow},
+		// Toolchain-driving verbs must strip VETO_PATH: the exec'd go spawns
+		// nested go/git, which the Layer-3 interposer would rewrite back into
+		// a fresh veto gate (infinite process-tree regress).
+		{"go build", []string{"build", "./..."}, packagemanager.RecursionRiskHigh},
+		{"go test", []string{"test", "./..."}, packagemanager.RecursionRiskHigh},
+		{"go vet", []string{"vet", "./..."}, packagemanager.RecursionRiskHigh},
+		{"go get modern", []string{"get", "./..."}, packagemanager.RecursionRiskHigh},
 		{"go mod tidy", []string{"mod", "tidy"}, packagemanager.RecursionRiskLow},
 		{"go mod download", []string{"mod", "download"}, packagemanager.RecursionRiskLow},
 		{"go work sync", []string{"work", "sync"}, packagemanager.RecursionRiskLow},
@@ -146,6 +149,7 @@ func TestEnvRecursionRisk_Go(t *testing.T) {
 		{"unknown verb", []string{"someNewVerb", "arg"}, packagemanager.RecursionRiskUnknown},
 		{"no verb", []string{}, packagemanager.RecursionRiskLow},
 		{"-C dir run", []string{"-C", "/tmp", "run", "./x"}, packagemanager.RecursionRiskLow},
+		{"-C dir build", []string{"-C", "/tmp", "build", "./x"}, packagemanager.RecursionRiskHigh},
 		{"-C dir install", []string{"-C", "/tmp", "install", "pkg@v1"}, packagemanager.RecursionRiskHigh},
 		{"-ldflags then install", []string{"-ldflags=-X main.x=run", "install", "./..."}, packagemanager.RecursionRiskHigh},
 	}

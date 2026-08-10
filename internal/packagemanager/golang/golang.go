@@ -173,6 +173,21 @@ func (Manager) ProjectPreflight(args []string) (packagemanager.ProjectPreflightP
 
 // EnvRecursionRisk implements packagemanager.EnvRecursionPolicy.
 //
+// The load-bearing distinction is not "does this verb re-enter veto" but
+// "does the process this verb execs spawn toolchain children that re-exec
+// go / VCS tools." When VETO_PATH survives into such a process, the Layer-3
+// interposer rewrites that nested exec back into a fresh veto gate, which
+// refreshes intel and spawns its own nested go — an infinite process-tree
+// regress (the `make install` intel-store-refreshed flood).
+//
+// Only `go run` keeps VETO_PATH: its child is user-authored code, and
+// stripping would silently disarm Layer 3 for that program's own execs.
+// Compiler-driving verbs (build/test/vet/install/get/generate/tool) exec the
+// go toolchain, which self-execs nested go/git — so they must strip. The
+// current build's deps were already gated by the preflight that just ran, and
+// any genuine nested PM install still hits Layer 2 shims / Layer 4 wrappers,
+// so stripping here costs no gate coverage.
+//
 // Argv parsing reuses flagsWithValues so flags like `-C dir` or
 // `-ldflags=...` don't fool the verb classifier.
 func (Manager) EnvRecursionRisk(args []string) packagemanager.EnvRecursionRiskLevel {
@@ -182,12 +197,17 @@ func (Manager) EnvRecursionRisk(args []string) packagemanager.EnvRecursionRiskLe
 		return packagemanager.RecursionRiskLow
 	}
 	switch verb {
-	case "run", "build", "test", "vet", "get", "list", "fmt", "doc",
+	case "run", "list", "fmt", "doc",
 		"env", "version", "fix", "clean", "telemetry", "bug", "mod", "work":
-		// mod/work are intentionally allowed by parent verb: every documented
-		// subverb is a metadata op, so treating subverbs as low avoids noise.
+		// run: child is user code — keep Layer 3 armed for its descendants.
+		// The rest are pure metadata / source ops that never drive the
+		// compiler and never self-exec a nested go. mod/work are allowed by
+		// parent verb: every documented subverb is a metadata op.
 		return packagemanager.RecursionRiskLow
-	case "install", "generate", "tool":
+	case "build", "test", "vet", "get", "install", "generate", "tool":
+		// Toolchain-driving verbs: the exec'd go spawns nested go/git, which
+		// the interposer would rewrite back into a fresh veto gate. Strip
+		// VETO_PATH so the recursion breaks at the immediate child.
 		return packagemanager.RecursionRiskHigh
 	default:
 		return packagemanager.RecursionRiskUnknown

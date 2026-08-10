@@ -131,6 +131,24 @@ func TestSanitizedEnvFor_StripsVETO_PATH_OnGoInstall(t *testing.T) {
 		"VETO_PATH must be stripped for `go install` to prevent recursion")
 }
 
+func TestSanitizedEnvFor_StripsVETO_PATH_OnToolchainVerbs(t *testing.T) {
+	env := []string{
+		"VETO_PATH=/opt/veto/bin/veto",
+		"DYLD_INSERT_LIBRARIES=/opt/veto/lib/libveto.dylib",
+		"PATH=/usr/bin",
+	}
+	// These verbs exec the go toolchain, which self-execs nested go/git.
+	// Preserving VETO_PATH lets the Layer-3 interposer rewrite that nested
+	// exec back into a fresh veto gate — the infinite intel-refresh regress.
+	for _, verb := range []string{"build", "test", "vet", "get", "generate", "tool"} {
+		t.Run(verb, func(t *testing.T) {
+			got := sanitizedEnvFor("go", []string{verb, "./..."}, env)
+			require.NotContains(t, got, "VETO_PATH=/opt/veto/bin/veto",
+				"VETO_PATH must be stripped for `go %s` so the toolchain's nested go/git execs don't re-enter veto", verb)
+		})
+	}
+}
+
 func TestSanitizedEnvFor_StripsForUnknownVerb(t *testing.T) {
 	env := []string{"VETO_PATH=/opt/veto/bin/veto"}
 	got := sanitizedEnvFor("go", []string{"some-future-verb"}, env)
