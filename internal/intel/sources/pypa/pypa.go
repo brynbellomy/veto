@@ -172,15 +172,6 @@ func (s *Source) fetchWithCache(ctx context.Context, payloadPath, etagPath strin
 }
 
 func (s *Source) fetchWithCacheBounded(ctx context.Context, payloadPath, etagPath string, retryAllowed bool) ([]byte, error) {
-	// Cache-only directive (freshness window): serve the on-disk tarball
-	// without a network round-trip. Missing cache falls through to the
-	// normal network path.
-	if intel.CacheOnly(ctx) {
-		if cached, err := os.ReadFile(payloadPath); err == nil {
-			return cached, nil
-		}
-	}
-
 	prevEtag, _ := os.ReadFile(etagPath)
 
 	// Cache-integrity gate: the etag names the upstream representation,
@@ -188,7 +179,40 @@ func (s *Source) fetchWithCacheBounded(ctx context.Context, payloadPath, etagPat
 	// cache miss so the 200 path re-downloads and re-records. Unrecorded
 	// (pre-integrity-fix cache) stays a conditional GET; the 200 path
 	// writes the sidecar on the next body.
+	//
+	// This MUST be computed before the cache-only directive below. Serving
+	// from disk without consulting it is the whole vulnerability.
 	hashVerdict := fsutil.PayloadHashVerdict(payloadPath)
+
+	// Cache-only directive: the caller's freshness window says the advisory
+	// set was fetched moments ago, so serve the on-disk tarball without a
+	// network round-trip. No usable cache falls through to the normal path —
+	// the directive is an optimization, never a correctness gate.
+	//
+	// Two rules make it safe, and both are easy to lose in a merge:
+	//
+	//  1. A HashMismatch does NOT short-circuit. It falls through to the
+	//     network path, which re-downloads and re-records — or, if upstream
+	//     is unreachable, fails closed with ErrDamagedCache below. A
+	//     freshness window saying "we fetched recently" is not evidence that
+	//     the bytes on disk are the bytes we fetched.
+	//  2. HashUnrecorded (a pre-integrity-fix cache) is served but NEVER
+	//     adopted here. The adoption path exists only under a live 304,
+	//     where upstream confirmed the etag names these bytes. Under
+	//     cache-only nothing confirms anything, so recording a hash now
+	//     would bless whatever happens to be on disk — laundering existing
+	//     damage into "verified" and permanently blinding this gate. The
+	//     persistent per-source baseline is the backstop for that case.
+	if intel.CacheOnly(ctx) && hashVerdict != fsutil.HashMismatch {
+		if cached, err := os.ReadFile(payloadPath); err == nil {
+			if hashVerdict == fsutil.HashUnrecorded {
+				s.logger.Warn().
+					Str("payload_path", payloadPath).
+					Msg("serving pre-integrity cache under cache-only directive; not adopting its hash without upstream validation")
+			}
+			return cached, nil
+		}
+	}
 	if hashVerdict == fsutil.HashMismatch && len(prevEtag) > 0 {
 		s.logger.Warn().
 			Str("payload_path", payloadPath).

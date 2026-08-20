@@ -225,3 +225,94 @@ func TestFetchDamagedCacheShapes(t *testing.T) {
 		})
 	}
 }
+
+// TestFetchCacheOnlyGuttedCacheMustNotServe is the merged-configuration
+// regression: the freshness window says "we fetched moments ago" (context
+// carries the CacheOnly directive) AND the on-disk payload has been
+// gutted. This is the state neither branch could test alone — the
+// freshness window removes the network round-trip whose 304 handler
+// carried the integrity gate, so the cache-only early return must consult
+// the content hash itself. Serving the gutted bytes here is the original
+// vulnerability reinstated on the one path that never touches the
+// network.
+//
+// Rules being pinned (see the cache-only block in fetchWithCacheBounded):
+// the verdict is computed BEFORE the directive; HashMismatch never
+// short-circuits under the directive (falls through to network, which
+// re-downloads and re-records); HashUnrecorded serves but never adopts.
+func TestFetchCacheOnlyGuttedCacheMustNotServe(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("ETag", `"npm-1"`)
+		_, _ = w.Write(loadFixture(t, "npm_manifest.json"))
+	}))
+	defer srv.Close()
+
+	cacheDir := t.TempDir()
+	src, err := datadog.New(datadog.Options{
+		BaseURL:  srv.URL,
+		CacheDir: cacheDir,
+		Logger:   zerolog.Nop(),
+	})
+	require.NoError(t, err)
+
+	// Prime the cache with a network fetch (records the hash sidecar).
+	warm, err := src.Fetch(context.Background(), intel.EcosystemNPM)
+	require.NoError(t, err)
+	require.Len(t, warm, 7)
+
+	// Gut the on-disk payload.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(cacheDir, "npm.json"), []byte(guttedManifest), 0o600))
+
+	// Cache-only fetch against the gutted payload: must NOT serve it.
+	ctx := intel.WithCacheOnly(context.Background())
+	reports, err := src.Fetch(ctx, intel.EcosystemNPM)
+	require.NoError(t, err, "mismatch under cache-only falls through to network, which heals")
+	require.Len(t, reports, 7,
+		"the gutted payload must not be served under the cache-only directive")
+	require.Greater(t, hits, 1, "the mismatch must trigger a real re-fetch")
+	for _, r := range reports {
+		require.NotEqual(t, "@0xengine/meow", r.Name,
+			"no report may come from the gutted manifest")
+	}
+}
+
+// TestFetchCacheOnlyUnrecordedServesButDoesNotAdopt pins rule 3 for this
+// source: a pre-integrity-fix payload (no .sha256 sidecar) under the
+// cache-only directive is SERVED — refusing would brick every upgraded
+// installation inside the freshness window — but its hash must NOT be
+// adopted, because nothing upstream confirms the bytes. Adoption under
+// cache-only would bless whatever is on disk and permanently blind the
+// binding layer.
+func TestFetchCacheOnlyUnrecordedServesButDoesNotAdopt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", `"npm-1"`)
+		_, _ = w.Write(loadFixture(t, "npm_manifest.json"))
+	}))
+	defer srv.Close()
+
+	cacheDir := t.TempDir()
+	// Simulate a pre-integrity-fix cache: payload + etag, no sidecar.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(cacheDir, "npm.json"), loadFixture(t, "npm_manifest.json"), 0o600))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(cacheDir, "npm.etag"), []byte(`"npm-1"`), 0o600))
+
+	src, err := datadog.New(datadog.Options{
+		BaseURL:  srv.URL,
+		CacheDir: cacheDir,
+		Logger:   zerolog.Nop(),
+	})
+	require.NoError(t, err)
+
+	ctx := intel.WithCacheOnly(context.Background())
+	reports, err := src.Fetch(ctx, intel.EcosystemNPM)
+	require.NoError(t, err, "an unrecorded payload must still serve under cache-only")
+	require.Len(t, reports, 7)
+
+	_, statErr := os.Stat(filepath.Join(cacheDir, "npm.json.sha256"))
+	require.True(t, os.IsNotExist(statErr),
+		"cache-only must NOT adopt (record) the hash of an unvalidated payload")
+}

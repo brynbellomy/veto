@@ -149,28 +149,62 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Cache-only directive (freshness window): skip the upstream HEAD etag
-	// probe and serve whatever is in memory, on disk as a parsed gob, or in
-	// the cached tarball. No usable local state falls through to the normal
-	// network path.
+	// Cache-integrity gate: both on-disk layers the cache-only directive
+	// below might serve — the parsed gob and the raw tarball — must have
+	// their verdicts computed BEFORE the directive. Serving from disk
+	// without consulting them is the whole vulnerability. (The in-memory
+	// cache needs no gate: it was fetched and parsed in this process, so
+	// it is pre-verified.)
+	gobVerdict := fsutil.PayloadHashVerdict(s.anyGobPath())
+	tarballPath := filepath.Join(s.cacheDir, "main.tar.gz")
+	tarballVerdict := fsutil.PayloadHashVerdict(tarballPath)
+
+	// Cache-only directive: the caller's freshness window says the advisory
+	// set was fetched moments ago, so skip the upstream HEAD etag probe and
+	// serve whatever is in memory, on disk as a parsed gob, or in the cached
+	// tarball. No usable local state falls through to the normal network
+	// path — the directive is an optimization, never a correctness gate.
+	//
+	// Two rules make it safe, and both are easy to lose in a merge:
+	//
+	//  1. A HashMismatch on EITHER local layer does NOT short-circuit. The
+	//     damaged layer is skipped (the gob load fails; the tarball fallback
+	//     is not taken) and the fetch falls through to the network path,
+	//     which re-downloads and re-records. A freshness window saying "we
+	//     fetched recently" is not evidence that the bytes on disk are the
+	//     bytes we fetched.
+	//  2. HashUnrecorded (a pre-integrity-fix cache) is served but NEVER
+	//     adopted. Adoption is justified only by upstream validation — a
+	//     live HEAD probe confirming the etag — which the cache-only path
+	//     has explicitly skipped. Adopting here would bless whatever happens
+	//     to be on disk and permanently blind the gate. The persistent
+	//     per-source baseline is the backstop for that case.
 	if intel.CacheOnly(ctx) {
 		if s.loaded {
 			return s.cached, nil
 		}
-		if cached, ok := s.loadGob(""); ok {
-			s.cached = cached
-			s.loaded = true
-			return s.cached, nil
-		}
-		tarballPath := filepath.Join(s.cacheDir, "main.tar.gz")
-		if _, err := os.Stat(tarballPath); err == nil {
-			reports, err := s.parseTarball(tarballPath)
-			if err == nil {
-				s.cached = reports
+		if gobVerdict != fsutil.HashMismatch {
+			if cached, ok := s.loadGobUnvalidated(""); ok {
+				s.cached = cached
 				s.loaded = true
 				return s.cached, nil
 			}
-			s.logger.Warn().Err(err).Msg("cache-only: cached tarball failed to parse; falling back to network")
+		}
+		if tarballVerdict != fsutil.HashMismatch {
+			if _, err := os.Stat(tarballPath); err == nil {
+				if tarballVerdict == fsutil.HashUnrecorded {
+					s.logger.Warn().
+						Str("payload_path", tarballPath).
+						Msg("serving pre-integrity cache under cache-only directive; not adopting its hash without upstream validation")
+				}
+				reports, err := s.parseTarball(tarballPath)
+				if err == nil {
+					s.cached = reports
+					s.loaded = true
+					return s.cached, nil
+				}
+				s.logger.Warn().Err(err).Msg("cache-only: cached tarball failed to parse; falling back to network")
+			}
 		}
 	}
 
@@ -187,6 +221,15 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 			s.loaded = true
 			return s.cached, nil
 		}
+		// No usable local layer survived its content-hash gate (or none
+		// existed) and upstream is unreachable. When a local layer exists
+		// but failed verification, this is cache damage with no repair
+		// path — the same condition the payload+etag sources fail closed
+		// on — so wrap ErrDamagedCache and let the store classify it.
+		if gobVerdict == fsutil.HashMismatch || tarballVerdict == fsutil.HashMismatch {
+			return nil, errors.With(intel.ErrDamagedCache, "openssf: local cache is damaged and upstream is unreachable").
+				Set("gob_hash", gobVerdict.String()).Set("tarball_hash", tarballVerdict.String())
+		}
 		return nil, errors.With(err, "openssf: cannot reach upstream and no local cache")
 	}
 
@@ -195,7 +238,9 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 	}
 
 	// Try the gob first — if disk matches upstream, we skip the heavy parse.
-	if cached, ok := s.loadGob(upstreamEtag); ok {
+	// The HEAD probe confirmed this etag live upstream, so an Unrecorded
+	// gob under it may be adopted (loadGobValidated with true).
+	if cached, ok := s.loadGobValidated(upstreamEtag, true); ok {
 		s.cached = cached
 		s.cacheEt = upstreamEtag
 		s.loaded = true
@@ -446,6 +491,12 @@ func (s *Source) gobPath(etag string) string {
 }
 
 func (s *Source) loadGob(etag string) ([]intel.MalwareReport, bool) {
+	return s.loadGobValidated(etag, false)
+}
+
+// loadGobValidated is loadGob with the upstream-validation flag threaded
+// to readGobFileValidated. See that method for why adoption requires it.
+func (s *Source) loadGobValidated(etag string, upstreamValidated bool) ([]intel.MalwareReport, bool) {
 	if etag == "" {
 		// Cold path with no etag — pick whichever gob is on disk.
 		entries, err := os.ReadDir(s.cacheDir)
@@ -454,15 +505,51 @@ func (s *Source) loadGob(etag string) ([]intel.MalwareReport, bool) {
 		}
 		for _, e := range entries {
 			if strings.HasPrefix(e.Name(), "parsed-") && strings.HasSuffix(e.Name(), ".gob") {
-				return s.readGobFile(filepath.Join(s.cacheDir, e.Name()))
+				return s.readGobFileValidated(filepath.Join(s.cacheDir, e.Name()), upstreamValidated)
 			}
 		}
 		return nil, false
 	}
-	return s.readGobFile(s.gobPath(etag))
+	return s.readGobFileValidated(s.gobPath(etag), upstreamValidated)
+}
+
+// loadGobUnvalidated is loadGob for paths that reached the gob without
+// upstream confirming its etag (cache-only directive, HEAD failure). The
+// mismatch gate still applies; adoption does not.
+func (s *Source) loadGobUnvalidated(etag string) ([]intel.MalwareReport, bool) {
+	return s.loadGobValidated(etag, false)
+}
+
+// anyGobPath returns the path of whichever parsed gob is on disk ("" when
+// none), so the cache-only path can gate on its content hash before
+// deciding to load it.
+func (s *Source) anyGobPath() string {
+	entries, err := os.ReadDir(s.cacheDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "parsed-") && strings.HasSuffix(e.Name(), ".gob") {
+			return filepath.Join(s.cacheDir, e.Name())
+		}
+	}
+	return ""
 }
 
 func (s *Source) readGobFile(path string) ([]intel.MalwareReport, bool) {
+	return s.readGobFileValidated(path, false)
+}
+
+// readGobFileValidated loads a parsed gob. upstreamValidated reports
+// whether upstream actually confirmed the etag naming this gob (a live
+// HEAD probe whose etag matches). ONLY then may an Unrecorded
+// (pre-integrity-fix) gob have its hash adopted. Callers that reached the
+// gob without upstream validation — the cache-only directive, which skips
+// the HEAD probe entirely, and the HEAD-failure fallback — must pass
+// false: adopting there would bless whatever bytes happen to be on disk,
+// laundering existing damage into "verified" and permanently blinding
+// the gate.
+func (s *Source) readGobFileValidated(path string, upstreamValidated bool) ([]intel.MalwareReport, bool) {
 	// Cache-integrity gate: the gob's filename is derived from the etag,
 	// but anything with write access to the cache dir can damage its
 	// bytes. A hash mismatch means the parsed-report cache cannot be
@@ -477,13 +564,18 @@ func (s *Source) readGobFile(path string) ([]intel.MalwareReport, bool) {
 			Msg("parsed gob failed content-hash verification; ignoring cache")
 		return nil, false
 	case fsutil.HashUnrecorded:
-		// The etag matched upstream (the caller only reaches the gob when
-		// it did), so the gob's bytes are upstream-consistent: adopt them
-		// by recording the hash now.
-		if body, readErr := os.ReadFile(path); readErr == nil {
-			if hashErr := fsutil.RecordPayloadHash(path, body); hashErr != nil {
-				s.logger.Warn().Err(hashErr).Msg("adopt grandfathered gob hash")
+		if upstreamValidated {
+			// The etag was confirmed live upstream, so the gob's bytes are
+			// upstream-consistent: adopt them by recording the hash now.
+			if body, readErr := os.ReadFile(path); readErr == nil {
+				if hashErr := fsutil.RecordPayloadHash(path, body); hashErr != nil {
+					s.logger.Warn().Err(hashErr).Msg("adopt grandfathered gob hash")
+				}
 			}
+		} else {
+			s.logger.Warn().
+				Str("path", path).
+				Msg("serving pre-integrity gob without upstream validation; not adopting its hash")
 		}
 	}
 	f, err := os.Open(path)

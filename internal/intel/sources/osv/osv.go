@@ -145,31 +145,57 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 	zipPath := filepath.Join(s.cacheDir, ecoPath+".zip")
 	etagPath := filepath.Join(s.cacheDir, ecoPath+".etag")
 
-	// Cache-only directive (freshness window): serve from memory or the
-	// on-disk zip without a network round-trip. No usable cache falls
-	// through to the normal network path.
-	if intel.CacheOnly(ctx) {
-		if entry, ok := s.cached[eco]; ok {
-			return entry.reports, nil
-		}
-		if _, statErr := os.Stat(zipPath); statErr == nil {
-			reports, parseErr := parseZip(zipPath, s.includeVuln, s.logger)
-			if parseErr == nil {
-				s.cached[eco] = ecosystemEntry{etag: "", reports: reports}
-				return reports, nil
-			}
-			s.logger.Warn().Err(parseErr).Str("ecosystem", string(eco)).Msg("cache-only: cached zip failed to parse; falling back to network")
-		}
-	}
-
-	prevEtag, _ := os.ReadFile(etagPath)
-
 	// Cache-integrity gate: the etag names the upstream representation,
 	// not the bytes on disk. A hash mismatch downgrades this fetch to a
 	// cache miss so the 200 path re-downloads and re-records. Unrecorded
 	// (pre-integrity-fix cache) stays a conditional GET; the 200 path
 	// writes the sidecar on the next body.
+	//
+	// This MUST be computed before the cache-only directive below. Serving
+	// from disk without consulting it is the whole vulnerability.
 	hashVerdict := fsutil.PayloadHashVerdict(zipPath)
+
+	// Cache-only directive: the caller's freshness window says the advisory
+	// set was fetched moments ago, so serve from memory or the on-disk zip
+	// without a network round-trip. No usable cache falls through to the
+	// normal path — the directive is an optimization, never a correctness
+	// gate.
+	//
+	// Two rules make it safe, and both are easy to lose in a merge:
+	//
+	//  1. The in-memory cache short-circuits freely: it was fetched and
+	//     parsed in this process, so it is pre-verified.
+	//  2. The on-disk zip is gated on its content hash. A HashMismatch does
+	//     NOT short-circuit — it falls through to the network path, which
+	//     re-downloads and re-records — and HashUnrecorded (a
+	//     pre-integrity-fix zip) serves but is NEVER adopted: adoption is
+	//     justified only by a live 304, where upstream confirmed the etag
+	//     names these bytes. Under cache-only nothing confirms anything, so
+	//     adopting would bless whatever happens to be on disk. The
+	//     persistent per-source baseline is the backstop for that case.
+	if intel.CacheOnly(ctx) {
+		if entry, ok := s.cached[eco]; ok {
+			return entry.reports, nil
+		}
+		if hashVerdict != fsutil.HashMismatch {
+			if _, statErr := os.Stat(zipPath); statErr == nil {
+				if hashVerdict == fsutil.HashUnrecorded {
+					s.logger.Warn().
+						Str("payload_path", zipPath).
+						Msg("serving pre-integrity cache under cache-only directive; not adopting its hash without upstream validation")
+				}
+				reports, parseErr := parseZip(zipPath, s.includeVuln, s.logger)
+				if parseErr == nil {
+					s.cached[eco] = ecosystemEntry{etag: "", reports: reports}
+					return reports, nil
+				}
+				s.logger.Warn().Err(parseErr).Str("ecosystem", string(eco)).Msg("cache-only: cached zip failed to parse; falling back to network")
+			}
+		}
+	}
+
+	prevEtag, _ := os.ReadFile(etagPath)
+
 	if hashVerdict == fsutil.HashMismatch && len(prevEtag) > 0 {
 		s.logger.Warn().
 			Str("payload_path", zipPath).

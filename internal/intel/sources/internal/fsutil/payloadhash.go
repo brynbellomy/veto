@@ -40,6 +40,20 @@ const (
 	HashUnrecorded
 )
 
+// String makes HashVerdict log-friendly.
+func (v HashVerdict) String() string {
+	switch v {
+	case HashMatch:
+		return "match"
+	case HashMismatch:
+		return "mismatch"
+	case HashUnrecorded:
+		return "unrecorded"
+	default:
+		return "unknown"
+	}
+}
+
 // RecordPayloadHash writes the SHA-256 of payload to <path>.sha256
 // atomically. Call immediately after the payload itself is durably
 // written, so the window where a payload exists without its hash is
