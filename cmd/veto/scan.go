@@ -133,7 +133,7 @@ func runScanWithOpts(logger zerolog.Logger, cfg config, opts scanOpts) int {
 			logger.Error().Err(err).Msg("build intel store")
 			return exitInternal
 		}
-		if err := store.Refresh(ctx); err != nil {
+		if err := refreshStoreWithFreshnessWindow(logger, cfg, store); err != nil {
 			logger.Error().Err(err).Msg("intel refresh failed during scan")
 			fmt.Fprintln(os.Stderr, "veto: INTERNAL ERROR — intel refresh failed; scan aborted fail-closed.")
 			return exitInternal

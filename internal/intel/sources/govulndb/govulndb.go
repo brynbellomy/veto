@@ -152,6 +152,24 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 	zipPath := filepath.Join(s.cacheDir, "vulndb.zip")
 	etagPath := filepath.Join(s.cacheDir, "vulndb.etag")
 
+	// Cache-only directive (freshness window): serve from memory or the
+	// on-disk zip without a network round-trip. No usable cache falls
+	// through to the normal network path.
+	if intel.CacheOnly(ctx) {
+		if s.loaded {
+			return s.cached, nil
+		}
+		if _, statErr := os.Stat(zipPath); statErr == nil {
+			reports, parseErr := parseZip(zipPath, s.logger)
+			if parseErr == nil {
+				s.cached = reports
+				s.loaded = true
+				return reports, nil
+			}
+			s.logger.Warn().Err(parseErr).Msg("cache-only: cached zip failed to parse; falling back to network")
+		}
+	}
+
 	prevEtag, _ := os.ReadFile(etagPath)
 
 	// Cache-integrity gate: the etag names the upstream representation,

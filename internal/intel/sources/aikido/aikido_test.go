@@ -95,6 +95,49 @@ func TestFetchEtagShortCircuit(t *testing.T) {
 	require.Equal(t, `"abc123"`, string(etag))
 }
 
+// TestFetchCacheOnlyServesFromDiskWithoutNetwork: when the context carries
+// the cache-only directive (the CLI's freshness window says the advisory
+// set was fetched moments ago), Fetch must serve the on-disk payload
+// without any upstream round-trip. A second fetch with a wiped cache must
+// fall through to the network — the directive is an optimization, never a
+// correctness gate.
+func TestFetchCacheOnlyServesFromDiskWithoutNetwork(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("ETag", `"abc123"`)
+		_, _ = w.Write([]byte(samplePayload))
+	}))
+	defer srv.Close()
+
+	cacheDir := t.TempDir()
+	src, err := aikido.New(aikido.Options{
+		BaseURL:  srv.URL,
+		CacheDir: cacheDir,
+		Logger:   zerolog.Nop(),
+	})
+	require.NoError(t, err)
+
+	// Prime the on-disk cache with a normal (network) fetch.
+	first, err := src.Fetch(context.Background(), intel.EcosystemNPM)
+	require.NoError(t, err)
+	require.Len(t, first, 3)
+	require.Equal(t, int32(1), hits.Load())
+
+	// Cache-only fetch: zero upstream hits, same reports.
+	reports, err := src.Fetch(intel.WithCacheOnly(context.Background()), intel.EcosystemNPM)
+	require.NoError(t, err)
+	require.Len(t, reports, 3)
+	require.Equal(t, int32(1), hits.Load(), "cache-only fetch must not contact upstream")
+
+	// Wipe the on-disk cache: cache-only must fall back to network.
+	require.NoError(t, os.Remove(filepath.Join(cacheDir, "npm.json")))
+	reports, err = src.Fetch(intel.WithCacheOnly(context.Background()), intel.EcosystemNPM)
+	require.NoError(t, err)
+	require.Len(t, reports, 3)
+	require.Equal(t, int32(2), hits.Load(), "cache-only with missing cache must fall back to network")
+}
+
 // TestFetchRejectsOversizedPayload: a MITM'd or compromised upstream
 // cannot OOM veto by serving a multi-GB body. The fetcher caps
 // payloads with io.LimitReader; reads past the cap are an error.

@@ -539,6 +539,15 @@ succeed on the very first run, the veto refuses installs rather
 than fail open. A sanity floor of 1000 reports total catches the
 "every feed returned []" case loudly.
 
+**Freshness window.** A `last-refresh` marker in the cache dir records
+the last successful refresh. Invocations within 3 minutes of it
+(`intel.RefreshFreshnessWindow`) skip every upstream round-trip and
+serve from the on-disk caches, so agent loops and CI retries don't pay
+one HTTP request per (source, ecosystem) per run. A missing, corrupt,
+or future-dated marker always falls back to a full refresh — a bad
+cache file can never suppress a security update. `veto doctor` ignores
+the window deliberately: diagnostics probe real upstream state.
+
 ## Usage
 
 ```sh
@@ -548,6 +557,22 @@ veto npm install chai-as-upgraded
 # veto: install refused — package intelligence flagged the following:
 #   - chai-as-upgraded@<any> (ecosystem: npm)
 #       [aikido] MALWARE
+
+# Ask veto what it thinks of a command line WITHOUT executing anything.
+# JSON verdict from the intel+policy gate over argv and on-disk manifests.
+# Exit codes match the enforcement path (0 allow/passthrough, 1 refuse,
+# 64 usage, 70 internal).
+veto test npm install lodash
+# {"decision":"allow","pm":"npm","args":["install","lodash"],...}
+veto test --format json pip install evil-pkg
+#
+# SCOPE: an "allow" verdict is NOT a statement that the install is safe.
+# It excludes the enforcement-only layers that run after the intel gate:
+# the resolver pre-scan (resolved transitive tree), the binding.gyp
+# tarball and node_modules tree scans (phantom-gyp / Miasma), and the
+# .pth wheel and site-packages tree scans (Hades). A clean-argv package
+# with a flagged transitive dep returns "allow" here while the executing
+# gate refuses. Use it as a fast intel lookup, not a replacement gate.
 
 # Refresh malware intel manually.
 veto sync

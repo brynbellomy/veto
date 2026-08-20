@@ -134,6 +134,31 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Cache-only directive (freshness window): skip the upstream HEAD etag
+	// probe and serve whatever is in memory, on disk as a parsed gob, or in
+	// the cached tarball. No usable local state falls through to the normal
+	// network path.
+	if intel.CacheOnly(ctx) {
+		if s.loaded {
+			return s.cached, nil
+		}
+		if cached, ok := s.loadGob(""); ok {
+			s.cached = cached
+			s.loaded = true
+			return s.cached, nil
+		}
+		tarballPath := filepath.Join(s.cacheDir, "main.tar.gz")
+		if _, err := os.Stat(tarballPath); err == nil {
+			reports, err := s.parseTarball(tarballPath)
+			if err == nil {
+				s.cached = reports
+				s.loaded = true
+				return s.cached, nil
+			}
+			s.logger.Warn().Err(err).Msg("cache-only: cached tarball failed to parse; falling back to network")
+		}
+	}
+
 	upstreamEtag, err := s.headEtag(ctx)
 	if err != nil {
 		if s.loaded {

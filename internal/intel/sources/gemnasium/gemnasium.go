@@ -177,6 +177,15 @@ func (s *Source) fetchWithCache(ctx context.Context, payloadPath, etagPath strin
 }
 
 func (s *Source) fetchWithCacheBounded(ctx context.Context, payloadPath, etagPath string, retryAllowed bool) ([]byte, error) {
+	// Cache-only directive (freshness window): serve the on-disk tarball
+	// without a network round-trip. Missing cache falls through to the
+	// normal network path.
+	if intel.CacheOnly(ctx) {
+		if cached, err := os.ReadFile(payloadPath); err == nil {
+			return cached, nil
+		}
+	}
+
 	prevEtag, _ := os.ReadFile(etagPath)
 
 	// Cache-integrity gate: the etag names the upstream representation,

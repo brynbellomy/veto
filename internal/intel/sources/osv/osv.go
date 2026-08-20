@@ -145,6 +145,23 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 	zipPath := filepath.Join(s.cacheDir, ecoPath+".zip")
 	etagPath := filepath.Join(s.cacheDir, ecoPath+".etag")
 
+	// Cache-only directive (freshness window): serve from memory or the
+	// on-disk zip without a network round-trip. No usable cache falls
+	// through to the normal network path.
+	if intel.CacheOnly(ctx) {
+		if entry, ok := s.cached[eco]; ok {
+			return entry.reports, nil
+		}
+		if _, statErr := os.Stat(zipPath); statErr == nil {
+			reports, parseErr := parseZip(zipPath, s.includeVuln, s.logger)
+			if parseErr == nil {
+				s.cached[eco] = ecosystemEntry{etag: "", reports: reports}
+				return reports, nil
+			}
+			s.logger.Warn().Err(parseErr).Str("ecosystem", string(eco)).Msg("cache-only: cached zip failed to parse; falling back to network")
+		}
+	}
+
 	prevEtag, _ := os.ReadFile(etagPath)
 
 	// Cache-integrity gate: the etag names the upstream representation,

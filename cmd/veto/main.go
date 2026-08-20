@@ -4,6 +4,7 @@
 // Usage:
 //
 //	veto <pm> <pm-args...>     gate an install command, then exec the real PM
+//	veto test <pm> <pm-args...>  print the gate's verdict; execute nothing
 //	veto sync                  refresh the intel store from all sources
 //	veto status                show source health and store size
 //	veto update                self-update the veto binary (via go install)
@@ -260,6 +261,8 @@ func run(args []string) int {
 		return exitOK
 	case "version", "--version", "-v":
 		return runVersion(os.Stdout)
+	case "test":
+		return runVerdict(logger, cfg, args[1:])
 	case "sync":
 		return runSync(logger, cfg)
 	case "status":
@@ -354,45 +357,20 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 		return execPMOrPythonM(cfg, pmName, pmArgs)
 	}
 
-	installs := pm.ParseInstalls(pmArgs)
-	manifestRefs := pm.ManifestRefs(pmArgs)
-	preflight, hasPreflight := projectPreflightPlan(pm, pmArgs, installs, manifestRefs)
-	if installs == nil && len(manifestRefs) == 0 && !hasPreflight {
+	in, decided := gateInputsFor(logger, cfg, pm, pmArgs)
+	if !decided {
 		// Not an install verb — pass through immediately, no intel needed.
 		return execPMOrPythonM(cfg, pmName, pmArgs)
 	}
-
-	store, err := buildStore(logger, cfg)
-	if err != nil {
-		logger.Error().Err(err).Msg("build intel store")
-		return exitInternal
-	}
-
-	// Refresh synchronously before gating; the cache layer keeps this fast on
-	// the common path.
-	ctx, cancel := context.WithTimeout(context.Background(), syncTimeout)
-	defer cancel()
-	if err := store.Refresh(ctx); err != nil {
-		// Don't fail open: if we have zero intel, we can't gate. Refuse with
-		// a clear message rather than letting an install through unchecked.
-		logger.Error().Err(err).Msg("intel refresh failed — refusing to gate without data")
-		fmt.Fprintln(os.Stderr, "veto: INTERNAL ERROR — intel refresh failed; install aborted fail-closed.")
-		return exitInternal
-	}
-
-	// Sanity floor on store health. An empty store means every lookup would
-	// return "clean," which is worse than useless — it's silently allowing
-	// packages through under the appearance of being gated. Either upstream
-	// is broken or compromised. Fail closed loudly.
-	if reportCount := store.ReportCount(); reportCount < minHealthyReportCount {
-		logger.Error().
-			Int("reports", reportCount).
-			Int("floor", minHealthyReportCount).
-			Msg("intel store below sanity floor — refusing to gate")
-		fmt.Fprintf(os.Stderr, "veto: INTERNAL ERROR — intel store has only %d reports (expected at least %d); install aborted fail-closed.\n", reportCount, minHealthyReportCount)
+	if in.store == nil {
+		// gateInputsFor already logged the failure; storeErr carries the
+		// case-specific line (build vs. refresh vs. sanity floor).
+		fmt.Fprintln(os.Stderr, in.storeErr)
 		fmt.Fprintln(os.Stderr, "Check that your sources are configured correctly and reachable: `veto status` and `veto sync`.")
 		return exitInternal
 	}
+	installs, manifestRefs, expander, policy := in.installs, in.manifestRefs, in.expander, in.policy
+	store := in.store
 
 	// Per-source damage check. A (source, ecosystem) bucket whose cache
 	// failed integrity verification — and could not be re-fetched or
@@ -433,13 +411,12 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 		}
 	}
 
-	expander := newCompoundExpander()
-	policy := gate.DefaultPolicy()
-	policy.ManifestExpander = expander
-	if hasPreflight {
+	// expander and policy come from gateInputsFor now (destructured above);
+	// the pre-refactor construction that stood here is redundant.
+	if in.hasPreflight {
 		preflightPolicy := policy
 		preflightPolicy.ManifestExpander = projectPreflightExpander{delegate: expander}
-		decision := gate.New(store, preflightPolicy, logger).Evaluate([]packagemanager.Install{}, preflight.ManifestRefs...)
+		decision := gate.New(store, preflightPolicy, logger).Evaluate([]packagemanager.Install{}, in.preflight.ManifestRefs...)
 		switch decision.Outcome {
 		case gate.OutcomeRefuse:
 			printRefusal(os.Stderr, decision)
@@ -771,9 +748,7 @@ func runSync(logger zerolog.Logger, cfg config) int {
 		logger.Error().Err(err).Msg("build intel store")
 		return exitInternal
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), syncTimeout)
-	defer cancel()
-	if err := store.Refresh(ctx); err != nil {
+	if err := refreshStoreWithFreshnessWindow(logger, cfg, store); err != nil {
 		logger.Error().Err(err).Msg("refresh")
 		return exitInternal
 	}
@@ -814,7 +789,9 @@ func runSync(logger zerolog.Logger, cfg config) int {
 	// already succeeded, and IOC hash-matching is a supplementary scan-time
 	// signal, not a gate input.
 	iocStore := buildIOCStore(logger, cfg)
-	if err := iocStore.Refresh(ctx); err != nil {
+	iocCtx, iocCancel := context.WithTimeout(context.Background(), syncTimeout)
+	defer iocCancel()
+	if err := iocStore.Refresh(iocCtx); err != nil {
 		logger.Warn().Err(err).Msg("ioc refresh failed; continuing")
 	}
 
@@ -1693,6 +1670,34 @@ func defaultCacheDir() string {
 	return filepath.Join(home, ".cache", "veto")
 }
 
+// refreshStoreWithFreshnessWindow refreshes the intel store, honoring the
+// short-lived freshness window: when the recorded last-successful-refresh
+// is younger than intel.RefreshFreshnessWindow, sources serve from their
+// on-disk caches without network round-trips. A successful refresh records
+// the marker. Marker failures are logged and otherwise ignored — the
+// fail-safe direction is always "refresh now," never "stay stale."
+//
+// doctor's checkIntel deliberately does NOT use this helper: a diagnostic
+// must probe the real upstream state, not the cache.
+func refreshStoreWithFreshnessWindow(logger zerolog.Logger, cfg config, store intel.Store) error {
+	ctx, cancel := context.WithTimeout(context.Background(), syncTimeout)
+	defer cancel()
+
+	if last, fresh := intel.ReadLastRefresh(cfg.CacheDir, time.Now()); fresh {
+		logger.Debug().Time("last_refresh", last).Msg("advisory cache inside freshness window; serving from disk cache")
+		ctx = intel.WithCacheOnly(ctx)
+	}
+
+	if err := store.Refresh(ctx); err != nil {
+		return err
+	}
+
+	if err := intel.WriteLastRefresh(cfg.CacheDir, time.Now()); err != nil {
+		logger.Warn().Err(err).Msg("record refresh marker")
+	}
+	return nil
+}
+
 // buildStore constructs the intel store from the configured sources. Unknown
 // source IDs in config log a warning and are skipped — the user can mistype
 // and still get a working store.
@@ -1930,6 +1935,16 @@ func printUsage(w io.Writer) {
 
 Usage:
   veto <pm> <pm-args...>    gate a package-manager invocation, then exec it
+  veto test [--format json|text] <pm> <pm-args...>
+                            verdict-only: evaluate the command against the
+                            intel+policy gate and print the decision WITHOUT
+                            executing anything. JSON by default. Exit codes
+                            match the enforcement path (0 allow/passthrough,
+                            1 refuse, 64 usage, 70 internal/abort).
+                            Scope: "allow" covers argv + on-disk manifests
+                            only — it excludes the resolver pre-scan
+                            (transitives) and the gyp/.pth worm scans, so
+                            it is not a statement that the install is safe.
   veto sync                 refresh malware intel from all configured sources
   veto status               print configured sources and cache location
   veto update [--check] [--full] [--ref REF]
