@@ -34,6 +34,13 @@ type Store interface {
 	// tuples. Callers can use this to fail closed when the index is implausibly
 	// small (e.g. an upstream feed returning an empty payload).
 	ReportCount() int
+
+	// Damaged returns the (source, ecosystem) buckets that failed
+	// integrity verification on the most recent Refresh and could not be
+	// repaired or retained. The base Store implementation returns nil;
+	// BaselineStore (NewStoreWithBaseline) reports real damage. Callers
+	// enforcing fail-closed behavior consult this after Refresh.
+	Damaged() []SourceDamage
 }
 
 // NewStore builds a Store backed by the given sources. The Store is empty
@@ -66,6 +73,24 @@ func NewStore(logger zerolog.Logger, sources ...Source) Store {
 // baseline of a single report, and an empty fetch following a single
 // stale one is the case where the new data is probably correct.
 const partialDropThreshold = 0.5
+
+// SourceDamage describes one (source, ecosystem) bucket that failed
+// integrity verification or implausibly collapsed against its baseline,
+// and could not be repaired or retained. Reported via Store.Damaged so
+// the caller (the gate, sync, doctor) can decide fail-closed behavior
+// and the operator can see exactly which source's coverage went missing.
+type SourceDamage struct {
+	SourceID  string
+	Ecosystem Ecosystem
+	// Reason is a human-readable classification of the failure mode.
+	Reason string
+	// Got is the report count the fetch produced (0 when the fetch
+	// errored before producing reports).
+	Got int
+	// Baseline is the recorded known-good count (0 when no baseline
+	// existed for the bucket).
+	Baseline int
+}
 
 // versionKey targets exact (ecosystem, name, version) lookups.
 type versionKey struct {
@@ -490,4 +515,11 @@ func (s *memStore) ReportCount() int {
 		}
 	}
 	return total
+}
+
+// Damaged implements Store. The base store has no persistent baseline and
+// no damaged-cache classification, so it always reports no damage. Use
+// NewStoreWithBaseline for the integrity-enforcing variant.
+func (s *memStore) Damaged() []SourceDamage {
+	return nil
 }

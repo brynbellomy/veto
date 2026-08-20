@@ -41,6 +41,7 @@ import (
 
 	"github.com/brynbellomy/veto/internal/intel"
 	"github.com/brynbellomy/veto/internal/intel/osvschema"
+	"github.com/brynbellomy/veto/internal/intel/sources/internal/fsutil"
 )
 
 const (
@@ -153,6 +154,19 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 
 	prevEtag, _ := os.ReadFile(etagPath)
 
+	// Cache-integrity gate: the etag names the upstream representation,
+	// not the bytes on disk. A hash mismatch downgrades this fetch to a
+	// cache miss so the 200 path re-downloads and re-records. Unrecorded
+	// (pre-integrity-fix cache) stays a conditional GET; the 200 path
+	// writes the sidecar on the next body.
+	hashVerdict := fsutil.PayloadHashVerdict(zipPath)
+	if hashVerdict == fsutil.HashMismatch && len(prevEtag) > 0 {
+		s.logger.Warn().
+			Str("payload_path", zipPath).
+			Msg("cached zip failed content-hash verification; forcing full refetch")
+		prevEtag = nil
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.zipURL, nil)
 	if err != nil {
 		return nil, errors.With(err, "build request")
@@ -167,6 +181,13 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 		if s.loaded {
 			s.logger.Warn().Err(err).Msg("govulndb unreachable, using in-memory cache")
 			return s.cached, nil
+		}
+		// The integrity gate applies to the disk path: with no network
+		// there is no way to repair a damaged payload, and serving it
+		// would silently reduce this source's coverage.
+		if hashVerdict == fsutil.HashMismatch {
+			return nil, errors.With(intel.ErrDamagedCache, "cached zip is damaged and upstream is unreachable").
+				Set("url", s.zipURL).Set("payload_path", zipPath)
 		}
 		if _, statErr := os.Stat(zipPath); statErr == nil {
 			s.logger.Warn().Err(err).Msg("govulndb unreachable, re-parsing cached zip")
@@ -189,6 +210,29 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 	case http.StatusNotModified:
 		if s.loaded && s.cacheEt == string(prevEtag) {
 			return s.cached, nil
+		}
+		// The 304 validated the etag, but the etag only names the upstream
+		// representation. Re-verify the payload hash NOW so damaged bytes
+		// cannot ride a 304 into the index. Mismatch → drop the etag and
+		// refetch (the refetch carries no If-None-Match, so it cannot
+		// 304-loop).
+		switch fsutil.PayloadHashVerdict(zipPath) {
+		case fsutil.HashMismatch:
+			s.logger.Warn().
+				Str("payload_path", zipPath).
+				Msg("304 validated etag but cached zip failed content-hash verification; forcing refetch")
+			_ = os.Remove(etagPath)
+			return s.ensureLoaded(ctx)
+		case fsutil.HashUnrecorded:
+			// Grandfathered zip (pre-integrity-fix cache) that just passed
+			// a live 304: adopt it by recording its hash now, so a
+			// steady-state cache that only ever sees 304s still becomes
+			// content-bound.
+			if body, readErr := os.ReadFile(zipPath); readErr == nil {
+				if hashErr := fsutil.RecordPayloadHash(zipPath, body); hashErr != nil {
+					s.logger.Warn().Err(hashErr).Msg("adopt grandfathered payload hash")
+				}
+			}
 		}
 		reports, err := parseZip(zipPath, s.logger)
 		if err != nil {
@@ -230,6 +274,13 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 			os.Remove(tmpPath)
 			return nil, errors.With(err, "rename zip")
 		}
+		// Bind the zip to its content hash so a later 304 revalidates the
+		// bytes on disk, not just the upstream representation.
+		if body, readErr := os.ReadFile(zipPath); readErr == nil {
+			if hashErr := fsutil.RecordPayloadHash(zipPath, body); hashErr != nil {
+				s.logger.Warn().Err(hashErr).Msg("record payload hash")
+			}
+		}
 
 		// Parse BEFORE persisting the etag so a malformed payload doesn't pin
 		// us into a 304-loop perma-failure: if parse fails here we leave the
@@ -237,6 +288,10 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 		// rather than re-parsing the same broken zip from disk.
 		reports, err := parseZip(zipPath, s.logger)
 		if err != nil {
+			// Parse failed — the freshly downloaded bytes are unusable. Drop
+			// the hash sidecar so the damaged zip is never treated as
+			// validated (the etag was never written for it).
+			fsutil.RemovePayloadHash(zipPath)
 			return nil, errors.With(err, "parse fresh zip")
 		}
 		if upstreamEtag != "" {

@@ -1360,6 +1360,23 @@ func checkIntel(logger zerolog.Logger, cfg config) []checkResult {
 			detail: fmt.Sprintf("%d reports across %d sources", count, len(store.SourceIDs())),
 		})
 	}
+	// Per-source integrity: a damaged (source, ecosystem) bucket means the
+	// gate for that ecosystem is missing coverage. doctor is the "did my
+	// install work?" entry point, so surface it as a distinct failing row.
+	if damaged := store.Damaged(); len(damaged) > 0 {
+		details := make([]string, 0, len(damaged))
+		for _, d := range damaged {
+			details = append(details, fmt.Sprintf("%s/%s: %s (got %d, baseline %d)", d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline))
+		}
+		out = append(out, checkResult{
+			status:   statusFail,
+			label:    "intel source integrity",
+			detail:   strings.Join(details, "; "),
+			howToFix: "Restore network and run `veto sync`. If a feed legitimately shrank, remove the baseline file (~/.cache/veto/intel-baseline.json) and re-sync.",
+		})
+	} else {
+		out = append(out, checkResult{status: statusPass, label: "intel source integrity", detail: "all sources verified"})
+	}
 	// Cache freshness — each source's cache dir contains files; the
 	// newest mtime is "last refreshed." 24h is the staleness window.
 	if freshness, ok := newestCacheMtime(cfg.CacheDir); ok {

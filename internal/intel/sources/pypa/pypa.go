@@ -137,13 +137,17 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 	if err != nil {
 		// Drop the pending etag so it isn't promoted; also drop the
 		// canonical etag so the next refresh re-downloads instead of
-		// 304-looping on the broken payload.
+		// 304-looping on the broken payload. The content-hash sidecar
+		// goes too — the bytes are what we stored, but they're not
+		// parseable, and a future fetch must not treat them as
+		// validated-good.
 		if rmErr := os.Remove(etagPath + ".pending"); rmErr != nil && !os.IsNotExist(rmErr) {
 			s.logger.Warn().Err(rmErr).Msg("remove etag.pending after parse failure")
 		}
 		if rmErr := os.Remove(etagPath); rmErr != nil && !os.IsNotExist(rmErr) {
 			s.logger.Warn().Err(rmErr).Msg("remove etag after parse failure")
 		}
+		fsutil.RemovePayloadHash(tarballPath)
 		return nil, err
 	}
 	// Phase 1.9: parse succeeded — promote the pending etag.
@@ -170,6 +174,19 @@ func (s *Source) fetchWithCache(ctx context.Context, payloadPath, etagPath strin
 func (s *Source) fetchWithCacheBounded(ctx context.Context, payloadPath, etagPath string, retryAllowed bool) ([]byte, error) {
 	prevEtag, _ := os.ReadFile(etagPath)
 
+	// Cache-integrity gate: the etag names the upstream representation,
+	// not the bytes on disk. A hash mismatch downgrades this fetch to a
+	// cache miss so the 200 path re-downloads and re-records. Unrecorded
+	// (pre-integrity-fix cache) stays a conditional GET; the 200 path
+	// writes the sidecar on the next body.
+	hashVerdict := fsutil.PayloadHashVerdict(payloadPath)
+	if hashVerdict == fsutil.HashMismatch && len(prevEtag) > 0 {
+		s.logger.Warn().
+			Str("payload_path", payloadPath).
+			Msg("cached tarball failed content-hash verification; forcing full refetch")
+		prevEtag = nil
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
 	if err != nil {
 		return nil, errors.With(err, "build request")
@@ -179,6 +196,14 @@ func (s *Source) fetchWithCacheBounded(ctx context.Context, payloadPath, etagPat
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
+		// Network failure — the integrity gate applies more strictly here:
+		// with no network there is no way to repair a damaged payload, and
+		// serving it would silently reduce this source's coverage.
+		// Mismatch → fail closed with ErrDamagedCache.
+		if hashVerdict == fsutil.HashMismatch {
+			return nil, errors.With(intel.ErrDamagedCache, "cached tarball is damaged and upstream is unreachable").
+				Set("url", s.url).Set("payload_path", payloadPath)
+		}
 		if cached, readErr := os.ReadFile(payloadPath); readErr == nil {
 			logEvt := s.logger.Warn().Err(err).Str("url", s.url)
 			if stat, statErr := os.Stat(payloadPath); statErr == nil {
@@ -207,6 +232,29 @@ func (s *Source) fetchWithCacheBounded(ctx context.Context, payloadPath, etagPat
 			_ = os.Remove(etagPath)
 			return s.fetchWithCacheBounded(ctx, payloadPath, etagPath, false)
 		}
+		// The 304 validated the etag; re-verify the payload hash now so a
+		// damaged or grandfathered-Unrecorded payload cannot ride a 304.
+		// Mismatch → drop the etag and refetch ONCE.
+		switch fsutil.PayloadHashVerdict(payloadPath) {
+		case fsutil.HashMismatch:
+			if !retryAllowed {
+				return nil, errors.With(intel.ErrDamagedCache, "304 validated etag but cached tarball is damaged").
+					Set("url", s.url).Set("payload_path", payloadPath)
+			}
+			s.logger.Warn().
+				Str("payload_path", payloadPath).
+				Msg("304 validated etag but cached tarball failed content-hash verification; forcing refetch")
+			_ = os.Remove(etagPath)
+			return s.fetchWithCacheBounded(ctx, payloadPath, etagPath, false)
+		case fsutil.HashUnrecorded:
+			// Grandfathered payload (pre-integrity-fix cache) that just
+			// passed a live 304: adopt it by recording its hash now, so a
+			// steady-state cache that only ever sees 304s still becomes
+			// content-bound.
+			if err := fsutil.RecordPayloadHash(payloadPath, cached); err != nil {
+				s.logger.Warn().Err(err).Msg("adopt grandfathered payload hash")
+			}
+		}
 		return cached, nil
 	case http.StatusOK:
 		// fall through
@@ -227,6 +275,11 @@ func (s *Source) fetchWithCacheBounded(ctx context.Context, payloadPath, etagPat
 	}
 	if err := fsutil.WriteAtomic(payloadPath, body); err != nil {
 		return nil, errors.With(err, "cache payload")
+	}
+	// Bind the payload to its content hash so a later 304 revalidates the
+	// bytes on disk, not just the upstream representation.
+	if err := fsutil.RecordPayloadHash(payloadPath, body); err != nil {
+		s.logger.Warn().Err(err).Msg("record payload hash")
 	}
 	// Phase 1.9: etag goes to a `.pending` sibling. The caller promotes
 	// it after parseTarball succeeds.

@@ -9,6 +9,7 @@ package ghsa
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/gob"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/brynbellomy/veto/internal/intel"
 	"github.com/brynbellomy/veto/internal/intel/osvschema"
+	"github.com/brynbellomy/veto/internal/intel/sources/internal/fsutil"
 )
 
 const (
@@ -218,7 +220,18 @@ func (s *Source) downloadIfChanged(ctx context.Context, upstreamEtag string) (st
 
 	if existing, err := os.ReadFile(etagPath); err == nil && string(existing) == upstreamEtag {
 		if _, err := os.Stat(tarballPath); err == nil {
-			return tarballPath, upstreamEtag, nil
+			// Cache-integrity gate: the etag matches, but the tarball's
+			// bytes may have been damaged on disk. A mismatch falls
+			// through to the download path (re-fetch + re-record).
+			// Unrecorded (pre-integrity-fix cache) is served as-is and
+			// self-heals on the next fresh download.
+			if fsutil.PayloadHashVerdict(tarballPath) == fsutil.HashMismatch {
+				s.logger.Warn().
+					Str("payload_path", tarballPath).
+					Msg("cached tarball failed content-hash verification; forcing re-download")
+			} else {
+				return tarballPath, upstreamEtag, nil
+			}
 		}
 	}
 
@@ -259,6 +272,13 @@ func (s *Source) downloadIfChanged(ctx context.Context, upstreamEtag string) (st
 	if err := os.Rename(tmpPath, tarballPath); err != nil {
 		os.Remove(tmpPath)
 		return "", "", errors.With(err, "rename tarball")
+	}
+	// Bind the tarball to its content hash so a later etag-reuse
+	// revalidates the bytes on disk, not just the upstream etag.
+	if body, readErr := os.ReadFile(tarballPath); readErr == nil {
+		if hashErr := fsutil.RecordPayloadHash(tarballPath, body); hashErr != nil {
+			s.logger.Warn().Err(hashErr).Msg("record payload hash")
+		}
 	}
 	// Phase 1.9: write etag to a `.pending` sibling. Promoted by the
 	// caller after parseTarball succeeds.
@@ -374,6 +394,29 @@ func (s *Source) loadGob(etag string) ([]intel.MalwareReport, bool) {
 }
 
 func (s *Source) readGobFile(path string) ([]intel.MalwareReport, bool) {
+	// Cache-integrity gate: the gob's filename is derived from the etag,
+	// but anything with write access to the cache dir can damage its
+	// bytes. A hash mismatch means the parsed-report cache cannot be
+	// trusted — fail the load (return not-ok) so the caller falls through
+	// to re-download and re-parse. Unrecorded (pre-integrity-fix cache)
+	// loads normally and is adopted below, so a steady-state cache whose
+	// etag never changes still becomes content-bound.
+	switch fsutil.PayloadHashVerdict(path) {
+	case fsutil.HashMismatch:
+		s.logger.Warn().
+			Str("path", path).
+			Msg("parsed gob failed content-hash verification; ignoring cache")
+		return nil, false
+	case fsutil.HashUnrecorded:
+		// The etag matched upstream (the caller only reaches the gob when
+		// it did), so the gob's bytes are upstream-consistent: adopt them
+		// by recording the hash now.
+		if body, readErr := os.ReadFile(path); readErr == nil {
+			if hashErr := fsutil.RecordPayloadHash(path, body); hashErr != nil {
+				s.logger.Warn().Err(hashErr).Msg("adopt grandfathered gob hash")
+			}
+		}
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, false
@@ -389,24 +432,17 @@ func (s *Source) readGobFile(path string) ([]intel.MalwareReport, bool) {
 
 func (s *Source) writeGob(etag string, reports []intel.MalwareReport) error {
 	path := s.gobPath(etag)
-	tmp, err := os.CreateTemp(s.cacheDir, "parsed-tmp-")
-	if err != nil {
-		return errors.With(err, "create temp gob")
-	}
-	tmpPath := tmp.Name()
-	enc := gob.NewEncoder(tmp)
-	if err := enc.Encode(gobBlob{Reports: reports}); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(gobBlob{Reports: reports}); err != nil {
 		return errors.With(err, "encode gob")
 	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return errors.With(err, "close gob")
+	if err := fsutil.WriteAtomic(path, buf.Bytes()); err != nil {
+		return errors.With(err, "write gob")
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return errors.With(err, "rename gob")
+	// Bind the gob to its content hash so a later load verifies the bytes
+	// on disk, not just the etag-derived filename.
+	if err := fsutil.RecordPayloadHash(path, buf.Bytes()); err != nil {
+		s.logger.Warn().Err(err).Msg("record gob hash")
 	}
 	return nil
 }

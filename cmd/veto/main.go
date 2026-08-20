@@ -394,6 +394,45 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 		return exitInternal
 	}
 
+	// Per-source damage check. A (source, ecosystem) bucket whose cache
+	// failed integrity verification — and could not be re-fetched or
+	// retained — means the gate is missing part of its coverage for that
+	// ecosystem. Serving the install anyway is silent degraded coverage,
+	// the exact failure mode the integrity layer exists to prevent, so
+	// for damage in an ecosystem this install touches we refuse (fail
+	// closed, same stance as a missing veto binary). Damage confined to
+	// ecosystems this install doesn't touch is reported loudly but does
+	// not block: an npm install must not wedge because the crates feed
+	// is rotting.
+	if refusals := damagedRefusals(store.Damaged(), pm.Ecosystem(), installs); len(refusals) > 0 {
+		for _, d := range refusals {
+			logger.Error().
+				Str("source", d.SourceID).
+				Str("ecosystem", string(d.Ecosystem)).
+				Str("reason", d.Reason).
+				Int("got", d.Got).
+				Int("baseline", d.Baseline).
+				Msg("intel source damaged — refusing to gate")
+		}
+		fmt.Fprintln(os.Stderr, "veto: INTERNAL ERROR — install aborted fail-closed.")
+		fmt.Fprintln(os.Stderr, "  Malware intel for this install is damaged and could not be restored:")
+		for _, d := range refusals {
+			fmt.Fprintf(os.Stderr, "    - source %s (ecosystem %s): %s (got %d reports, baseline %d)\n",
+				d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline)
+		}
+		fmt.Fprintln(os.Stderr, "\n  This is not a malware block — veto could not verify its intel coverage.")
+		fmt.Fprintln(os.Stderr, "  Remediation: restore network and run `veto sync` to re-fetch; if the feed")
+		fmt.Fprintln(os.Stderr, "  legitimately shrank, delete the baseline file and re-sync:")
+		fmt.Fprintf(os.Stderr, "    rm '%s'\n", filepath.Join(cfg.CacheDir, "intel-baseline.json"))
+		return exitInternal
+	} else if damaged := store.Damaged(); len(damaged) > 0 {
+		// Out-of-scope damage: loud, but non-blocking.
+		for _, d := range damaged {
+			fmt.Fprintf(os.Stderr, "veto: WARN — intel source %s (ecosystem %s) is damaged: %s (got %d, baseline %d); installs for that ecosystem will be refused until restored.\n",
+				d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline)
+		}
+	}
+
 	expander := newCompoundExpander()
 	policy := gate.DefaultPolicy()
 	policy.ManifestExpander = expander
@@ -702,6 +741,30 @@ func projectPreflightRequires(kind packagemanager.ManifestKind) bool {
 	}
 }
 
+// damagedRefusals filters the store's damage report down to the buckets
+// this gate invocation actually touches: the package manager's own
+// ecosystem plus the ecosystems of every install spec. Manifest refs
+// expand into installs of the same ecosystem as the PM, so pmEco covers
+// them. Damage outside that set is reported (by the caller) but does not
+// block — an npm install must not wedge because the crates feed is
+// rotting.
+func damagedRefusals(damaged []intel.SourceDamage, pmEco intel.Ecosystem, installs []packagemanager.Install) []intel.SourceDamage {
+	if len(damaged) == 0 {
+		return nil
+	}
+	touched := map[intel.Ecosystem]struct{}{pmEco: {}}
+	for _, ins := range installs {
+		touched[ins.Ref.Ecosystem] = struct{}{}
+	}
+	var out []intel.SourceDamage
+	for _, d := range damaged {
+		if _, ok := touched[d.Ecosystem]; ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 func runSync(logger zerolog.Logger, cfg config) int {
 	store, err := buildStore(logger, cfg)
 	if err != nil {
@@ -727,6 +790,20 @@ func runSync(logger zerolog.Logger, cfg config) int {
 			Msg("intel store below sanity floor after refresh")
 		fmt.Fprintf(os.Stderr, "veto: WARN — intel store has only %d reports (expected at least %d); sync succeeded but the index is implausibly small.\n", reportCount, minHealthyReportCount)
 		fmt.Fprintln(os.Stderr, "Check that your sources are configured correctly and reachable: `veto status`.")
+		return exitInternal
+	}
+	// Per-source damage report. sync is the operator's remediation entry
+	// point, so damage here fails the sync (non-zero) with the per-source
+	// detail — a sync that leaves damaged buckets has not actually synced.
+	if damaged := store.Damaged(); len(damaged) > 0 {
+		logger.Error().Int("damaged", len(damaged)).Msg("intel sources damaged after refresh")
+		fmt.Fprintln(os.Stderr, "veto: WARN — some intel sources are damaged and could not be restored:")
+		for _, d := range damaged {
+			fmt.Fprintf(os.Stderr, "  - source %s (ecosystem %s): %s (got %d reports, baseline %d)\n",
+				d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline)
+		}
+		fmt.Fprintf(os.Stderr, "If a feed legitimately shrank, delete the baseline file and re-sync: rm '%s'\n",
+			filepath.Join(cfg.CacheDir, "intel-baseline.json"))
 		return exitInternal
 	}
 	// Refresh the host-level IOC store alongside intel so `veto sync`
@@ -1619,6 +1696,11 @@ func defaultCacheDir() string {
 // buildStore constructs the intel store from the configured sources. Unknown
 // source IDs in config log a warning and are skipped — the user can mistype
 // and still get a working store.
+//
+// The store carries a persistent per-(source, ecosystem) count baseline at
+// <cacheDir>/intel-baseline.json so a damaged cache is detected even on a
+// cold process (the in-process retention guard resets every invocation).
+// See intel.BaselineStore for the detection policy.
 func buildStore(logger zerolog.Logger, cfg config) (intel.Store, error) {
 	var sources []intel.Source
 	for _, id := range cfg.Sources {
@@ -1632,7 +1714,10 @@ func buildStore(logger zerolog.Logger, cfg config) (intel.Store, error) {
 	if len(sources) == 0 {
 		return nil, errors.New("no usable sources configured")
 	}
-	return intel.NewStore(logger, sources...), nil
+	return intel.NewStoreWithBaseline(
+		logger,
+		filepath.Join(cfg.CacheDir, "intel-baseline.json"),
+		sources...), nil
 }
 
 func buildSource(logger zerolog.Logger, cfg config, id string) (intel.Source, error) {

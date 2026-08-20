@@ -93,6 +93,19 @@ type Source interface {
 // fetch failure.
 var ErrUnsupportedEcosystem = errors.New("source does not cover this ecosystem")
 
+// ErrDamagedCache is returned by Source.Fetch when the source's on-disk
+// cache payload is present but fails integrity verification — its bytes
+// no longer match the content hash recorded when it was written (truncated,
+// emptied, or replaced), and no intact copy could be recovered (upstream
+// unreachable, or the re-fetch also failed verification).
+//
+// The Store routes this error to its damaged-source report rather than the
+// ordinary fetch-error path: a damaged cache is a distinct condition from a
+// network failure, because the operator's remediation differs (inspect the
+// cache dir vs. check connectivity) and because serving *anything* from the
+// damaged bucket would silently reduce that source's coverage.
+var ErrDamagedCache = errors.New("cached payload failed content-hash verification")
+
 // Verdict is the result of a Store lookup. Empty Reports means "no source
 // flagged this package version."
 type Verdict struct {
