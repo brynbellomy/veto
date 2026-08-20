@@ -58,6 +58,27 @@ type commandVerdict struct {
 
 	// Errors carries the internal failures behind an "abort" decision.
 	Errors []string `json:"errors,omitempty"`
+
+	// Damage lists the (source, ecosystem) intel buckets that failed
+	// integrity verification and could not be restored, for ecosystems
+	// THIS command touches. Non-empty always accompanies decision
+	// "abort": the gate cannot see its full coverage, so the verdict is
+	// neither allow (nothing was flagged — we simply cannot see) nor
+	// refuse (no package was flagged). A machine consumer must treat
+	// damage as "indeterminate, fail closed" — the same stance the
+	// enforcement path takes with exit 70.
+	Damage []damageEntry `json:"damage,omitempty"`
+}
+
+// damageEntry is one damaged (source, ecosystem) intel bucket in a
+// commandVerdict. The fields mirror intel.SourceDamage so a consumer can
+// correlate with `veto doctor` / `veto status` output.
+type damageEntry struct {
+	Source   string `json:"source"`
+	Eco      string `json:"ecosystem"`
+	Reason   string `json:"reason"`
+	Got      int    `json:"got"`
+	Baseline int    `json:"baseline"`
 }
 
 // installVerdict is one package's gate outcome inside a commandVerdict.
@@ -160,10 +181,25 @@ func runVerdict(logger zerolog.Logger, cfg config, args []string) int {
 // the executing gate — veto keeps executing package-manager commands
 // precisely because of these four layers.
 //
+// DAMAGED INTEL — a state a consumer must handle distinctly. When an
+// intel (source, ecosystem) bucket in an ecosystem this command touches
+// failed integrity verification and could not be restored, the verdict
+// is "abort" (exit 70) with the damaged buckets enumerated in the
+// "damage" array (source, ecosystem, reason, got, baseline) and
+// summarized in "errors". This is neither "allow" (nothing was flagged
+// — the gate simply cannot see part of its coverage) nor "refuse" (no
+// package was flagged): it is INDETERMINATE, and the consumer must fail
+// closed exactly as it would for any other abort. The damage decision is
+// computed in gateInputsFor, the single site both this path and runGate
+// flow through, so the two surfaces cannot disagree on whether damage
+// blocks. Damage confined to ecosystems this command does not touch is
+// non-blocking and never appears here (runGate prints those as WARNs).
+//
 // The asymmetry that DOES hold: for `cargo add --git`, enforcement may
 // clone-and-resolve the spec into an allow while the verdict refuses it
 // without fetching. Within the layers the verdict evaluates, it never
-// allows what the same layers would refuse.
+// allows what the same layers would refuse. Damage composes with this:
+// both surfaces abort identically on it.
 func evaluateCommandLine(logger zerolog.Logger, cfg config, args []string) (commandVerdict, int) {
 	pmName, pmArgs := args[0], args[1:]
 	v := commandVerdict{PM: pmName, Args: pmArgs}
@@ -193,6 +229,31 @@ func evaluateCommandLine(logger zerolog.Logger, cfg config, args []string) (comm
 		return v, exitInternal
 	}
 
+	// Damaged intel bucket in an ecosystem this command touches: the gate
+	// cannot see its full coverage, so there is no honest verdict to give.
+	// "abort" (exit 70) matches the enforcement path's fail-closed stance;
+	// the reason names the damaged source and ecosystem so a machine
+	// consumer can surface remediation without parsing prose. This check
+	// lives in gateInputsFor (in.damageRefusals) — not here — so the two
+	// surfaces cannot drift on whether damage blocks.
+	if len(in.damageRefusals) > 0 {
+		v.Decision = string(gate.OutcomeAbort)
+		v.Reason = verdictDamageReason(in.damageRefusals)
+		for _, d := range in.damageRefusals {
+			v.Damage = append(v.Damage, damageEntry{
+				Source:   d.SourceID,
+				Eco:      string(d.Ecosystem),
+				Reason:   d.Reason,
+				Got:      d.Got,
+				Baseline: d.Baseline,
+			})
+			v.Errors = append(v.Errors, fmt.Sprintf(
+				"intel source %s (ecosystem %s) damaged: %s (got %d reports, baseline %d)",
+				d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline))
+		}
+		return v, exitInternal
+	}
+
 	var decision gate.Decision
 	if in.hasPreflight {
 		preflightPolicy := in.policy
@@ -204,6 +265,23 @@ func evaluateCommandLine(logger zerolog.Logger, cfg config, args []string) (comm
 
 	v = verdictFromDecision(pmName, pmArgs, &decision)
 	return v, codeForOutcome(decision.Outcome)
+}
+
+// verdictDamageReason renders the abort reason for a damaged-bucket
+// verdict: one line naming the first damaged source and ecosystem, with
+// the full list in v.Damage / v.Errors.
+func verdictDamageReason(refusals []intel.SourceDamage) string {
+	if len(refusals) == 0 {
+		return ""
+	}
+	d := refusals[0]
+	more := ""
+	if len(refusals) > 1 {
+		more = fmt.Sprintf(" (+%d more)", len(refusals)-1)
+	}
+	return fmt.Sprintf(
+		"intel for this install is damaged and could not be verified: source %s (ecosystem %s): %s (got %d reports, baseline %d)%s",
+		d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline, more)
 }
 
 // verdictFromDecision maps a gate.Decision to its structured commandVerdict
@@ -245,6 +323,16 @@ type gateInputs struct {
 	manifestRefs []packagemanager.ManifestRef
 	preflight    packagemanager.ProjectPreflightPlan
 	hasPreflight bool
+
+	// damageRefusals lists the (source, ecosystem) damage buckets in
+	// ecosystems this command touches. Non-empty means the intel store is
+	// missing part of its coverage for THIS install: the gate cannot see
+	// everything it claims to, so both the enforcement path and the
+	// verdict path must fail closed. Computed in gateInputsFor — the one
+	// place both paths flow through — so the two surfaces cannot diverge
+	// on whether damage blocks (the verdict path previously skipped this
+	// check entirely and answered "allow" over a damaged bucket).
+	damageRefusals []intel.SourceDamage
 }
 
 func gateInputsFor(
@@ -260,7 +348,7 @@ func gateInputsFor(
 		return gateInputs{}, false
 	}
 
-	store, err := buildStore(logger, cfg)
+	store, err := buildStoreFn(logger, cfg)
 	if err != nil {
 		logger.Error().Err(err).Msg("build intel store")
 		return gateInputs{storeErr: fmt.Sprintf("veto: INTERNAL ERROR — could not build intel store (%v); install aborted fail-closed.", err)}, true
@@ -288,18 +376,41 @@ func gateInputsFor(
 			reportCount, minHealthyReportCount)}, true
 	}
 
+	// Per-source damage check, computed HERE so the enforcement path and
+	// the verdict path cannot disagree on it: a (source, ecosystem) bucket
+	// that failed integrity verification — and could not be re-fetched or
+	// retained — means the store is missing part of its coverage. For
+	// damage in an ecosystem this command touches, the caller must fail
+	// closed; damage confined to untouched ecosystems stays non-blocking
+	// (an npm install must not wedge because the crates feed is rotting).
+	// Callers own presentation: runGate prints the operator block on
+	// stderr, evaluateCommandLine encodes it into the verdict JSON.
+	damageRefusals := damagedRefusals(store.Damaged(), pm.Ecosystem(), installs)
+	if len(damageRefusals) > 0 {
+		for _, d := range damageRefusals {
+			logger.Error().
+				Str("source", d.SourceID).
+				Str("ecosystem", string(d.Ecosystem)).
+				Str("reason", d.Reason).
+				Int("got", d.Got).
+				Int("baseline", d.Baseline).
+				Msg("intel source damaged — refusing to gate")
+		}
+	}
+
 	expander := newCompoundExpander()
 	policy := gate.DefaultPolicy()
 	policy.ManifestExpander = expander
 
 	return gateInputs{
-		store:        store,
-		policy:       policy,
-		expander:     expander,
-		installs:     installs,
-		manifestRefs: manifestRefs,
-		preflight:    preflight,
-		hasPreflight: hasPreflight,
+		store:          store,
+		policy:         policy,
+		expander:       expander,
+		installs:       installs,
+		manifestRefs:   manifestRefs,
+		preflight:      preflight,
+		hasPreflight:   hasPreflight,
+		damageRefusals: damageRefusals,
 	}, true
 }
 

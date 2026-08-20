@@ -372,29 +372,20 @@ func runGate(logger zerolog.Logger, cfg config, args []string) int {
 	installs, manifestRefs, expander, policy := in.installs, in.manifestRefs, in.expander, in.policy
 	store := in.store
 
-	// Per-source damage check. A (source, ecosystem) bucket whose cache
-	// failed integrity verification — and could not be re-fetched or
-	// retained — means the gate is missing part of its coverage for that
-	// ecosystem. Serving the install anyway is silent degraded coverage,
-	// the exact failure mode the integrity layer exists to prevent, so
-	// for damage in an ecosystem this install touches we refuse (fail
-	// closed, same stance as a missing veto binary). Damage confined to
-	// ecosystems this install doesn't touch is reported loudly but does
-	// not block: an npm install must not wedge because the crates feed
-	// is rotting.
-	if refusals := damagedRefusals(store.Damaged(), pm.Ecosystem(), installs); len(refusals) > 0 {
-		for _, d := range refusals {
-			logger.Error().
-				Str("source", d.SourceID).
-				Str("ecosystem", string(d.Ecosystem)).
-				Str("reason", d.Reason).
-				Int("got", d.Got).
-				Int("baseline", d.Baseline).
-				Msg("intel source damaged — refusing to gate")
-		}
+	// Per-source damage check. gateInputsFor computed damageRefusals (the
+	// buckets in ecosystems THIS install touches) so the enforcement path
+	// and the verdict path share one damage decision and cannot drift on
+	// whether damage blocks — the verdict path previously skipped the
+	// check and answered "allow" over a damaged bucket. Serving the
+	// install anyway is silent degraded coverage, the exact failure mode
+	// the integrity layer exists to prevent, so we fail closed (same
+	// stance as a missing veto binary). Damage confined to ecosystems
+	// this install doesn't touch is reported loudly but does not block:
+	// an npm install must not wedge because the crates feed is rotting.
+	if len(in.damageRefusals) > 0 {
 		fmt.Fprintln(os.Stderr, "veto: INTERNAL ERROR — install aborted fail-closed.")
 		fmt.Fprintln(os.Stderr, "  Malware intel for this install is damaged and could not be restored:")
-		for _, d := range refusals {
+		for _, d := range in.damageRefusals {
 			fmt.Fprintf(os.Stderr, "    - source %s (ecosystem %s): %s (got %d reports, baseline %d)\n",
 				d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline)
 		}
@@ -1706,6 +1697,14 @@ func refreshStoreWithFreshnessWindow(logger zerolog.Logger, cfg config, store in
 // <cacheDir>/intel-baseline.json so a damaged cache is detected even on a
 // cold process (the in-process retention guard resets every invocation).
 // See intel.BaselineStore for the detection policy.
+// buildStoreFn exists as an injection seam for tests: the verdict-path
+// damage tests build a REAL BaselineStore over fake sources (so the
+// Damaged() routing runs for real) and need gateInputsFor to consume it
+// without going through cfg.Sources → buildSource, which only knows the
+// production source IDs. Indirection through a var is the minimal seam;
+// production callers are unaffected.
+var buildStoreFn = buildStore
+
 func buildStore(logger zerolog.Logger, cfg config) (intel.Store, error) {
 	var sources []intel.Source
 	for _, id := range cfg.Sources {
