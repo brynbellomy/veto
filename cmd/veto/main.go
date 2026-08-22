@@ -806,6 +806,19 @@ func runStatus(logger zerolog.Logger, cfg config) int {
 		fmt.Printf("veto: configured IOC feeds: %v\n", cfg.IOCSources)
 	}
 	fmt.Printf("veto: cache dir: %s\n", cfg.CacheDir)
+	// FIX 3: status is a store consumer too. It does not gate or
+	// scan, but reporting damage here is the cheapest operator
+	// surface: `veto status` is the first command an operator runs
+	// when something looks wrong, and a damaged bucket IS something
+	// wrong. Display-only (exit stays 0) — the blocking decisions
+	// live in the gate/verdict/scan paths.
+	if damaged := store.Damaged(); len(damaged) > 0 {
+		for _, d := range damaged {
+			fmt.Printf("veto: WARN - intel source %s (ecosystem %s) is damaged: %s (got %d reports, baseline %d)\n",
+				d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline)
+		}
+		fmt.Println("veto: installs and scans for the damaged ecosystems will be refused until restored; see `veto doctor`.")
+	}
 	return exitOK
 }
 

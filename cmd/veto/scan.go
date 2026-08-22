@@ -128,7 +128,7 @@ func runScanWithOpts(logger zerolog.Logger, cfg config, opts scanOpts) int {
 	var store intel.Store
 	if needsIntel {
 		var err error
-		store, err = buildStore(logger, cfg)
+		store, err = buildStoreFn(logger, cfg)
 		if err != nil {
 			logger.Error().Err(err).Msg("build intel store")
 			return exitInternal
@@ -141,6 +141,38 @@ func runScanWithOpts(logger zerolog.Logger, cfg config, opts scanOpts) int {
 		if reportCount := store.ReportCount(); reportCount < minHealthyReportCount {
 			logger.Error().Int("reports", reportCount).Int("floor", minHealthyReportCount).Msg("intel store below sanity floor during scan")
 			fmt.Fprintf(os.Stderr, "veto: INTERNAL ERROR — intel store has only %d reports (expected at least %d); scan aborted fail-closed.\n", reportCount, minHealthyReportCount)
+			return exitInternal
+		}
+	}
+
+	// FIX 3: consult damage. A scan walks EVERY ecosystem (unlike an
+	// install, which touches one), so damage in any bucket means the
+	// scan would report clean over a silently degraded index. Fail
+	// closed, same stance as runGate and the verdict path. This was
+	// the third entrypoint the drift guard missed; the guard now
+	// enumerates store consumers structurally
+	// (verdict_damage_drift_test.go).
+	if needsIntel {
+		if damaged := store.Damaged(); len(damaged) > 0 {
+			for _, d := range damaged {
+				logger.Error().
+					Str("source", d.SourceID).
+					Str("ecosystem", string(d.Ecosystem)).
+					Str("reason", d.Reason).
+					Int("got", d.Got).
+					Int("baseline", d.Baseline).
+					Msg("intel source damaged - refusing to scan")
+			}
+			fmt.Fprintln(os.Stderr, "veto: INTERNAL ERROR - scan aborted fail-closed.")
+			fmt.Fprintln(os.Stderr, "  Malware intel is damaged and could not be restored:")
+			for _, d := range damaged {
+				fmt.Fprintf(os.Stderr, "    - source %s (ecosystem %s): %s (got %d reports, baseline %d)\n",
+					d.SourceID, d.Ecosystem, d.Reason, d.Got, d.Baseline)
+			}
+			fmt.Fprintln(os.Stderr, "  This is not a malware finding - veto could not verify its intel coverage.")
+			fmt.Fprintln(os.Stderr, "  Remediation: restore network and run 'veto sync' to re-fetch; if the feed")
+			fmt.Fprintln(os.Stderr, "  legitimately shrank, delete the baseline file and re-sync:")
+			fmt.Fprintf(os.Stderr, "    rm '%s'\n", filepath.Join(cfg.CacheDir, "intel-baseline.json"))
 			return exitInternal
 		}
 	}
