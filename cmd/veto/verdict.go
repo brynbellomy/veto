@@ -288,8 +288,25 @@ func verdictDamageReason(refusals []intel.SourceDamage) string {
 // form. Kept separate from store construction so tests can drive a real
 // gate.Gate with fixture intel and assert on the exact JSON shape an
 // integrator consumes.
+// normalizeOutcome enforces the verdict JSON's decision vocabulary:
+// allow, refuse, passthrough, abort. gate.Outcome is a string type and
+// the gate could in principle mint a new value; codeForOutcome already
+// maps unknowns to exit 70, but the JSON used to emit the raw string —
+// a consumer branching on "decision" would see an unknown token and
+// fall through its switch to whatever its default is (often allow).
+// Unknown outcomes normalize to abort so the JSON and the exit code can
+// never disagree (FIX 6).
+func normalizeOutcome(o gate.Outcome) string {
+	switch o {
+	case gate.OutcomeAllow, gate.OutcomeRefuse, gate.OutcomePassThrough, gate.OutcomeAbort:
+		return string(o)
+	default:
+		return string(gate.OutcomeAbort)
+	}
+}
+
 func verdictFromDecision(pmName string, pmArgs []string, d *gate.Decision) commandVerdict {
-	v := commandVerdict{PM: pmName, Args: pmArgs, Decision: string(d.Outcome)}
+	v := commandVerdict{PM: pmName, Args: pmArgs, Decision: normalizeOutcome(d.Outcome)}
 	for _, gv := range d.Verdicts {
 		v.Installs = append(v.Installs, toInstallVerdict(gv))
 	}

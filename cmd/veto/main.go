@@ -1687,17 +1687,28 @@ func refreshStoreWithFreshnessWindow(logger zerolog.Logger, cfg config, store in
 	ctx, cancel := context.WithTimeout(context.Background(), syncTimeout)
 	defer cancel()
 
+	cacheOnly := false
 	if last, fresh := intel.ReadLastRefresh(cfg.CacheDir, time.Now()); fresh {
 		logger.Debug().Time("last_refresh", last).Msg("advisory cache inside freshness window; serving from disk cache")
 		ctx = intel.WithCacheOnly(ctx)
+		cacheOnly = true
 	}
 
 	if err := store.Refresh(ctx); err != nil {
 		return err
 	}
 
-	if err := intel.WriteLastRefresh(cfg.CacheDir, time.Now()); err != nil {
-		logger.Warn().Err(err).Msg("record refresh marker")
+	// FIX 4: the marker names the last successful NETWORK refresh. A
+	// cache-only refresh has no wire basis, so sliding the marker
+	// here would turn the window into a sliding lease — an agent
+	// loop invoking veto more often than the window would NEVER
+	// contact the network, and never reach the fetch paths that
+	// heal a damaged cache. Write it only when the wire was
+	// actually consulted.
+	if !cacheOnly {
+		if err := intel.WriteLastRefresh(cfg.CacheDir, time.Now()); err != nil {
+			logger.Warn().Err(err).Msg("record refresh marker")
+		}
 	}
 	return nil
 }

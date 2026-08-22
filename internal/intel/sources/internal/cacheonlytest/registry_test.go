@@ -36,7 +36,7 @@ func TestRegisteredSourcesMatchBuildSource(t *testing.T) {
 	network := networkSourceIDs(t)
 	require.NotEmpty(t, network,
 		"parsing buildSource found no sources; the registry guard itself is broken "+
-				"(was buildSource renamed or moved?) — update this test, do not delete it")
+			"(was buildSource renamed or moved?) — update this test, do not delete it")
 
 	for _, id := range network {
 		require.True(t, registered[id],
@@ -66,16 +66,41 @@ func TestEveryRegisteredSourceHasPlugIn(t *testing.T) {
 			"source %q is registered but has no *_cacheonly_harness_test.go plug-in; "+
 				"the registration is lying", id)
 
-		var body string
-		for _, m := range matches {
-			b, err := os.ReadFile(m)
-			require.NoError(t, err)
-			body += string(b)
+		// FIX 6: bind on real CALL EXPRESSIONS, not substrings — a
+		// commented-out call or a doc-comment mention satisfied the old
+		// require.Contains check. Parse each plug-in file and require an
+		// actual call to every scenario runner.
+		track := map[string]bool{
+			"RunGuttedUnderCacheOnly":                  false,
+			"RunUnrecordedMustNotAdopt":                false,
+			"Run304UnrecordedGuttedMustRebindFromWire": false,
 		}
-		require.Contains(t, body, "RunGuttedUnderCacheOnly(",
-			"source %q's plug-in does not run the gutted-cache scenario", id)
-		require.Contains(t, body, "RunUnrecordedMustNotAdopt(",
-			"source %q's plug-in does not run the unrecorded-no-adopt scenario", id)
+		for _, m := range matches {
+			fset := token.NewFileSet()
+			af, err := parser.ParseFile(fset, m, nil, 0)
+			if err != nil {
+				t.Errorf("source %q: plug-in %s does not parse: %v", id, m, err)
+				continue
+			}
+			ast.Inspect(af, func(n ast.Node) bool {
+				if ce, ok := n.(*ast.CallExpr); ok {
+					if sel, ok := ce.Fun.(*ast.SelectorExpr); ok {
+						if _, tracked := track[sel.Sel.Name]; tracked || track[sel.Sel.Name] == false {
+							if _, ok := track[sel.Sel.Name]; ok {
+								track[sel.Sel.Name] = true
+							}
+						}
+					}
+				}
+				return true
+			})
+		}
+		for name, seen := range track {
+			if !seen {
+				t.Errorf("source %q: plug-in never CALLS cacheonlytest.%s (a comment or "+
+					"doc mention does not count)", id, name)
+			}
+		}
 	}
 }
 
@@ -130,7 +155,7 @@ func networkSourceIDs(t *testing.T) []string {
 				for _, e := range cc.List {
 					bl, ok := e.(*ast.BasicLit)
 					if !ok || bl.Kind != token.STRING {
-							continue
+						continue
 					}
 					v := strings.Trim(bl.Value, `"`)
 					if nonNetwork[v] {

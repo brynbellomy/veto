@@ -192,31 +192,37 @@ var RegisteredSources = []string{
 	"rustsec",
 }
 
-// findSidecars lists every *.sha256 sidecar under dir.
+// findSidecars lists every *.sha256 sidecar under dir, RECURSIVELY. The
+// gob family nests nothing today, but a source that ever grows a
+// per-ecosystem subdirectory must not silently escape the unrecorded
+// scenario's strip (FIX 6: the non-recursive version missed nested
+// sidecars and the test would pass against a cache it never fully
+// un-recorded).
 func findSidecars(t *testing.T, dir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
-	require.NoError(t, err)
 	var out []string
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".sha256" {
-			out = append(out, e.Name())
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-	}
+		if !d.IsDir() && filepath.Ext(d.Name()) == ".sha256" {
+			out = append(out, path)
+		}
+		return nil
+	})
+	require.NoError(t, err)
 	return out
 }
 
-// StripSidecarsInRoot removes every *.sha256 sidecar directly in dir
-// (the flat cache layout: datadog, aikido, osv, govulndb, pypa).
-// Sources whose cache layout nests per-ecosystem supply their own.
+// StripSidecarsInRoot removes every *.sha256 sidecar under dir,
+// RECURSIVELY (FIX 6: the flat-only version silently missed nested
+// sidecars, letting a partially-stripped cache pass the unrecorded
+// scenario). All nine current sources use flat layouts; recursion costs
+// nothing and survives a future nested layout.
 func StripSidecarsInRoot(t *testing.T, dir string) {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
-	require.NoError(t, err)
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".sha256" {
-			require.NoError(t, os.Remove(filepath.Join(dir, e.Name())))
-		}
+	for _, path := range findSidecars(t, dir) {
+		require.NoError(t, os.Remove(path))
 	}
 }
 
