@@ -164,7 +164,23 @@ func (b *BaselineStore) Refresh(ctx context.Context) error {
 	// buckets keep their previous count implicitly (the retained slice IS
 	// the known-good data); fresh-accepted buckets record their new count
 	// (feeds grow).
-	nextBaseline := mergeBaseline(baseline, resolved)
+	// FIX 2 (ratchet-down): on a CACHE-ONLY refresh nothing was fetched
+	// from the wire, so the accepted counts have no upstream basis — they
+	// are whatever the on-disk payloads happened to contain. A
+	// damaged-but-above-threshold bucket (partial write retaining 60%)
+	// would otherwise become the new anchor, and the very next cold
+	// start would compare against the poisoned value: accept poisoned,
+	// and the poison becomes the anchor. A cache-only run therefore
+	// keeps the previous anchors wholesale — it may not move an anchor
+	// in EITHER direction on disk evidence alone. Wire-verified runs
+	// re-anchor as before (including legitimate shrinkage, which only
+	// the wire can confirm).
+	var nextBaseline map[sourceEcoKey]int
+	if CacheOnly(ctx) {
+		nextBaseline = baseline
+	} else {
+		nextBaseline = mergeBaseline(baseline, resolved)
+	}
 	if err := b.saveBaseline(nextBaseline); err != nil {
 		// The baseline is an integrity signal, not a gate input; failing
 		// to persist it degrades to the pre-baseline behavior (in-process
