@@ -66,6 +66,7 @@ func rustsecCacheOnlyCase(t *testing.T) cacheonlytest.Case {
 		}
 		},
 		StripHashSidecars: cacheonlytest.StripSidecarsInRoot,
+		HeadValidated:     true,
 	}
 }
 
@@ -94,4 +95,8 @@ func rustsecAdvisoryJSONFor(pkg string) string {
     {"package": {"ecosystem": "crates.io", "name": "` + pkg + `"}, "versions": ["1.0.0"]}
   ]
 }`
+}
+
+func TestCacheOnlyHarness304UnrecordedGuttedMustRebindFromWire(t *testing.T) {
+	cacheonlytest.Run304UnrecordedGuttedMustRebindFromWire(t, rustsecCacheOnlyCase(t))
 }

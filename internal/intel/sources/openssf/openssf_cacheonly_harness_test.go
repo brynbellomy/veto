@@ -63,6 +63,7 @@ func openssfCacheOnlyCase(t *testing.T) cacheonlytest.Case {
 		}
 		},
 		StripHashSidecars: cacheonlytest.StripSidecarsInRoot,
+		HeadValidated:     true,
 	}
 }
 
@@ -86,4 +87,8 @@ func encodeOpenssfGobForTest(t *testing.T, reports []intel.MalwareReport) []byte
 // identical shape encodes identically.
 type openssfGobBlob struct {
 	Reports []intel.MalwareReport
+}
+
+func TestCacheOnlyHarness304UnrecordedGuttedMustRebindFromWire(t *testing.T) {
+	cacheonlytest.Run304UnrecordedGuttedMustRebindFromWire(t, openssfCacheOnlyCase(t))
 }

@@ -145,10 +145,20 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 	return s.ensureLoaded(ctx)
 }
 
+// ensureLoaded is the locked entrypoint. The 304 arms inside may
+// retry once (etag dropped, unconditional refetch); that retry must
+// NOT re-enter ensureLoaded — the mutex is held here and re-locking
+// self-deadlocks (a latent bug in the Mismatch arm that the FIX 1
+// Unrecorded arm made reachable). Retry goes to ensureLoadedLocked.
 func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.ensureLoadedLocked(ctx)
+}
+
+// ensureLoadedLocked is ensureLoaded with the mutex already held.
+func (s *Source) ensureLoadedLocked(ctx context.Context) ([]intel.MalwareReport, error) {
 	zipPath := filepath.Join(s.cacheDir, "vulndb.zip")
 	etagPath := filepath.Join(s.cacheDir, "vulndb.etag")
 
@@ -266,17 +276,21 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 				Str("payload_path", zipPath).
 				Msg("304 validated etag but cached zip failed content-hash verification; forcing refetch")
 			_ = os.Remove(etagPath)
-			return s.ensureLoaded(ctx)
+			return s.ensureLoadedLocked(ctx)
 		case fsutil.HashUnrecorded:
-			// Grandfathered zip (pre-integrity-fix cache) that just passed
-			// a live 304: adopt it by recording its hash now, so a
-			// steady-state cache that only ever sees 304s still becomes
-			// content-bound.
-			if body, readErr := os.ReadFile(zipPath); readErr == nil {
-				if hashErr := fsutil.RecordPayloadHash(zipPath, body); hashErr != nil {
-					s.logger.Warn().Err(hashErr).Msg("adopt grandfathered payload hash")
-				}
-			}
+			// FIX 1: a live 304 validates the ETAG, not the bytes on
+			// disk. An Unrecorded sidecar means nothing binds this zip
+			// (crash between write and RecordPayloadHash, a deleted
+			// sidecar, or a pre-sidecar cache), so adopting the on-disk
+			// bytes now would bless whatever happens to be there --
+			// gutted bytes would read HashMatch forever after. Treat
+			// Unrecorded exactly like Mismatch: drop the etag and refetch,
+			// so only bytes read off the wire in THIS request get bound.
+			s.logger.Warn().
+				Str("payload_path", zipPath).
+				Msg("304 validated etag but zip hash is unrecorded; forcing refetch to bind wire bytes")
+			_ = os.Remove(etagPath)
+			return s.ensureLoadedLocked(ctx)
 		}
 		reports, err := parseZip(zipPath, s.logger)
 		if err != nil {

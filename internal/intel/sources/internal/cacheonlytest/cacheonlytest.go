@@ -72,6 +72,12 @@ type Case struct {
 	// every *.sha256 sidecar in cacheDir. Used by the
 	// unrecorded-must-not-adopt scenario.
 	StripHashSidecars func(t *testing.T, cacheDir string)
+
+	// HeadValidated marks the gob/tarball family (ghsa, openssf,
+	// rustsec): they validate via a HEAD etag probe rather than
+	// If-None-Match, so the 304-unrecorded scenario's "conditional"
+	// request is the HEAD, and the "refetch" is any GET.
+	HeadValidated bool
 }
 
 // RunGuttedUnderCacheOnly is the core scenario: warm the cache with a
@@ -212,4 +218,75 @@ func StripSidecarsInRoot(t *testing.T, dir string) {
 			require.NoError(t, os.Remove(filepath.Join(dir, e.Name())))
 		}
 	}
+}
+
+// Run304UnrecordedGuttedMustRebindFromWire pins FIX 1: a payload whose
+// sidecar is MISSING (crash between WriteAtomic and RecordPayloadHash, a
+// deleted sidecar, or any pre-sidecar cache) and whose bytes have been
+// gutted, served a live 304 against the still-intact etag, must NOT
+// adopt the gutted bytes' hash. The 304 validates the etag — the upstream
+// representation — not the bytes on disk; adopting on read-side evidence
+// alone blesses whatever happens to be on disk and the bucket reads
+// HashMatch on gutted bytes forever after. The fetch must instead treat
+// 304+Unrecorded exactly like Mismatch: drop the etag, GET the body off
+// the wire, and record the hash of THOSE bytes.
+func Run304UnrecordedGuttedMustRebindFromWire(t *testing.T, c Case) {
+	t.Helper()
+
+	// Upstream answers 304 against whatever etag the warm fetch recorded
+	// (echoed back verbatim); a request with NO If-None-Match is the
+	// forced refetch and must get the intact body. The HeadValidated
+	// family (gob/tarball sources) validates via a HEAD etag probe
+	// instead: the HEAD is the "conditional" and any GET is the refetch.
+	inner := c.Serve(t)
+	var sawConditional, sawUnconditional bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c.HeadValidated {
+			if r.Method == http.MethodHead {
+				sawConditional = true
+				inner(w, r) // inner sets ETag; no body on HEAD
+				return
+			}
+			sawUnconditional = true
+			inner(w, r)
+			return
+		}
+		if inm := r.Header.Get("If-None-Match"); inm != "" {
+			sawConditional = true
+			w.Header().Set("ETag", inm)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		sawUnconditional = true
+		inner(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	cacheDir := t.TempDir()
+
+	// Warm with a network fetch — the server sets etag "warm".
+	warm := c.NewSource(t, srv.URL, cacheDir)
+	warmReports, err := warm.Fetch(context.Background(), c.Ecosystem)
+	require.NoError(t, err)
+	require.Len(t, warmReports, c.WarmReports,
+		"fixture sanity: intact warm fetch must yield %d reports", c.WarmReports)
+	c.StripHashSidecars(t, cacheDir)
+	c.Damage(t, cacheDir)
+
+	// The fetch under test: etag intact, payload gutted, sidecar gone.
+	// Pre-request verdict is Unrecorded, so the conditional GET goes out;
+	// upstream 304s; the 304 arm must NOT adopt the gutted bytes.
+	cold := c.NewSource(t, srv.URL, cacheDir)
+	reports, err := cold.Fetch(context.Background(), c.Ecosystem)
+	require.NoError(t, err, "the fetch must heal via the wire")
+	require.True(t, sawConditional, "fixture sanity: the intact etag must draw a conditional/HEAD request")
+	require.True(t, sawUnconditional, "the validated-etag arm must force an unconditional refetch")
+
+	for _, r := range reports {
+		require.NotEqual(t, c.GuttedName, r.Name,
+			"source %s adopted/served GUTTED bytes off a 304+Unrecorded — the FIX 1 defect", c.Name)
+	}
+	require.Equal(t, c.WarmReports, len(reports),
+		"the healed fetch must return the intact payload's report set")
+
 }

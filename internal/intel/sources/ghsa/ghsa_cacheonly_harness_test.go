@@ -75,6 +75,7 @@ func ghsaCacheOnlyCase(t *testing.T) cacheonlytest.Case {
 		}
 		},
 		StripHashSidecars: cacheonlytest.StripSidecarsInRoot,
+		HeadValidated:     true,
 	}
 }
 
@@ -93,4 +94,8 @@ func encodeGobForTest(t *testing.T, reports []intel.MalwareReport) []byte {
 	var buf bytes.Buffer
 	require.NoError(t, gob.NewEncoder(&buf).Encode(gobBlob{Reports: reports}))
 	return buf.Bytes()
+}
+
+func TestCacheOnlyHarness304UnrecordedGuttedMustRebindFromWire(t *testing.T) {
+	cacheonlytest.Run304UnrecordedGuttedMustRebindFromWire(t, ghsaCacheOnlyCase(t))
 }

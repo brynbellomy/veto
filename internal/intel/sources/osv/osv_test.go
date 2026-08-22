@@ -159,9 +159,18 @@ func TestFetch304ReparsesCachedZip(t *testing.T) {
 
 	payload := makeOSVZip(t, "MAL-2026-3", "cached-pkg", "npm", []string{"2.0.0"})
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// FIX 1 changed the contract for an UNRECORDED zip: an etag-only 304
+	// no longer adopts the disk bytes, so the source refetches without
+	// If-None-Match to bind wire bytes. The server must therefore serve
+	// the body to unconditional GETs (a 304 to an unconditional GET is
+	// broken upstream behavior and fails closed).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"v1"`)
-		w.WriteHeader(http.StatusNotModified)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = w.Write(payload)
 	}))
 	defer srv.Close()
 

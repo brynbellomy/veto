@@ -15,12 +15,13 @@ import (
 	"github.com/brynbellomy/veto/internal/intel/sources/datadog"
 )
 
-// TestFetchGrandfatheredCacheAdoptsHashOn304 pins the steady-state
-// adoption path: a cache written before content binding (no .sha256
-// sidecar) that passes a live 304 must get its hash recorded on that
-// very fetch. Without this, a cache whose etag never changes would stay
-// permanently grandfathered and the content-binding layer would never
-// engage for it.
+// TestFetchGrandfatheredCacheAdoptsHashOn304 pins the steady-state path
+// for a cache written before content binding (no .sha256 sidecar): FIX 1
+// forbids adopting disk bytes on a 304 alone, so the fetch must rebind
+// from the WIRE — one unconditional GET, then the sidecar exists and the
+// cache is content-bound from here on. A cache whose etag never changes
+// still becomes bound (via that one GET), just never via read-side
+// adoption.
 func TestFetchGrandfatheredCacheAdoptsHashOn304(t *testing.T) {
 	fixture := loadFixture(t, "npm_manifest.json")
 
@@ -51,26 +52,31 @@ func TestFetchGrandfatheredCacheAdoptsHashOn304(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// FIX 1 changed this contract: a 304 on an UNRECORDED payload no
+	// longer adopts the disk bytes (the etag names the upstream
+	// representation, not what is on disk). The fetch must instead drop
+	// the etag and re-fetch unconditionally, binding the wire bytes.
 	reports, err := src.Fetch(context.Background(), intel.EcosystemNPM)
-	require.NoError(t, err, "a grandfathered cache serving a live 304 must load")
+	require.NoError(t, err, "a grandfathered cache must heal via the wire")
 	require.Len(t, reports, 7)
 
-	// The sidecar must now exist — the 304-adopted payload is bound from
-	// here on.
+	// The sidecar must now exist — bound from the WIRE bytes this
+	// process read, not from what was on disk.
 	require.FileExists(t, filepath.Join(cacheDir, "npm.json.sha256"),
-		"a grandfathered payload that passes a live 304 must have its hash adopted")
+		"the wire-refetched payload must be bound on this very fetch")
 
-	// And damage after adoption must be caught by the hash gate: same
+	// And damage after binding must be caught by the hash gate: same
 	// fetch sequence, gutted payload, 304-answering upstream → re-fetch.
 	require.NoError(t, os.WriteFile(
 		filepath.Join(cacheDir, "npm.json"), []byte(guttedManifest), 0o600))
 
 	recovered, err := src.Fetch(context.Background(), intel.EcosystemNPM)
-	require.NoError(t, err, "post-adoption damage must be repaired by re-fetch")
+	require.NoError(t, err, "post-binding damage must be repaired by re-fetch")
 	require.Len(t, recovered, 7, "the re-fetched manifest must be the intact one")
-	// Hit 1: the adopting 304. Hit 2: the damage is caught by the
-	// pre-request hash gate (etag present, hash mismatch → conditional
-	// header dropped), so the upstream sees a bare GET and serves the
-	// intact body.
-	require.Equal(t, 2, hits, "one 304-adopt, then one bare GET re-fetch")
+	// Hit 1: the 304 that refused adoption. Hit 2: the unconditional
+	// refetch that bound the wire bytes. Hit 3: the damage is caught by
+	// the pre-request hash gate (etag present, hash mismatch →
+	// conditional header dropped), so the upstream sees a bare GET and
+	// serves the intact body.
+	require.Equal(t, 3, hits, "one refused-adoption 304, one wire-binding GET, one damage-repair GET")
 }

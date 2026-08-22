@@ -296,15 +296,23 @@ func (s *Source) fetchWithCacheBounded(ctx context.Context, url, payloadPath, et
 			_ = os.Remove(etagPath)
 			return s.fetchOnce(ctx, url, payloadPath, etagPath)
 		case fsutil.HashUnrecorded:
-			// Grandfathered payload (pre-integrity-fix cache) that just
-			// passed a live 304: adopt it by recording its hash now, so a
-			// steady-state cache that only ever sees 304s still becomes
-			// content-bound. The bytes are the ones the upstream etag
-			// names, so recording the hash of what is on disk binds them
-			// together from here on.
-			if err := fsutil.RecordPayloadHash(payloadPath, cached); err != nil {
-				s.logger.Warn().Err(err).Msg("adopt grandfathered payload hash")
+			// FIX 1: a live 304 validates the ETAG, not the bytes on
+			// disk. An Unrecorded sidecar means nothing binds this payload
+			// (crash between WriteAtomic and RecordPayloadHash, a deleted
+			// sidecar, or a pre-sidecar cache), so adopting the on-disk
+			// bytes now would bless whatever happens to be there -- gutted
+			// bytes would read HashMatch forever after. Treat Unrecorded
+			// exactly like Mismatch: drop the etag and refetch, so only
+			// bytes read off the wire in THIS request ever get bound.
+			if !retryAllowed {
+				return nil, errors.With(intel.ErrDamagedCache, "304 validated etag but payload hash is unrecorded; refusing to adopt unbound disk bytes").
+					Set("payload_path", payloadPath)
 			}
+			s.logger.Warn().
+				Str("payload_path", payloadPath).
+				Msg("304 validated etag but payload hash is unrecorded; forcing refetch to bind wire bytes")
+			_ = os.Remove(etagPath)
+			return s.fetchOnce(ctx, url, payloadPath, etagPath)
 		}
 		return cached, nil
 	case http.StatusOK:

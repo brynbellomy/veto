@@ -133,13 +133,35 @@ func (s *Source) ID() string { return sourceID }
 
 // Fetch implements intel.Source.
 func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.MalwareReport, error) {
+	if _, ok := ecosystemPath(eco); !ok {
+		return nil, intel.ErrUnsupportedEcosystem
+	}
+
+	// The 304 arms inside may retry once (etag dropped, unconditional
+	// refetch). That retry must NOT re-enter Fetch: the mutex is held
+	// here, and re-locking self-deadlocks (a latent bug in the Mismatch
+	// arm that the FIX 1 Unrecorded arm made reachable). Retry goes to
+	// fetchLocked directly.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.fetchLocked(ctx, eco)
+}
+
+// fetchLocked is Fetch with the mutex already held.
+func (s *Source) fetchLocked(ctx context.Context, eco intel.Ecosystem) ([]intel.MalwareReport, error) {
+	return s.fetchLockedBudget(ctx, eco, 1)
+}
+
+// fetchLockedBudget is fetchLocked with a retry budget: the 304
+// arms may consume one retry (drop etag, unconditional refetch).
+// An upstream that answers 304 to an UNCONDITIONAL GET is broken
+// or hostile; fail closed instead of looping forever.
+func (s *Source) fetchLockedBudget(ctx context.Context, eco intel.Ecosystem, retries int) ([]intel.MalwareReport, error) {
 	ecoPath, ok := ecosystemPath(eco)
 	if !ok {
 		return nil, intel.ErrUnsupportedEcosystem
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	url := s.baseURL + "/" + ecoPath + "/all.zip"
 	zipPath := filepath.Join(s.cacheDir, ecoPath+".zip")
@@ -259,17 +281,27 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 				Str("payload_path", zipPath).
 				Msg("304 validated etag but cached zip failed content-hash verification; forcing refetch")
 			_ = os.Remove(etagPath)
-			return s.Fetch(ctx, eco)
-		case fsutil.HashUnrecorded:
-			// Grandfathered zip (pre-integrity-fix cache) that just passed
-			// a live 304: adopt it by recording its hash now, so a
-			// steady-state cache that only ever sees 304s still becomes
-			// content-bound.
-			if body, readErr := os.ReadFile(zipPath); readErr == nil {
-				if hashErr := fsutil.RecordPayloadHash(zipPath, body); hashErr != nil {
-					s.logger.Warn().Err(hashErr).Msg("adopt grandfathered payload hash")
-				}
+			if retries <= 0 {
+				return nil, errors.With(intel.ErrDamagedCache, "304 to an unconditional refetch; upstream is broken or hostile").Set("url", url)
 			}
+			return s.fetchLockedBudget(ctx, eco, retries-1)
+		case fsutil.HashUnrecorded:
+			// FIX 1: a live 304 validates the ETAG, not the bytes on
+			// disk. An Unrecorded sidecar means nothing binds this zip
+			// (crash between write and RecordPayloadHash, a deleted
+			// sidecar, or a pre-sidecar cache), so adopting the on-disk
+			// bytes now would bless whatever happens to be there --
+			// gutted bytes would read HashMatch forever after. Treat
+			// Unrecorded exactly like Mismatch: drop the etag and refetch,
+			// so only bytes read off the wire in THIS request get bound.
+			s.logger.Warn().
+				Str("payload_path", zipPath).
+				Msg("304 validated etag but zip hash is unrecorded; forcing refetch to bind wire bytes")
+			_ = os.Remove(etagPath)
+			if retries <= 0 {
+				return nil, errors.With(intel.ErrDamagedCache, "304 to an unconditional refetch; upstream is broken or hostile").Set("url", url)
+			}
+			return s.fetchLockedBudget(ctx, eco, retries-1)
 		}
 		reports, err := parseZip(zipPath, s.includeVuln, s.logger)
 		if err != nil {

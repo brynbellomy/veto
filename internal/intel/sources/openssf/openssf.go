@@ -316,12 +316,13 @@ func (s *Source) downloadIfChanged(ctx context.Context, upstreamEtag string) (st
 			// Cache-integrity gate: the etag matches, but the tarball's
 			// bytes may have been damaged on disk. A mismatch falls
 			// through to the download path (re-fetch + re-record).
-			// Unrecorded (pre-integrity-fix cache) is served as-is and
-			// self-heals on the next fresh download.
-			if fsutil.PayloadHashVerdict(tarballPath) == fsutil.HashMismatch {
+			// FIX 1 extends the same rule to Unrecorded: a HEAD-confirmed
+			// etag is not evidence about unbound disk bytes, so an unrecorded
+			// tarball is re-downloaded and only the wire bytes get bound.
+			if fsutil.PayloadHashVerdict(tarballPath) != fsutil.HashMatch {
 				s.logger.Warn().
 					Str("payload_path", tarballPath).
-					Msg("cached tarball failed content-hash verification; forcing re-download")
+					Msg("cached tarball not content-verified (damaged or unrecorded); forcing re-download")
 			} else {
 				return tarballPath, upstreamEtag, nil
 			}
@@ -564,19 +565,30 @@ func (s *Source) readGobFileValidated(path string, upstreamValidated bool) ([]in
 			Msg("parsed gob failed content-hash verification; ignoring cache")
 		return nil, false
 	case fsutil.HashUnrecorded:
+		// FIX 1: never adopt on read-side evidence. Even a HEAD-confirmed
+		// etag validates only the upstream REPRESENTATION, not the gob
+		// bytes on disk; an Unrecorded sidecar means nothing binds them
+		// (crash between WriteAtomic and RecordPayloadHash, a deleted
+		// sidecar, or a pre-sidecar cache). Adopting now would bless
+		// whatever happens to be on disk -- gutted bytes would read
+		// HashMatch forever after. Serve the unbound gob only when the
+		// caller cannot fall through to the wire (upstreamValidated is
+		// false only on cache-only and dead-upstream paths); when the
+		// wire IS reachable the caller must prefer re-downloading and
+		// re-parsing so only bytes read off the wire get bound.
 		if upstreamValidated {
-			// The etag was confirmed live upstream, so the gob's bytes are
-			// upstream-consistent: adopt them by recording the hash now.
-			if body, readErr := os.ReadFile(path); readErr == nil {
-				if hashErr := fsutil.RecordPayloadHash(path, body); hashErr != nil {
-					s.logger.Warn().Err(hashErr).Msg("adopt grandfathered gob hash")
-				}
-			}
-		} else {
+			// Wire reachable: refuse the unbound gob so ensureLoaded falls
+			// through to downloadIfChanged (which re-downloads the tarball
+			// and re-records its hash) and writeGob re-binds the gob from
+			// bytes this process produced.
 			s.logger.Warn().
 				Str("path", path).
-				Msg("serving pre-integrity gob without upstream validation; not adopting its hash")
+				Msg("gob hash unrecorded; refusing to adopt on etag evidence alone; falling through to wire")
+			return nil, false
 		}
+		s.logger.Warn().
+			Str("path", path).
+			Msg("serving pre-integrity gob without upstream validation; not adopting its hash")
 	}
 	f, err := os.Open(path)
 	if err != nil {

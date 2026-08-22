@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -22,7 +23,13 @@ func gemnasiumCacheOnlyCase(t *testing.T) cacheonlytest.Case {
 		"advisories-community-main/npm/lodash/CVE-2019-10744.yml": readFixture(t, "npm_lodash.yml"),
 	})
 	gutted := makeTarball(t, map[string]string{
-		"advisories-community-main/npm/someone-else/CVE-2020-0001.yml": readFixture(t, "npm_lodash.yml"),
+		// The gutted tarball must carry a DIFFERENT report: the report name
+		// comes from package_slug inside the yml, not the tarball path, so a
+		// gutted fixture that only renames the path still reports lodash and
+		// a "no someone-else report" assertion passes even when the gutted
+		// bytes ARE served -- the fixture lies.
+		"advisories-community-main/npm/someone-else/CVE-2020-0001.yml": strings.Replace(
+			readFixture(t, "npm_lodash.yml"), "npm/lodash", "npm/someone-else", 1),
 	})
 	return cacheonlytest.Case{
 		Name:      "gemnasium",
@@ -58,4 +65,8 @@ func TestCacheOnlyHarnessGuttedCacheMustNotServe(t *testing.T) {
 
 func TestCacheOnlyHarnessUnrecordedServesButDoesNotAdopt(t *testing.T) {
 	cacheonlytest.RunUnrecordedMustNotAdopt(t, gemnasiumCacheOnlyCase(t))
+}
+
+func TestCacheOnlyHarness304UnrecordedGuttedMustRebindFromWire(t *testing.T) {
+	cacheonlytest.Run304UnrecordedGuttedMustRebindFromWire(t, gemnasiumCacheOnlyCase(t))
 }
