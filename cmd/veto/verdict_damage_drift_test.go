@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -140,4 +142,118 @@ func TestBothEntrypointsConsultDamage(t *testing.T) {
 	require.False(t, runGateRecomputes,
 		"runGate must not recompute damagedRefusals itself — a second call site is a "+
 			"second chance for the paths to diverge (and double-logs the damage)")
+}
+
+// TestEveryStoreConsumerConsultsDamage is the STRUCTURAL, enumerated form
+// of the drift guard (FIX 3): instead of listing entrypoints by name —
+// which is exactly how `veto scan` escaped the first guard — it parses
+// every non-test file in cmd/veto, finds every function that obtains an
+// intel.Store (via a buildStore/buildStoreFn call or an intel.Store-typed
+// declaration), and asserts each consults .Damaged(). A future entrypoint
+// that builds a store, checks the sanity floor, and stops — without the
+// damage check — fails this test by construction, not by omission from a
+// list of names. This guard was lost once to a mutation-restore wipe and
+// caught a real fourth consumer (runStatus) the first time it ran.
+func TestEveryStoreConsumerConsultsDamage(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+	require.NotEmpty(t, files, "no .go files found in cmd/veto; the guard is broken")
+
+	// Producers/consumers exempt from the Damaged() requirement:
+	//   - buildStore: constructs the store; it has nothing to consult.
+	//   - refreshStoreWithFreshnessWindow: shared plumbing every consumer
+	//     calls (refresh + marker); not a decision-maker. Its callers are
+	//     each guarded individually.
+	// This list is reviewable surface: adding a name here must justify
+	// why that consumer may ignore damage.
+	exempt := map[string]bool{
+		"buildStore":                      true,
+		"refreshStoreWithFreshnessWindow": true,
+	}
+
+	type consumer struct {
+		file string
+		fn   string
+	}
+	var consumers []consumer
+
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		af, err := parser.ParseFile(fset, f, nil, 0)
+		if err != nil {
+			t.Errorf("%s does not parse: %v", f, err)
+			continue
+		}
+
+		var currentFn string
+		var fnGetsStore, fnConsultsDamage bool
+		flush := func() {
+			if fnGetsStore && currentFn != "" && !exempt[currentFn] {
+				consumers = append(consumers, consumer{file: f, fn: currentFn})
+				if !fnConsultsDamage {
+					t.Errorf("%s: %s obtains an intel.Store but never consults Damaged() — "+
+						"a consumer over a damaged index silently degrades coverage (FIX 3: "+
+						"this is how `veto scan` escaped the named-entrypoint guard)", f, currentFn)
+				}
+			}
+			fnGetsStore, fnConsultsDamage = false, false
+		}
+
+		ast.Inspect(af, func(n ast.Node) bool {
+			if fd, ok := n.(*ast.FuncDecl); ok {
+				flush()
+				currentFn = fd.Name.Name
+				return true
+			}
+			if currentFn == "" {
+				return true
+			}
+			// Obtains a store: calls a producer (in an assignment or a
+			// declaration), or declares an intel.Store-typed variable.
+			if ce, ok := n.(*ast.CallExpr); ok {
+				if id, ok := ce.Fun.(*ast.Ident); ok && (id.Name == "buildStore" || id.Name == "buildStoreFn") {
+					fnGetsStore = true
+				}
+			}
+			if vs, ok := n.(*ast.ValueSpec); ok {
+				for _, v := range vs.Values {
+					if id, ok := v.(*ast.Ident); ok && (id.Name == "buildStore" || id.Name == "buildStoreFn") {
+						fnGetsStore = true
+					}
+				}
+				if sel, ok := vs.Type.(*ast.SelectorExpr); ok {
+					if x, ok := sel.X.(*ast.Ident); ok && x.Name == "intel" && sel.Sel.Name == "Store" {
+						fnGetsStore = true
+					}
+				}
+			}
+			if as, ok := n.(*ast.AssignStmt); ok {
+				for _, r := range as.Rhs {
+					if id, ok := r.(*ast.Ident); ok && (id.Name == "buildStore" || id.Name == "buildStoreFn") {
+						fnGetsStore = true
+					}
+					if ce, ok := r.(*ast.CallExpr); ok {
+						if id, ok := ce.Fun.(*ast.Ident); ok && (id.Name == "buildStore" || id.Name == "buildStoreFn") {
+							fnGetsStore = true
+						}
+					}
+				}
+			}
+			// Consults damage.
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				if sel.Sel.Name == "Damaged" {
+					fnConsultsDamage = true
+				}
+			}
+			return true
+		})
+		flush()
+	}
+
+	require.NotEmpty(t, consumers,
+		"the guard found no store consumers; it is broken and must be fixed, not deleted")
+	t.Logf("guard covered %d store consumers across cmd/veto", len(consumers))
 }
