@@ -539,6 +539,21 @@ succeed on the very first run, the veto refuses installs rather
 than fail open. A sanity floor of 1000 reports total catches the
 "every feed returned []" case loudly.
 
+**Cache integrity — corruption only, not an authenticity boundary.**
+Every cached payload carries a SHA-256 sidecar, and a persistent
+per-source baseline (`intel-baseline.json`) anchors expected report
+counts. These layers detect CORRUPTION: crashes, partial writes, disk
+rot, and implausibly collapsed feeds. They are NOT tamper detection.
+A writer that can modify a payload can also recompute its sidecar and
+rewrite the baseline, and the layer will report `HashMatch`. That is a
+deliberate scoping decision (corruption-only model): anything that can
+write `~/.cache/veto` as your UID can also replace the veto binary
+itself, so a stronger hash in the cache defends nothing. Known accepted
+limit: a payload retaining >50% of its entries while removing one
+specific package defeats the count-based check. A damaged bucket makes
+installs, `veto test`, and `veto scan` fail closed (exit 70) with the
+source and ecosystem named; `veto status` prints it as a warning.
+
 **Freshness window.** A `last-refresh` marker in the cache dir records
 the last successful refresh. Invocations within 3 minutes of it
 (`intel.RefreshFreshnessWindow`) skip every upstream round-trip and

@@ -26,7 +26,9 @@ type HashVerdict int
 
 const (
 	// HashMatch: the payload's bytes hash to the recorded value. The
-	// payload is exactly what we stored.
+	// payload is exactly what we stored — meaning what the last WRITER
+	// stored, which is veto itself under the corruption-only model. It
+	// is not proof of upstream authenticity; see the package comment.
 	HashMatch HashVerdict = iota
 	// HashMismatch: the payload's bytes differ from the recorded hash.
 	// The file has been truncated, emptied, or replaced since it was

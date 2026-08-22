@@ -2,6 +2,16 @@
 // feed sources. Anything in here is internal-only — the parent
 // internal/intel/sources/internal/ path makes that explicit to the Go
 // import-path enforcer.
+//
+// THREAT MODEL (read this before trusting a HashMatch): the content-hash
+// sidecars detect CORRUPTION — crash, partial write, disk rot. They are
+// NOT an authenticity boundary. A writer that can modify a payload can
+// also recompute its sidecar (and rewrite the baseline file), and this
+// layer will report HashMatch. That is accepted under veto's
+// corruption-only model: anything that can write ~/.cache/veto as your
+// UID can also replace the veto binary, so a stronger hash here defends
+// nothing. HashMatch means "consistent with whatever last wrote this
+// file," not "verified."
 package fsutil
 
 import (

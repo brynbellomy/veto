@@ -37,6 +37,17 @@ const baselineFileName = "intel-baseline.json"
 // be resolved by deleting the baseline file.
 const baselineThreshold = partialDropThreshold
 
+// THREAT MODEL: the baseline detects CORRUPTION — a collapsed count
+// from a partial write, disk rot, or a feed error. It is NOT an
+// authenticity boundary: a writer that can rewrite a payload can
+// also rewrite intel-baseline.json, and a payload retaining >50% of
+// its entries while removing one specific package defeats the
+// count-based check entirely. Both limits are accepted under
+// veto's corruption-only model (see fsutil's package comment: a
+// same-UID writer can replace the veto binary, so hashing harder
+// here defends nothing). Anchors move only on wire-verified runs
+// (FIX 2); a cache-only run may report damage but never re-anchor.
+
 // BaselineStore wraps the in-memory store with a persistent per-bucket
 // count baseline. Construct via NewStoreWithBaseline; NewStore returns a
 // store without one (tests and embedders that don't care about
