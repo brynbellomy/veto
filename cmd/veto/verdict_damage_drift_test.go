@@ -189,7 +189,13 @@ func TestEveryStoreConsumerConsultsDamage(t *testing.T) {
 		}
 
 		var currentFn string
-		var fnGetsStore, fnConsultsDamage bool
+		var fnGetsStore, fnConsultsDamage, hasRefreshBasis bool
+
+		// Helpers that receive an already-refreshed store from their
+		// callers (gateInputsFor: both call sites refresh first).
+		helperWithRefreshedCallers := map[string]bool{
+			"gateInputsFor": true,
+		}
 		flush := func() {
 			if fnGetsStore && currentFn != "" && !exempt[currentFn] {
 				consumers = append(consumers, consumer{file: f, fn: currentFn})
@@ -198,8 +204,24 @@ func TestEveryStoreConsumerConsultsDamage(t *testing.T) {
 						"a consumer over a damaged index silently degrades coverage (FIX 3: "+
 						"this is how `veto scan` escaped the named-entrypoint guard)", f, currentFn)
 				}
+				// grok round-3 finding: consulting Damaged() on a store that was
+				// never refreshed is a dead consult — Damaged() reports the
+				// last refresh, so a consumer that builds and reads without
+				// refreshing always sees nil and the check is theater. Every
+				// consumer must have a refresh basis: its own Refresh/
+				// refreshStoreWithFreshnessWindow call, or helper status
+				// (gateInputsFor — its callers refresh before calling).
+				if !fnConsultsDamage || !hasRefreshBasis {
+					if !hasRefreshBasis && helperWithRefreshedCallers[currentFn] {
+						// ok: helper of a refreshing caller
+					} else if !hasRefreshBasis {
+						t.Errorf("%s: %s consults Damaged() but never refreshes — "+
+							"a dead consult on a never-refreshed store always sees nil "+
+							"(grok round-3: runStatus reported a clean store over damage)", f, currentFn)
+					}
+				}
 			}
-			fnGetsStore, fnConsultsDamage = false, false
+			fnGetsStore, fnConsultsDamage, hasRefreshBasis = false, false, false
 		}
 
 		ast.Inspect(af, func(n ast.Node) bool {
@@ -245,7 +267,22 @@ func TestEveryStoreConsumerConsultsDamage(t *testing.T) {
 			// Consults damage.
 			if sel, ok := n.(*ast.SelectorExpr); ok {
 				if sel.Sel.Name == "Damaged" {
-					fnConsultsDamage = true
+					// Receiver-bind the consult: it must be a method on a store
+					// variable (e.g. store.Damaged()), not any selector named
+					// Damaged on an unrelated receiver. The receiver just has
+					// to be an identifier here; the consumer detection above
+					// already established this function holds an intel.Store.
+					if _, ok := sel.X.(*ast.Ident); ok {
+						fnConsultsDamage = true
+					}
+				}
+				if sel.Sel.Name == "Refresh" {
+					hasRefreshBasis = true
+				}
+			}
+			if ce, ok := n.(*ast.CallExpr); ok {
+				if id, ok := ce.Fun.(*ast.Ident); ok && id.Name == "refreshStoreWithFreshnessWindow" {
+					hasRefreshBasis = true
 				}
 			}
 			return true

@@ -806,6 +806,17 @@ func runStatus(logger zerolog.Logger, cfg config) int {
 		fmt.Printf("veto: configured IOC feeds: %v\n", cfg.IOCSources)
 	}
 	fmt.Printf("veto: cache dir: %s\n", cfg.CacheDir)
+	// Refresh before consulting damage. Damaged() reports the last
+	// refresh; on a freshly built store it is always nil, so
+	// consulting it without a refresh is theater — status would
+	// report a clean store over rotting buckets (grok round-3
+	// finding: the dead consult). The freshness window honors a
+	// recent sync, so this is not a forced network round-trip on
+	// every status call.
+	if err := refreshStoreWithFreshnessWindow(logger, cfg, store); err != nil {
+		logger.Error().Err(err).Msg("status: refresh intel store")
+		fmt.Fprintf(os.Stderr, "veto: WARN — could not refresh intel store: %v\n", err)
+	}
 	// FIX 3: status is a store consumer too. It does not gate or
 	// scan, but reporting damage here is the cheapest operator
 	// surface: `veto status` is the first command an operator runs
