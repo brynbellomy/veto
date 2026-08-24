@@ -155,6 +155,13 @@ func networkSourceIDs(t *testing.T) []string {
 				for _, e := range cc.List {
 					bl, ok := e.(*ast.BasicLit)
 					if !ok || bl.Kind != token.STRING {
+						// A non-literal case value (a named constant, a concatenation)
+						// silently drops that source from the enumeration — the harness
+						// would cover N-1 sources and nothing would fail. Fail loudly
+						// instead (note 4): the registry must be able to see every case.
+						t.Errorf("buildSource case %T is not a string literal — "+
+							"the registry cannot enumerate it; rewrite it as a literal "+
+							"or extend this parser", e)
 						continue
 					}
 					v := strings.Trim(bl.Value, `"`)
