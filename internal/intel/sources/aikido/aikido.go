@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/brynbellomy/go-utils/errors"
@@ -68,6 +69,12 @@ type Source struct {
 	cache   string
 	client  *http.Client
 	logger  zerolog.Logger
+
+	// sweepOnce bounds the orphan-temp sweep to one pass per process. This
+	// is a COST guard, not a correctness lock: the sweep's safety comes
+	// from the 24h age threshold (a live writer's temp can never be that
+	// old), so concurrent processes sweeping the same directory are safe.
+	sweepOnce sync.Once
 }
 
 var _ intel.Source = (*Source)(nil)
@@ -117,6 +124,11 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 	if !ok {
 		return nil, intel.ErrUnsupportedEcosystem
 	}
+
+	// Hygiene, not a gate: drop download temps this source's own dead runs
+	// left behind. Non-fatal by contract (see fsutil.SweepOrphanTemps);
+	// once per process keeps it off the per-ecosystem hot path.
+	s.sweepOnce.Do(s.sweepOrphanTemps)
 
 	url := s.baseURL + "/" + path
 	cachedPayload := filepath.Join(s.cache, string(eco)+".json")
@@ -371,6 +383,13 @@ func (s *Source) commitEtagAfterParse(etagPath string) {
 	if err := os.Rename(pending, etagPath); err != nil {
 		s.logger.Warn().Err(err).Str("from", pending).Str("to", etagPath).Msg("commit etag")
 	}
+}
+
+// sweepOrphanTemps removes abandoned download temps from this source's
+// cache dir. Runs once per process (sweepOnce); failures are logged, never
+// propagated — a cache that can't be cleaned must not fail a fetch.
+func (s *Source) sweepOrphanTemps() {
+	fsutil.SweepOrphanTemps(s.cache, s.logger)
 }
 
 func feedPath(eco intel.Ecosystem) (string, bool) {

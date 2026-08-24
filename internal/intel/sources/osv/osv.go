@@ -85,6 +85,12 @@ type Source struct {
 	logger      zerolog.Logger
 	includeVuln bool
 
+	// sweepOnce bounds the orphan-temp sweep to one pass per process. This
+	// is a COST guard, not a correctness lock: the sweep's safety comes
+	// from the 24h age threshold (a live writer's temp can never be that
+	// old), so concurrent processes sweeping the same directory are safe.
+	sweepOnce sync.Once
+
 	mu     sync.Mutex
 	cached map[intel.Ecosystem]ecosystemEntry
 }
@@ -137,6 +143,13 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 		return nil, intel.ErrUnsupportedEcosystem
 	}
 
+	// Hygiene, not a gate: drop download temps this source's own dead runs
+	// left behind. Non-fatal by contract (see fsutil.SweepOrphanTemps);
+	// once per process keeps it off the per-ecosystem hot path. The 24h
+	// age threshold is what makes this race-free against this process's
+	// own concurrent downloads, so it must NOT run under s.mu.
+	s.sweepOnce.Do(s.sweepOrphanTemps)
+
 	// The 304 arms inside may retry once (etag dropped, unconditional
 	// refetch). That retry must NOT re-enter Fetch: the mutex is held
 	// here, and re-locking self-deadlocks (a latent bug in the Mismatch
@@ -146,6 +159,13 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 	defer s.mu.Unlock()
 
 	return s.fetchLocked(ctx, eco)
+}
+
+// sweepOrphanTemps removes abandoned download temps from this source's
+// cache dir. Runs once per process (sweepOnce); failures are logged, never
+// propagated — a cache that can't be cleaned must not fail a fetch.
+func (s *Source) sweepOrphanTemps() {
+	fsutil.SweepOrphanTemps(s.cacheDir, s.logger)
 }
 
 // fetchLocked is Fetch with the mutex already held.

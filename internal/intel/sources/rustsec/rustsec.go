@@ -86,6 +86,12 @@ type Source struct {
 	client     *http.Client
 	logger     zerolog.Logger
 
+	// sweepOnce bounds the orphan-temp sweep to one pass per process. This
+	// is a COST guard, not a correctness lock: the sweep's safety comes
+	// from the 24h age threshold (a live writer's temp can never be that
+	// old), so concurrent processes sweeping the same directory are safe.
+	sweepOnce sync.Once
+
 	mu      sync.Mutex
 	cached  []intel.MalwareReport
 	loaded  bool
@@ -137,6 +143,11 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 		return nil, intel.ErrUnsupportedEcosystem
 	}
 
+	// Hygiene, not a gate: drop download temps this source's own dead runs
+	// left behind. Non-fatal by contract (see fsutil.SweepOrphanTemps);
+	// once per process keeps it off the per-ecosystem hot path.
+	s.sweepOnce.Do(s.sweepOrphanTemps)
+
 	reports, err := s.ensureLoaded(ctx)
 	if err != nil {
 		return nil, err
@@ -156,6 +167,13 @@ func (s *Source) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.Malwar
 // ensureLoaded returns the parsed report set, revalidating the cached tarball
 // against the upstream etag and re-parsing only when it has changed. Callers
 // hold s.mu for the duration so the download/parse runs at most once per change.
+// sweepOrphanTemps removes abandoned download temps from this source's
+// cache dir. Runs once per process (sweepOnce); failures are logged, never
+// propagated — a cache that can't be cleaned must not fail a fetch.
+func (s *Source) sweepOrphanTemps() {
+	fsutil.SweepOrphanTemps(s.cacheDir, s.logger)
+}
+
 func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
