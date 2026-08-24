@@ -539,6 +539,22 @@ succeed on the very first run, the veto refuses installs rather
 than fail open. A sanity floor of 1000 reports total catches the
 "every feed returned []" case loudly.
 
+**Cache hygiene — orphaned download temps are swept.** Every feed
+downloads to a temp file (`npm.zip.tmp-1877699234`) and atomically
+renames it into place. A run that dies before the rename leaves
+that temp behind forever — on a busy machine that accumulated to
+4.7 GB across 126 files. On each source's first fetch, veto now
+sweeps `*.tmp-*` files older than 24 hours **in that source's own
+cache directory only**. The 24h threshold is what makes this safe
+without locks: `os.CreateTemp` names are process-unique and every
+writer renames or removes its temp within one fetch, so a live
+download's temp can never be 24 hours old. Real payloads, `.sha256`
+sidecars, etags, parsed-`.gob` layers, `intel-baseline.json`, and
+`last-refresh` are never matched — the pattern is the exact
+`<name>.tmp-<digits>` shape `os.CreateTemp` produces, and only
+that. Sweep failures (unreadable dir, read-only FS) are logged and
+skipped; hygiene never blocks or fails a fetch.
+
 **Cache integrity — corruption only, not an authenticity boundary.**
 Every cached payload carries a SHA-256 sidecar, and a persistent
 per-source baseline (`intel-baseline.json`) anchors expected report
