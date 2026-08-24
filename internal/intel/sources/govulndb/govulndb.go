@@ -159,6 +159,16 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 
 // ensureLoadedLocked is ensureLoaded with the mutex already held.
 func (s *Source) ensureLoadedLocked(ctx context.Context) ([]intel.MalwareReport, error) {
+	return s.ensureLoadedBudget(ctx, 1)
+}
+
+// ensureLoadedBudget is ensureLoadedLocked with a retry budget: the 304
+// arms may consume one retry (drop etag, unconditional refetch). An
+// upstream that answers 304 to an UNCONDITIONAL GET is broken or
+// hostile; fail closed instead of looping forever. (grok round-5:
+// govulndb shipped without this and looped until the context died,
+// after which the network-failure arm served the unbound zip.)
+func (s *Source) ensureLoadedBudget(ctx context.Context, retries int) ([]intel.MalwareReport, error) {
 	zipPath := filepath.Join(s.cacheDir, "vulndb.zip")
 	etagPath := filepath.Join(s.cacheDir, "vulndb.etag")
 
@@ -267,16 +277,22 @@ func (s *Source) ensureLoadedLocked(ctx context.Context) ([]intel.MalwareReport,
 		}
 		// The 304 validated the etag, but the etag only names the upstream
 		// representation. Re-verify the payload hash NOW so damaged bytes
-		// cannot ride a 304 into the index. Mismatch → drop the etag and
-		// refetch (the refetch carries no If-None-Match, so it cannot
-		// 304-loop).
+		// cannot ride a 304 into the index. Mismatch or Unrecorded →
+		// drop the etag and refetch without If-None-Match. A WELL-BEHAVED
+		// upstream answers that with a body, but nothing upstream enforces
+		// it — a broken or hostile CDN can 304 a bare GET — so the retry
+		// carries a one-shot budget and fails closed with ErrDamagedCache
+		// if the 304s keep coming.
 		switch fsutil.PayloadHashVerdict(zipPath) {
 		case fsutil.HashMismatch:
 			s.logger.Warn().
 				Str("payload_path", zipPath).
 				Msg("304 validated etag but cached zip failed content-hash verification; forcing refetch")
 			_ = os.Remove(etagPath)
-			return s.ensureLoadedLocked(ctx)
+			if retries <= 0 {
+				return nil, errors.With(intel.ErrDamagedCache, "304 to an unconditional refetch; upstream is broken or hostile").Set("url", s.zipURL)
+			}
+			return s.ensureLoadedBudget(ctx, retries-1)
 		case fsutil.HashUnrecorded:
 			// FIX 1: a live 304 validates the ETAG, not the bytes on
 			// disk. An Unrecorded sidecar means nothing binds this zip
@@ -290,7 +306,10 @@ func (s *Source) ensureLoadedLocked(ctx context.Context) ([]intel.MalwareReport,
 				Str("payload_path", zipPath).
 				Msg("304 validated etag but zip hash is unrecorded; forcing refetch to bind wire bytes")
 			_ = os.Remove(etagPath)
-			return s.ensureLoadedLocked(ctx)
+			if retries <= 0 {
+				return nil, errors.With(intel.ErrDamagedCache, "304 to an unconditional refetch; upstream is broken or hostile").Set("url", s.zipURL)
+			}
+			return s.ensureLoadedBudget(ctx, retries-1)
 		}
 		reports, err := parseZip(zipPath, s.logger)
 		if err != nil {

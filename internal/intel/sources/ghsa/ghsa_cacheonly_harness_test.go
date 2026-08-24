@@ -69,10 +69,10 @@ func ghsaCacheOnlyCase(t *testing.T) cacheonlytest.Case {
 			require.NoError(t, err)
 			for _, e := range entries {
 				if strings.HasPrefix(e.Name(), "parsed-") && strings.HasSuffix(e.Name(), ".gob") {
-				require.NoError(t, os.WriteFile(
-					filepath.Join(cacheDir, e.Name()), guttedGob, 0o600))
+					require.NoError(t, os.WriteFile(
+						filepath.Join(cacheDir, e.Name()), guttedGob, 0o600))
+				}
 			}
-		}
 		},
 		StripHashSidecars: cacheonlytest.StripSidecarsInRoot,
 		HeadValidated:     true,
@@ -98,4 +98,8 @@ func encodeGobForTest(t *testing.T, reports []intel.MalwareReport) []byte {
 
 func TestCacheOnlyHarness304UnrecordedGuttedMustRebindFromWire(t *testing.T) {
 	cacheonlytest.Run304UnrecordedGuttedMustRebindFromWire(t, ghsaCacheOnlyCase(t))
+}
+
+func TestCacheOnlyHarness304LoopMustFailClosed(t *testing.T) {
+	cacheonlytest.Run304LoopMustFailClosed(t, ghsaCacheOnlyCase(t))
 }

@@ -22,7 +22,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -226,6 +228,21 @@ func StripSidecarsInRoot(t *testing.T, dir string) {
 	}
 }
 
+// removeGobLayers deletes every parsed-*.gob file so the 304-loop
+// scenario cannot be satisfied by serving an unrecorded gob out
+// of the upstream-unreachable availability arm. The gob family
+// only fails closed when no local layer is servable.
+func removeGobLayers(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "parsed-") && strings.HasSuffix(e.Name(), ".gob") {
+			require.NoError(t, os.Remove(filepath.Join(dir, e.Name())))
+		}
+	}
+}
+
 // Run304UnrecordedGuttedMustRebindFromWire pins FIX 1: a payload whose
 // sidecar is MISSING (crash between WriteAtomic and RecordPayloadHash, a
 // deleted sidecar, or any pre-sidecar cache) and whose bytes have been
@@ -295,4 +312,101 @@ func Run304UnrecordedGuttedMustRebindFromWire(t *testing.T, c Case) {
 	require.Equal(t, c.WarmReports, len(reports),
 		"the healed fetch must return the intact payload's report set")
 
+}
+
+// Run304LoopMustFailClosed pins the retry budget (grok's round-5
+// finding): an upstream that answers 304 to an UNCONDITIONAL GET — a
+// broken or hostile CDN — must not drive unbounded recursion. The FIX 1
+// arms drop the etag and refetch without If-None-Match; a well-behaved
+// upstream answers that with a body, but nothing enforces it, so each
+// source carries a one-shot budget and fails closed with
+// ErrDamagedCache when the budget is spent. govulndb shipped without
+// the budget: the loop ran until the context died, and then the
+// network-failure arm served the unbound (possibly gutted) zip — the
+// original critical through a side door.
+//
+// Fixture shape: the server answers the FIRST request (the warm fetch)
+// with the intact body + etag, then flips into broken mode and answers
+// every subsequent request — conditional or not — with 304. A 304
+// fixture that serves a body when If-None-Match is absent would never
+// exercise the budget, which is exactly why the suite stayed green
+// across nine sources while govulndb looped.
+func Run304LoopMustFailClosed(t *testing.T, c Case) {
+	t.Helper()
+
+	var servedBody bool
+	inner := c.Serve(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Flip to broken mode only after the first request that actually
+		// CARRIES a body answer. The HeadValidated family (gob/tarball
+		// sources) opens every fetch with a HEAD probe — flipping on the
+		// first request would break the warm fetch itself. HEADs and
+		// conditional GETs before the body is served pass through inner.
+		if !servedBody && r.Method == http.MethodGet && r.Header.Get("If-None-Match") == "" {
+			servedBody = true
+			inner(w, r)
+			return
+		}
+		if servedBody {
+			// Broken/hostile mode: 304 to everything, including bare GETs.
+			if inm := r.Header.Get("If-None-Match"); inm != "" {
+				w.Header().Set("ETag", inm)
+			}
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		inner(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	cacheDir := t.TempDir()
+	warm := c.NewSource(t, srv.URL, cacheDir)
+	warmReports, err := warm.Fetch(context.Background(), c.Ecosystem)
+	require.NoError(t, err)
+	require.Len(t, warmReports, c.WarmReports, "fixture sanity: warm fetch must serve the intact body")
+	require.True(t, servedBody, "fixture sanity: the server must have served the intact body once")
+
+	// Gut + strip + orphan: sidecars gone, payload damaged, etag
+	// intact, and every parsed-*.gob layer REMOVED. Two independent
+	// threats share this fixture. For the payload family the loop is
+	// the hazard: the conditional GET draws a 304, the FIX 1 arm drops
+	// the etag and refetches unconditionally, the broken server 304s
+	// THAT too, and the budget must fire. For the HeadValidated family
+	// the HEAD probe itself draws the 304; the family correctly fails
+	// closed on damaged-cache-plus-dead-upstream — but only if the
+	// availability arm cannot serve an unrecorded gob as a fallback.
+	// Deleting the gob forces every local layer through its gate so
+	// both families terminate in ErrDamagedCache, never a hang, and
+	// never the gutted bytes.
+	c.StripHashSidecars(t, cacheDir)
+	c.Damage(t, cacheDir)
+	removeGobLayers(t, cacheDir)
+
+	cold := c.NewSource(t, srv.URL, cacheDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	type result struct {
+		reports []intel.MalwareReport
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		reports, err := cold.Fetch(ctx, c.Ecosystem)
+		done <- result{reports: reports, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		require.Error(t, res.err,
+			"source %s must fail closed on a 304-looping upstream, not serve", c.Name)
+		require.ErrorIs(t, res.err, intel.ErrDamagedCache,
+			"the 304-loop failure must carry ErrDamagedCache (budget exhausted), got: %v", res.err)
+		for _, r := range res.reports {
+			require.NotEqual(t, c.GuttedName, r.Name,
+				"source %s served the GUTTED payload out of a 304 loop — the original critical through the side door", c.Name)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatalf("source %s appears to be looping on a 304-to-everything upstream (no result within 45s) — the retry budget is missing", c.Name)
+	}
 }

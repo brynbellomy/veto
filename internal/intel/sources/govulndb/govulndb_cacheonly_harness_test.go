@@ -66,3 +66,7 @@ func TestCacheOnlyHarnessUnrecordedServesButDoesNotAdopt(t *testing.T) {
 func TestCacheOnlyHarness304UnrecordedGuttedMustRebindFromWire(t *testing.T) {
 	cacheonlytest.Run304UnrecordedGuttedMustRebindFromWire(t, govulndbCacheOnlyCase(t))
 }
+
+func TestCacheOnlyHarness304LoopMustFailClosed(t *testing.T) {
+	cacheonlytest.Run304LoopMustFailClosed(t, govulndbCacheOnlyCase(t))
+}

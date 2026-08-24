@@ -42,7 +42,7 @@ func rustsecCacheOnlyCase(t *testing.T) cacheonlytest.Case {
 			src, err := New(Options{
 				TarballURL: srvURL,
 				CacheDir:   cacheDir,
-				Logger:   zerolog.Nop(),
+				Logger:     zerolog.Nop(),
 			})
 			require.NoError(t, err)
 			return src
@@ -60,10 +60,10 @@ func rustsecCacheOnlyCase(t *testing.T) cacheonlytest.Case {
 			require.NoError(t, err)
 			for _, e := range entries {
 				if strings.HasPrefix(e.Name(), "parsed-") && strings.HasSuffix(e.Name(), ".gob") {
-				require.NoError(t, os.WriteFile(
-					filepath.Join(cacheDir, e.Name()), guttedGob, 0o600))
+					require.NoError(t, os.WriteFile(
+						filepath.Join(cacheDir, e.Name()), guttedGob, 0o600))
+				}
 			}
-		}
 		},
 		StripHashSidecars: cacheonlytest.StripSidecarsInRoot,
 		HeadValidated:     true,
@@ -99,4 +99,8 @@ func rustsecAdvisoryJSONFor(pkg string) string {
 
 func TestCacheOnlyHarness304UnrecordedGuttedMustRebindFromWire(t *testing.T) {
 	cacheonlytest.Run304UnrecordedGuttedMustRebindFromWire(t, rustsecCacheOnlyCase(t))
+}
+
+func TestCacheOnlyHarness304LoopMustFailClosed(t *testing.T) {
+	cacheonlytest.Run304LoopMustFailClosed(t, rustsecCacheOnlyCase(t))
 }

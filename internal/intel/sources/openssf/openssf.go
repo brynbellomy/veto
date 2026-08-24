@@ -296,6 +296,16 @@ func (s *Source) headEtag(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// A non-OK HEAD is upstream unavailability — EXCEPT a 304, which
+		// answers a question nobody asked (an unconditional HEAD carries
+		// no If-None-Match). A 304 here is protocol garbage from a broken
+		// or hostile upstream, and the availability arms below must not
+		// be able to launder it into a served cache hit. Carrying
+		// ErrDamagedCache marks the upstream itself as unusable.
+		if resp.StatusCode == http.StatusNotModified {
+			return "", errors.With(intel.ErrDamagedCache, "upstream answered 304 to an unconditional HEAD").
+				Set("status", resp.StatusCode).Set("url", s.tarballURL)
+		}
 		return "", errors.WithNew("unexpected head status").Set("status", resp.StatusCode)
 	}
 	etag := resp.Header.Get("ETag")
@@ -339,6 +349,15 @@ func (s *Source) downloadIfChanged(ctx context.Context, upstreamEtag string) (st
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusNotModified {
+			// A 304 answer to an UNCONDITIONAL GET (no If-None-Match was set
+			// on this request) is protocol garbage: the upstream confirms the
+			// bytes are elsewhere while refusing to send them. A broken
+			// upstream must not stand in for an unreachable one — the
+			// availability arms would otherwise serve the unbound cache.
+			return "", "", errors.With(intel.ErrDamagedCache, "upstream answered 304 to an unconditional request").
+				Set("status", resp.StatusCode).Set("url", s.tarballURL)
+		}
 		return "", "", errors.WithNew("unexpected get status").Set("status", resp.StatusCode)
 	}
 
