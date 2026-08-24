@@ -195,6 +195,16 @@ func (s *Source) ensureLoaded(ctx context.Context) ([]intel.MalwareReport, error
 
 	upstreamEtag, err := s.headEtag(ctx)
 	if err != nil {
+		// A broken upstream must not stand in for an unreachable one. A
+		// 304 answer to the unconditional HEAD carries ErrDamagedCache
+		// (see headEtag); a genuine transport failure does not. Only the
+		// latter may be answered from local layers — a hostile upstream
+		// that 304s everything would otherwise be served the unrecorded
+		// gob out of the availability arm, laundering garbage protocol
+		// into a clean cache hit.
+		if stderrors.Is(err, intel.ErrDamagedCache) {
+			return nil, err
+		}
 		if s.loaded {
 			s.logger.Warn().Err(err).Msg("etag check failed, using in-memory cache")
 			return s.cached, nil

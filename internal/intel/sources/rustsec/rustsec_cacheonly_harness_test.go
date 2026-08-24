@@ -104,3 +104,7 @@ func TestCacheOnlyHarness304UnrecordedGuttedMustRebindFromWire(t *testing.T) {
 func TestCacheOnlyHarness304LoopMustFailClosed(t *testing.T) {
 	cacheonlytest.Run304LoopMustFailClosed(t, rustsecCacheOnlyCase(t))
 }
+
+func TestCacheOnlyHarnessHead304WithUnrecordedLayerFailsClosed(t *testing.T) {
+	cacheonlytest.RunHead304WithUnrecordedLayerFailsClosed(t, rustsecCacheOnlyCase(t))
+}

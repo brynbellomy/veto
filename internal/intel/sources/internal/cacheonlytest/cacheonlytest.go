@@ -410,3 +410,67 @@ func Run304LoopMustFailClosed(t *testing.T, c Case) {
 		t.Fatalf("source %s appears to be looping on a 304-to-everything upstream (no result within 45s) — the retry budget is missing", c.Name)
 	}
 }
+
+// RunHead304WithUnrecordedLayerFailsClosed pins the availability-arm half
+// of the broken-304 classification for the HeadValidated family. After
+// a warm fetch every hash sidecar is deleted (both local layers become
+// Unrecorded), and the source is pointed at a server that answers 304
+// to every request — the HEAD probe draws the 304. A 304 to an
+// unconditional HEAD is protocol garbage from a broken upstream, NOT
+// a dead one: the upstream-unreachable fallback arms must not serve
+// the unrecorded local layers. Before the fix the plain
+// "unexpected head status" error dropped into those arms and served
+// the gob — a broken upstream laundered into a clean cache hit.
+func RunHead304WithUnrecordedLayerFailsClosed(t *testing.T, c Case) {
+	t.Helper()
+	if !c.HeadValidated {
+		t.Skipf("source %s is not in the HeadValidated family", c.Name)
+	}
+
+	inner := c.Serve(t)
+	warm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner(w, r)
+	}))
+	t.Cleanup(warm.Close)
+
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if inm := r.Header.Get("If-None-Match"); inm != "" {
+			w.Header().Set("ETag", inm)
+		}
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	t.Cleanup(broken.Close)
+
+	cacheDir := t.TempDir()
+	warmSrc := c.NewSource(t, warm.URL, cacheDir)
+	warmReports, err := warmSrc.Fetch(context.Background(), c.Ecosystem)
+	require.NoError(t, err)
+	require.Len(t, warmReports, c.WarmReports, "fixture sanity: warm fetch must serve the intact body")
+
+	// Strip every sidecar: both local layers become Unrecorded.
+	c.StripHashSidecars(t, cacheDir)
+
+	cold := c.NewSource(t, broken.URL, cacheDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	type result struct {
+		reports []intel.MalwareReport
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		reports, err := cold.Fetch(ctx, c.Ecosystem)
+		done <- result{reports: reports, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		require.Error(t, res.err,
+			"source %s: HEAD-304 with unrecorded local layers must fail closed, not serve them", c.Name)
+		require.ErrorIs(t, res.err, intel.ErrDamagedCache,
+			"the HEAD-304 failure must carry ErrDamagedCache (broken upstream), got: %v", res.err)
+		require.Empty(t, res.reports, "no reports may be served out of a broken-upstream fallback")
+	case <-time.After(45 * time.Second):
+		t.Fatalf("source %s appears to be looping on HEAD-304 — no result within 45s", c.Name)
+	}
+}
