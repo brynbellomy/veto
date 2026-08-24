@@ -34,11 +34,18 @@ const (
 	// The file has been truncated, emptied, or replaced since it was
 	// written. The payload MUST NOT be served as validated.
 	HashMismatch
-	// HashUnrecorded: no sidecar exists for this payload. Either it was
-	// written by a veto older than content binding, or the sidecar was
-	// lost. Callers treat this as "trust the payload this once" — the
-	// grandfather clause — because refusing would break every
-	// pre-existing installation on upgrade.
+	// HashUnrecorded: no sidecar exists for this payload. Either it
+	// was written by a veto older than content binding, or the
+	// sidecar was lost. Post-FIX-1 the grandfather clause is
+	// direction-bound: a network path (upstream reachable, HEAD or
+	// conditional GET answered) REFUSES to adopt the unbound bytes
+	// and rebinds from the wire — only bytes read off the wire in
+	// this request ever get recorded. Serving without adopting is
+	// reserved for the paths with no wire to fall back to: the
+	// cache-only directive and a genuinely unreachable upstream.
+	// Refusing everywhere instead would break every pre-existing
+	// installation on upgrade, which is why the clause survives at
+	// all.
 	HashUnrecorded
 )
 

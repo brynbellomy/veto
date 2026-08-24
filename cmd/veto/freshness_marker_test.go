@@ -15,14 +15,21 @@ import (
 
 // markerCountingSource records how many times the network (Fetch) was consulted.
 type markerCountingSource struct {
-	hits int
+	hits   int
+	cached []intel.MalwareReport
 }
 
 func (s *markerCountingSource) ID() string { return "counting-feed" }
 
-func (s *markerCountingSource) Fetch(_ context.Context, eco intel.Ecosystem) ([]intel.MalwareReport, error) {
+func (s *markerCountingSource) Fetch(ctx context.Context, eco intel.Ecosystem) ([]intel.MalwareReport, error) {
 	if eco != intel.EcosystemNPM {
 		return nil, intel.ErrUnsupportedEcosystem
+	}
+	// Honor the directive like a real source: cache-only serves the
+	// in-memory copy without touching the wire, so hit counts mean
+	// "network consulted," which is the quantity FIX 4 is about.
+	if intel.CacheOnly(ctx) && s.hits > 0 {
+		return s.cached, nil
 	}
 	s.hits++
 	reports := make([]intel.MalwareReport, 1200)
@@ -33,6 +40,7 @@ func (s *markerCountingSource) Fetch(_ context.Context, eco intel.Ecosystem) ([]
 			Reason:     "MALWARE",
 		}
 	}
+	s.cached = reports
 	return reports, nil
 }
 
@@ -74,10 +82,26 @@ func TestCacheOnlyRefreshDoesNotSlideFreshnessMarker(t *testing.T) {
 		"a cache-only refresh must not slide the freshness marker: the window "+
 			"measures time since the last NETWORK refresh")
 
+	hitsAfterCacheOnly := src.hits
+
 	// And the guarantee that motivated the fix: let the (un-slid) marker
 	// age past the window; the next refresh MUST hit the network.
 	expired := time.Now().Add(-4 * time.Minute).UTC().Format(time.RFC3339Nano)
 	require.NoError(t, os.WriteFile(marker, []byte(expired), 0o600))
 	require.NoError(t, refreshStoreWithFreshnessWindow(zerolog.Nop(), cfg, store))
 
+	// FIX 4 coda (note 2): the wire contact is not merely believed — it
+	// is asserted. A refresh that reads the expired marker but never
+	// calls Fetch (e.g. a marker check wired to always-fresh) would
+	// pass the assertions above; the hit count is the proof the loop
+	// actually reached the wire and can heal a damaged cache.
+	// FIX 4 coda (note 2): the wire contact is not merely believed — it
+	// is asserted. The counting source has no on-disk cache and never
+	// honors CacheOnly, so hits can increment on cache-only refreshes
+	// too; what must hold is that the EXPIRED marker drives at least
+	// one more Fetch than the in-window refresh did. A marker check
+	// wired to always-fresh would leave hits flat — that is the bug
+	// this coda catches.
+	require.Greater(t, src.hits, hitsAfterCacheOnly,
+		"the expired marker must drive a network refresh; hits %d not > %d", src.hits, hitsAfterCacheOnly)
 }
