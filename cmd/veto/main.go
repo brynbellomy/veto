@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
@@ -43,6 +44,7 @@ import (
 	"github.com/brynbellomy/veto/internal/intel/sources/pypa"
 	"github.com/brynbellomy/veto/internal/intel/sources/rustsec"
 	"github.com/brynbellomy/veto/internal/ioc"
+	"github.com/brynbellomy/veto/internal/vmshim"
 	"github.com/brynbellomy/veto/internal/ioc/sources/abusech"
 	"github.com/brynbellomy/veto/internal/ioc/sources/misp"
 	"github.com/brynbellomy/veto/internal/packagemanager"
@@ -1521,16 +1523,79 @@ func findDisplacedOriginal(path, shimDir string) (string, bool) {
 //
 // `registered` is a wrappers.json membership predicate; see
 // findWrappedOriginal for the provenance rationale.
+//
+// Version-manager shims met during the PATH walk are probed first (see
+// resolveRealBinary); any shim the walk refused is reported on stderr
+// here so the user learns why a different binary ran.
 func findRealBinary(name string, registered func(string) bool) (string, error) {
+	res, err := resolveRealBinary(name, registered, defaultVMShims())
+	for _, s := range res.Skipped {
+		fmt.Fprintf(os.Stderr, "veto: skipping %s shim %s: %s\n", s.Manager, s.Candidate, s.Reason)
+		if s.Hint != "" {
+			fmt.Fprintf(os.Stderr, "veto:   to restore the pinned %s, run: %s\n", name, s.Hint)
+		}
+	}
+	return res.Path, err
+}
+
+// skippedShim records a version-manager shim the PATH walk refused to
+// exec because the manager could not name a real binary behind it.
+type skippedShim struct {
+	Manager   string
+	Candidate string
+	Reason    string
+	Hint      string
+}
+
+// probedShim records the version-manager shim the PATH walk accepted and
+// the real binary the manager reported it would run.
+type probedShim struct {
+	Manager   string
+	Candidate string
+	RealPath  string
+}
+
+// resolvedBinary is the resolver's full answer: the path to exec plus
+// what happened at any version-manager shim along the way.
+type resolvedBinary struct {
+	Path    string
+	Probed  *probedShim
+	Skipped []skippedShim
+}
+
+// resolveRealBinary is findRealBinary's engine with the version-manager
+// registry injected. The PATH walk's first non-veto entry is normally the
+// answer, but when that entry is a version-manager shim (mise, asdf,
+// pyenv) the walk asks the manager whether it can actually resolve `name`
+// from the current directory before handing over. A shim whose manager
+// cannot resolve the tool would fall back to a PATH search of its own,
+// find veto's shim again, and exec-loop forever (`go version` hanging
+// with no output; `go get` re-gating and logging an intel refresh on
+// every lap — the 2026-09-15 GOBIN-only ghost-install incident). Such a
+// shim is skipped and the walk continues, which is exactly the binary
+// the manager's own fallback would have reached, minus the loop.
+//
+// Fail-safe direction: a probe that fails for any reason (manager cannot
+// resolve, manager missing, probe timed out) skips the shim. A wrong
+// toolchain is visible in `go version`; an exec loop is a hang.
+//
+// A shim whose manager resolves cleanly is exec'd as before — through
+// the shim, not the resolved path — so the manager's own env injection
+// still applies. The only additional check is that the manager's answer
+// can be unwrapped if it happens to be a Layer-4 wrap site.
+func resolveRealBinary(name string, registered func(string) bool, vms vmshim.Registry) (resolvedBinary, error) {
+	var res resolvedBinary
 	if wrapped, ok := findWrappedOriginal(os.Args[0], registered); ok {
-		return wrapped, nil
+		res.Path = wrapped
+		return res, nil
 	}
 	// Alias case: argv[0] is a plain symlink into a registered wrapper
 	// sibling (pyenv `python -> python3.10`, `bunx -> bun`). Follow the
 	// chain before falling back to the PATH walk, which would otherwise
 	// resolve to the wrong interpreter.
 	if wrapped, ok := findWrappedOriginalViaChain(os.Args[0], registered); ok {
-		return wrapped, nil
+		res.Path = wrapped
+		return res, nil
 	}
 	shimDir := defaultShimDir()
 	// Direct shim invocation: argv[0] IS a shim-dir path (someone ran
@@ -1545,17 +1610,25 @@ func findRealBinary(name string, registered func(string) bool) (string, error) {
 	// siblings.
 	if argv0 := os.Args[0]; filepath.Base(argv0) == name {
 		if displaced, ok := findDisplacedOriginal(argv0, shimDir); ok {
-			return displaced, nil
+			res.Path = displaced
+			return res, nil
 		}
 	}
 	self, err := os.Executable()
 	if err != nil {
-		return "", errors.With(err, "resolve self")
+		return res, errors.With(err, "resolve self")
 	}
 	selfReal, err := filepath.EvalSymlinks(self)
 	if err != nil {
 		selfReal = self
 	}
+
+	// Probe inputs, computed lazily on the first version-manager shim
+	// met: the manager resolves its config from the caller's cwd, and
+	// runs under the same sanitized env the real binary will get so the
+	// probe itself can never be rewritten back into veto.
+	var probeEnv []string
+	probeDir := ""
 
 	pathEnv := os.Getenv("PATH")
 	for _, dir := range filepath.SplitList(pathEnv) {
@@ -1599,10 +1672,9 @@ func findRealBinary(name string, registered func(string) bool) (string, error) {
 			// exec'd, producing an infinite re-entry loop — the root
 			// cause of the veto-dzk python-shim stall. PATH walk and
 			// argv[0] lookup must agree on which siblings to trust.
-			if registered != nil && registered(candidate) {
-				if sibling := candidate + ".veto-original"; isExecutableRegularOrSymlink(sibling) && !isSelfReferential(sibling) {
-					return sibling, nil
-				}
+			if sibling, ok := usableWrapAnchor(candidate, registered); ok {
+				res.Path = sibling
+				return res, nil
 			}
 			// Layer-2 displacement: the candidate is a shim-dir entry
 			// whose real binary was moved aside by `install-shims
@@ -1617,13 +1689,99 @@ func findRealBinary(name string, registered func(string) bool) (string, error) {
 			// findDisplacedOriginal. Unhealthy or absent siblings fall
 			// through and the walk continues (fail closed).
 			if displaced, ok := findDisplacedOriginal(candidate, shimDir); ok {
-				return displaced, nil
+				res.Path = displaced
+				return res, nil
 			}
 			continue
 		}
-		return candidate, nil
+		mgr := vms.Owner(candidate, resolved)
+		if mgr == nil {
+			res.Path = candidate
+			return res, nil
+		}
+		if probeEnv == nil {
+			probeEnv = sanitizedEnv(os.Environ())
+			if wd, err := os.Getwd(); err == nil {
+				probeDir = wd
+			}
+		}
+		real, err := mgr.Which(context.Background(), candidate, name, probeDir, probeEnv)
+		if err != nil {
+			res.Skipped = append(res.Skipped, skippedShim{
+				Manager:   mgr.Name(),
+				Candidate: candidate,
+				Reason:    probeSkipReason(err),
+				Hint:      probeHint(err),
+			})
+			continue
+		}
+		// The manager's answer may itself be a Layer-4 wrap site (a mise
+		// install dir wrapped by install-wrappers). That is fine — the
+		// wrap unwraps via its argv[0] anchor — unless the anchor is
+		// missing or self-referential, in which case exec'ing the shim
+		// would loop through the wrapper instead of through mise.
+		if realResolved, err := filepath.EvalSymlinks(real); err == nil && realResolved == selfReal {
+			if _, ok := usableWrapAnchor(real, registered); !ok {
+				res.Skipped = append(res.Skipped, skippedShim{
+					Manager:   mgr.Name(),
+					Candidate: candidate,
+					Reason:    fmt.Sprintf("%s resolves %s to %s, a veto wrapper whose real-binary anchor is missing or loops back into veto", mgr.Name(), name, real),
+					Hint:      "veto doctor",
+				})
+				continue
+			}
+		}
+		res.Probed = &probedShim{Manager: mgr.Name(), Candidate: candidate, RealPath: real}
+		res.Path = candidate
+		return res, nil
 	}
-	return "", errors.WithNew("not found in PATH").Set("name", name)
+	return res, errors.WithNew("not found in PATH").Set("name", name)
+}
+
+// usableWrapAnchor returns the `.veto-original` sibling of a registered
+// Layer-4 wrap site when that sibling is an executable that does not
+// resolve back into veto. Both the PATH walk (for a candidate that IS
+// veto) and the version-manager probe (for a manager answer that IS
+// veto) need the same three-part test, so it lives in one place.
+//
+// Provenance gate: only wrap sites recorded in wrappers.json are
+// honored, otherwise an attacker planting `<dir>/<name>.veto-original`
+// at any PATH entry would hijack execution. Self-reference guard: a
+// sibling chaining back to veto (the veto-dzk python-shim stall) would
+// exec-loop.
+func usableWrapAnchor(site string, registered func(string) bool) (string, bool) {
+	if registered == nil || !registered(site) {
+		return "", false
+	}
+	sibling := site + wrapperSuffix
+	if !isExecutableRegularOrSymlink(sibling) || isSelfReferential(sibling) {
+		return "", false
+	}
+	return sibling, true
+}
+
+// probeSkipReason renders a version-manager probe failure for the
+// stderr warning and the doctor row.
+func probeSkipReason(err error) string {
+	var ue *vmshim.UnresolvableError
+	if stderrors.As(err, &ue) {
+		reason := fmt.Sprintf("%s cannot resolve %s from this directory", ue.Manager, ue.Name)
+		if ue.Detail != "" {
+			reason += " (" + ue.Detail + ")"
+		}
+		return reason + "; exec'ing the shim would loop back into veto"
+	}
+	return "probe failed: " + err.Error() + "; exec'ing the shim could loop back into veto"
+}
+
+// probeHint returns the manager's remediation command when it printed
+// one, else "".
+func probeHint(err error) string {
+	var ue *vmshim.UnresolvableError
+	if stderrors.As(err, &ue) {
+		return ue.Hint
+	}
+	return ""
 }
 
 // isExecutableRegularOrSymlink returns true if `p` exists, is not a

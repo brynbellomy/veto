@@ -72,6 +72,7 @@ func runDoctor(logger zerolog.Logger, cfg config, args []string) int {
 	results := []checkResult{}
 	results = append(results, checkVetoOnPath())
 	results = append(results, checkShimDir()...)
+	results = append(results, checkVersionManagerShims(cfg)...)
 	results = append(results, checkShellIntegration())
 	results = append(results, checkClaudeHook())
 	results = append(results, checkCodexPosture())

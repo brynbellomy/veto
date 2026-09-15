@@ -716,6 +716,38 @@ If you'd rather not touch PATH ordering at all, Layer 4
 (`install-wrappers`) sidesteps the issue entirely: it wraps the actual
 binaries at their install paths, so PATH lookup order stops mattering.
 
+### Version-manager shims are probed before veto hands off to them
+
+With Layer 2 shims winning PATH, the hand-off for `go`, `npm`, `uv`,
+`python` and friends is: veto's shim gates the command, then walks PATH
+for the first entry that is not veto — usually the version manager's own
+shim (`~/.local/share/mise/shims/go`), which picks the project-pinned
+toolchain and execs it. That hand-off is only sound while the manager can
+actually resolve the tool. When it cannot, mise falls back to a PATH
+search of its own, finds veto's shim again, and the two exec each other
+forever: `go version` hangs with no output, and a gated verb like
+`go get` re-runs the gate (and logs `intel store refreshed`) on every
+lap.
+
+The usual trigger is a project pin the installed tree cannot serve — a
+`.mise.toml` naming `go = "1.25.1"` whose
+`~/.local/share/mise/installs/go/1.25.1/bin/` exists (mise's GOBIN put
+`gopls`, `mockery`, … there) but holds no `go` toolchain. `mise ls` lists
+the version as installed; `mise which go` says otherwise.
+
+veto therefore asks the manager first (`mise which go`, `asdf which go`,
+`pyenv which python`, from the current directory, bounded by a 10s
+timeout). If the manager names a real binary, veto execs the shim as
+before so the manager's env injection still applies. If it cannot, veto
+skips the shim, prints one line to stderr naming the manager's own
+remediation (`mise install --force go@1.25.1`), and continues the PATH
+walk to the next `go` — the same binary mise's fallback would have
+reached, minus the loop. With no other `go` on PATH the command fails
+closed with `cannot find real go` instead of hanging.
+
+`veto doctor`, run from the affected project directory, shows the same
+state as a `vm-shim:<pm>` WARN row with the remediation inline.
+
 ## Threat model and fail-closed semantics
 
 **Fail-closed guarantees** (the gate refuses the install in all of
@@ -858,6 +890,13 @@ Run `veto doctor` in a fresh terminal. It checks:
   (`<pm>.veto-displaced`) are validated too: the displaced original
   must be executable and must not resolve back into veto (a lost real
   binary FAILs loudly instead of passing as a healthy shim).
+- Version-manager hand-offs resolve from the current directory
+  (`vm-shim:<pm>` rows): when a PM shim's PATH walk lands on a mise,
+  asdf or pyenv shim, doctor asks the manager which real binary it would
+  run here. A manager that cannot answer (project pins a version whose
+  install lacks the executable) WARNs with the manager's remediation
+  command and names the binary veto runs instead of looping; a clean
+  answer PASSes naming the resolved toolchain.
 - The Claude Code Bash hook is wired in `~/.claude/settings.json`.
 - Agent posture beyond Claude: Codex shell PATH policy, the current
   project's Cursor veto rule, and Sirene's launch PATH where inspectable.
